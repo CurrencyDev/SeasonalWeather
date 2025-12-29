@@ -1,0 +1,18 @@
+[Unit]
+Description=SeasonalWeather Orchestrator (NWWS-OI -> NWS API -> Icecast)
+After=network-online.target seasonalweather-liquidsoap.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=seasonalweather
+Group=seasonalweather
+EnvironmentFile=/etc/seasonalweather/seasonalweather.env
+WorkingDirectory=/opt/seasonalweather/app
+ExecStart=/opt/seasonalweather/venv/bin/python -m seasonalweather --config /etc/seasonalweather/config.yaml
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

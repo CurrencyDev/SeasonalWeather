@@ -1,0 +1,4 @@
+slixmpp==1.8.5
+httpx==0.27.2
+PyYAML==6.0.2
+python-dateutil==2.9.0.post0

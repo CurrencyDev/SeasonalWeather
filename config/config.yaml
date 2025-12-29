@@ -1,0 +1,202 @@
+station:
+  name: "SeasonalWeather"
+  service_area_name: "Baltimore/Washington (KLWX — WXM42/WXM43/KHB36/KEC83 service area)"
+  timezone: "America/New_York"
+  disclaimer: "This is an unofficial automated IP weather broadcast. It is not NOAA Weather Radio and is not endorsed by the National Weather Service. For critical information, use NOAA Weather Radio and weather.gov."
+
+stream:
+  icecast_host: "127.0.0.1"
+  icecast_port: 8000
+  icecast_mount: "seasonalweather.ogg"
+
+# Two-mode cycle: normal vs heightened (shorter)
+cycle:
+  normal_interval_seconds: 300
+  heightened_interval_seconds: 180
+  min_heightened_seconds: 1800  # stay heightened at least this long after a tone-out
+  reference_points:
+    # (lat, lon, label) — used for forecast snippets + obs anchors
+    - [38.8521, -77.0377, "Washington"]
+    - [39.1774, -76.6684, "Baltimore"]
+    - [38.9531, -77.4565, "Dulles"]
+    - [39.4015, -77.4144, "Frederick"]
+    - [39.6360, -78.7601, "Cumberland"]
+
+# Observations station IDs for api.weather.gov/stations/<id>/observations/latest
+observations:
+  stations: ["KDCA", "KBWI", "KIAD", "KMRB", "KCHO"]
+
+# NWWS-OI listener
+nwws:
+  server: "nwws-oi.weather.gov"
+  port: 5222
+  allowed_wfos: ["KLWX"]
+
+# KLWX tone-out product types (matches the NWR tone table)
+policy:
+  toneout_product_types:
+    - "TOA"  # Tornado Watch
+    - "TOR"  # Tornado Warning
+    - "SVA"  # Severe Thunderstorm Watch
+    - "SVR"  # Severe Thunderstorm Warning
+    - "SMW"  # Special Marine Warning
+    - "FFA"  # Flash Flood Watch
+    - "FFW"  # Flash Flood Warning
+    - "FLW"  # Flood Warning
+    - "TRA"  # Tropical Storm Watch
+    - "TRW"  # Tropical Storm Warning
+    - "HUA"  # Hurricane Watch
+    - "HUW"  # Hurricane Warning
+    - "WSW"  # Winter Storm Warning
+    - "BZW"  # Blizzard Warning
+    - "SQW"  # Snow Squall Warning
+    - "HWW"  # High Wind Warning
+    - "CFW"  # Coastal Flood Warning
+    - "CDW"  # Civil Danger Warning
+    - "CEM"  # Civil Emergency Message
+    - "EAN"  # Emergency Action Notification
+    - "EQW"  # Earthquake Warning
+    - "EVI"  # Evacuation Immediate
+    - "FRW"  # Fire Warning
+    - "HMW"  # Hazardous Materials Warning
+    - "LAE"  # Local Area Emergency
+    - "LEW"  # Law Enforcement Warning
+    - "NUW"  # Nuclear Power Plant Warning
+    - "RHW"  # Radiological Hazard Warning
+    - "SPW"  # Shelter in Place Warning
+    - "TOE"  # 911 Telephone Outage Emergency
+    - "RWT"  # Required Weekly Test
+
+  # Minimum gap between consecutive tone-outs (prevents “tone spam” when back-to-back products drop)
+  min_tone_gap_seconds: 2.0
+
+# Service area = union of these 4 KLWX transmitters
+# Source: https://www.weather.gov/lwx/nwrtables (transmitter county SAME/FIPS lists)
+service_area:
+  transmitters:
+    # Source: NWS Baltimore/Washington (LWX) NWR SAME/FIPS table
+    # https://www.weather.gov/lwx/nwrtables
+    KEC83:  # Baltimore (City), MD — KEC-83 162.400 MHz
+      - { name: "District of Columbia", same_fips: "011001" }
+      - { name: "Anne Arundel MD", same_fips: "024003" }
+      - { name: "Baltimore County MD", same_fips: "024005" }
+      - { name: "Carroll MD", same_fips: "024013" }
+      - { name: "Harford MD", same_fips: "024025" }
+      - { name: "Howard MD", same_fips: "024027" }
+      - { name: "Kent MD", same_fips: "024029" }
+      - { name: "Montgomery MD", same_fips: "024031" }
+      - { name: "Prince George's MD", same_fips: "024033" }
+      - { name: "Queen Anne's MD", same_fips: "024035" }
+      - { name: "St. Mary's MD", same_fips: "024037" }
+      - { name: "City of Baltimore MD", same_fips: "024510" }
+      - { name: "Arlington VA", same_fips: "051013" }
+      - { name: "Fairfax VA", same_fips: "051059" }
+      - { name: "Prince William VA", same_fips: "051153" }
+      - { name: "City of Alexandria VA", same_fips: "051510" }
+      - { name: "Adams PA", same_fips: "042001" }
+      - { name: "York PA", same_fips: "042133" }
+
+    KHB36:  # Manassas, VA — KHB-36 162.550 MHz
+      - { name: "District of Columbia", same_fips: "011001" }
+      - { name: "Calvert MD", same_fips: "024009" }
+      - { name: "Charles MD", same_fips: "024017" }
+      - { name: "Frederick MD", same_fips: "024021" }
+      - { name: "Montgomery MD", same_fips: "024031" }
+      - { name: "Prince George's MD", same_fips: "024033" }
+      - { name: "St. Mary's MD", same_fips: "024037" }
+      - { name: "Jefferson WV", same_fips: "054037" }
+      - { name: "Arlington VA", same_fips: "051013" }
+      - { name: "Clarke VA", same_fips: "051043" }
+      - { name: "Culpeper VA", same_fips: "051047" }
+      - { name: "Fairfax VA", same_fips: "051059" }
+      - { name: "Fauquier VA", same_fips: "051061" }
+      - { name: "King George VA", same_fips: "051099" }
+      - { name: "Loudoun VA", same_fips: "051107" }
+      - { name: "Madison VA", same_fips: "051113" }
+      - { name: "Orange VA", same_fips: "051137" }
+      - { name: "Page VA", same_fips: "051139" }
+      - { name: "Prince William VA", same_fips: "051153" }
+      - { name: "Rappahannock VA", same_fips: "051157" }
+      - { name: "Spotsylvania VA", same_fips: "051177" }
+      - { name: "Stafford VA", same_fips: "051179" }
+      - { name: "Warren VA", same_fips: "051187" }
+      - { name: "City of Alexandria VA", same_fips: "051510" }
+      - { name: "City of Fairfax VA", same_fips: "051600" }
+      - { name: "City of Falls Church VA", same_fips: "051610" }
+      - { name: "City of Fredericksburg VA", same_fips: "051630" }
+      - { name: "City of Manassas VA", same_fips: "051683" }
+      - { name: "City of Manassas Park VA", same_fips: "051685" }
+      # Marine areas (SAME marine codes used by NWR; may appear in alert geocodes)
+      - { name: "All of Tidal Potomac", same_fips: "073535" }
+      - { name: "All of Tidal Potomac", same_fips: "073536" }
+      - { name: "All of Tidal Potomac", same_fips: "073537" }
+      - { name: "Chesapeake Bay: Sandy Point to North Beach", same_fips: "073532" }
+      - { name: "Chesapeake Bay: North Beach to Drum Point", same_fips: "073533" }
+
+    WXM42:  # Hagerstown, MD — WXM-42 162.550 MHz
+      - { name: "Allegany MD", same_fips: "024001" }
+      - { name: "Carroll MD", same_fips: "024013" }
+      - { name: "Frederick MD", same_fips: "024021" }
+      - { name: "Washington MD", same_fips: "024043" }
+      - { name: "Adams PA", same_fips: "042001" }
+      - { name: "Bedford PA", same_fips: "042009" }
+      - { name: "Franklin PA", same_fips: "042055" }
+      - { name: "Fulton PA", same_fips: "042057" }
+      - { name: "Berkeley WV", same_fips: "054003" }
+      - { name: "Grant WV", same_fips: "054023" }
+      - { name: "Hampshire WV", same_fips: "054027" }
+      - { name: "Hardy WV", same_fips: "054031" }
+      - { name: "Jefferson WV", same_fips: "054037" }
+      - { name: "Mineral WV", same_fips: "054057" }
+      - { name: "Morgan WV", same_fips: "054065" }
+      - { name: "Pendleton WV", same_fips: "054071" }
+      - { name: "Augusta VA", same_fips: "051015" }
+      - { name: "Clarke VA", same_fips: "051043" }
+      - { name: "Fauquier VA", same_fips: "051061" }
+      - { name: "Frederick VA", same_fips: "051069" }
+      - { name: "Highland VA", same_fips: "051091" }
+      - { name: "Loudoun VA", same_fips: "051107" }
+      - { name: "Page VA", same_fips: "051139" }
+      - { name: "Rockingham VA", same_fips: "051165" }
+      - { name: "Shenandoah VA", same_fips: "051171" }
+      - { name: "Warren VA", same_fips: "051187" }
+      - { name: "City of Harrisonburg VA", same_fips: "051660" }
+      - { name: "City of Staunton VA", same_fips: "051790" }
+      - { name: "City of Waynesboro VA", same_fips: "051820" }
+      - { name: "City of Winchester VA", same_fips: "051840" }
+
+    WXM43:  # Frostburg, MD — WXM-43 162.425 MHz
+      - { name: "Allegany MD", same_fips: "024001" }
+      - { name: "Garrett MD", same_fips: "024023" }
+      - { name: "Washington MD", same_fips: "024043" }
+      - { name: "Bedford PA", same_fips: "042009" }
+      - { name: "Fulton PA", same_fips: "042057" }
+      - { name: "Somerset PA", same_fips: "042111" }
+      - { name: "Grant WV", same_fips: "054023" }
+      - { name: "Hampshire WV", same_fips: "054027" }
+      - { name: "Hardy WV", same_fips: "054031" }
+      - { name: "Mineral WV", same_fips: "054057" }
+      - { name: "Morgan WV", same_fips: "054065" }
+
+
+tts:
+  backend: "espeak-ng"  # espeak-ng | piper
+  voice: "en-us"        # espeak voice name OR piper model path (when backend=piper)
+  rate_wpm: 165
+  volume: 1.0
+
+audio:
+  sample_rate: 48000
+  attention_tone_hz: 1050
+  attention_tone_seconds: 8.0
+  eom_beep_hz: 1000
+  eom_beep_seconds: 0.6
+  inter_segment_silence_seconds: 0.35
+  post_alert_silence_seconds: 1.2
+
+paths:
+  work_dir: "/var/lib/seasonalweather"
+  audio_dir: "/var/lib/seasonalweather/audio"
+  cache_dir: "/var/lib/seasonalweather/cache"
+  config_dir: "/etc/seasonalweather"
+  log_dir: "/var/log/seasonalweather"
