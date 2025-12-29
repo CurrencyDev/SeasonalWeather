@@ -19,6 +19,7 @@ import random
 import re
 import threading
 import time
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import slixmpp
@@ -38,60 +39,107 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
-class NWWSClient(slixmpp.ClientXMPP):
+def _env_str(key: str, default: str = "") -> str:
+    v = os.environ.get(key, "")
+    return v.strip() if isinstance(v, str) else default
+
+
+async def _wait_evt(evt: threading.Event, timeout: float) -> bool:
+    timeout = max(0.0, float(timeout))
+    return await asyncio.to_thread(evt.wait, timeout)
+
+
+@dataclass
+class _SharedState:
     """
-    NWWS-OI XMPP client that:
-      - Connects with STARTTLS
-      - Joins the NWWS MUC (XEP-0045)
-      - Extracts full NWWS payloads when present
-      - Emits payload strings into an asyncio.Queue[str] owned by the main loop
+    Shared cross-thread state (thread-safe).
+    The NWWS worker thread writes these; the async supervisor reads them.
+    """
+    lock: threading.Lock
 
-    Slixmpp is asyncio-based. To avoid conflicting with your orchestrator loop, we run Slixmpp
-    in a dedicated thread with its own event loop, then shuttle messages back to the main loop
-    via call_soon_threadsafe().
+    rx_count: int = 0
+    muc_joined: bool = False
+    last_rx_monotonic: float = 0.0
+    last_any_monotonic: float = 0.0
+    last_error: str = ""
 
-    Resiliency:
-      - If we fail to confirm MUC join (no groupchat traffic) within SEASONAL_NWWS_MUC_CONFIRM_SECONDS, we restart.
-      - If MUC is confirmed but we see no RX traffic for SEASONAL_NWWS_STALL_SECONDS, we restart.
+    def reset(self) -> None:
+        with self.lock:
+            self.rx_count = 0
+            self.muc_joined = False
+            now = time.monotonic()
+            self.last_rx_monotonic = 0.0
+            self.last_any_monotonic = now
+            self.last_error = ""
+
+    def mark_any(self) -> None:
+        with self.lock:
+            self.last_any_monotonic = time.monotonic()
+
+    def mark_rx(self) -> None:
+        with self.lock:
+            now = time.monotonic()
+            self.last_rx_monotonic = now
+            self.last_any_monotonic = now
+            self.rx_count += 1
+
+    def set_muc(self, v: bool) -> None:
+        with self.lock:
+            self.muc_joined = v
+            self.last_any_monotonic = time.monotonic()
+
+    def set_error(self, msg: str) -> None:
+        with self.lock:
+            self.last_error = (msg or "").strip()
+            self.last_any_monotonic = time.monotonic()
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {
+                "rx_count": self.rx_count,
+                "muc_joined": self.muc_joined,
+                "last_rx_monotonic": self.last_rx_monotonic,
+                "last_any_monotonic": self.last_any_monotonic,
+                "last_error": self.last_error,
+            }
+
+
+class _NWWSXMPP(slixmpp.ClientXMPP):
+    """
+    Slixmpp client that runs ONLY inside the worker thread's event loop.
     """
 
     def __init__(
         self,
         jid: str,
         password: str,
-        server: str,
-        port: int,
-        out_queue: "asyncio.Queue[str]",
         *,
-        room_jid: str = "NWWS@conference.nwws-oi.weather.gov",
-        room_password: Optional[str] = None,
-        nick: str = "SeasonalWeather",
+        room_jid: str,
+        room_password: Optional[str],
+        nick: str,
+        shared: _SharedState,
+        muc_joined_evt: threading.Event,
+        started_evt: threading.Event,
+        stop_evt: threading.Event,
+        emit_cb,  # callable(text:str)->None (thread-safe)
+        muc_confirm_timeout_seconds: int,
     ) -> None:
         super().__init__(jid, password)
 
-        # Avoid attribute name "server" (Slixmpp historically had a deprecated property)
-        self.server_host = server
-        self.server_port = int(port)
-
-        self.out_queue = out_queue
-
         self.room_jid = room_jid
-        # If not provided, default to account password (Pidgin-style behavior)
         self.room_password = room_password if room_password is not None else password
         self.nick = nick
 
-        # Main orchestrator loop (set when run_forever() is called)
-        self._main_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._shared = shared
+        self._muc_joined_evt = muc_joined_evt
+        self._started_evt = started_evt
+        self._stop_evt = stop_evt
+        self._emit_cb = emit_cb
 
-        # Thread runner
-        self._thread: Optional[threading.Thread] = None
-        self._stop_evt = threading.Event()
-        self._started_evt = threading.Event()
+        self._muc_confirm_timeout_seconds = max(5, int(muc_confirm_timeout_seconds))
 
-        # State
-        self._rx_count = 0
-        self._muc_confirmed = False
-        self._last_rx_monotonic: Optional[float] = None
+        # Must be created on the worker loop.
+        self._muc_self_presence_evt: Optional[asyncio.Event] = None
 
         # Plugins
         self.register_plugin("xep_0030")  # Service Discovery
@@ -101,15 +149,20 @@ class NWWSClient(slixmpp.ClientXMPP):
         # Events
         self.add_event_handler("session_start", self._on_session_start)
         self.add_event_handler("message", self._on_message)
+        self.add_event_handler("presence", self._on_presence)
         self.add_event_handler("failed_auth", self._on_failed_auth)
         self.add_event_handler("disconnected", self._on_disconnected)
 
     async def _on_session_start(self, event) -> None:
-        self.send_presence()
-        self._last_rx_monotonic = time.monotonic()
+        self._shared.mark_any()
 
-        # Enable keepalive ONLY once we're on the correct loop (thread loop).
-        # This helps, but the stall watchdog is still the main safety net.
+        # IMPORTANT: session_start means auth/bind succeeded.
+        # Signal "started" NOW so the supervisor doesn't time out while waiting on MUC presence.
+        self._started_evt.set()
+
+        self._muc_self_presence_evt = asyncio.Event()
+        self.send_presence()
+
         try:
             self["xep_0199"].enable_keepalive(interval=30, timeout=10)
         except Exception:
@@ -124,15 +177,14 @@ class NWWSClient(slixmpp.ClientXMPP):
 
         log.info("NWWS-OI session started; joining MUC %s as %s", self.room_jid, self.nick)
 
-        # join_muc signature varies by slixmpp version; never pass wait=...
+        # Portable join (no join_muc_wait, no maxhistory).
         try:
             res = self.plugin["xep_0045"].join_muc(
                 self.room_jid,
                 self.nick,
-                password=self.room_password or None,
+                password=(self.room_password or None),
             )
         except TypeError:
-            # Older signature sometimes uses positional password
             res = self.plugin["xep_0045"].join_muc(
                 self.room_jid,
                 self.nick,
@@ -142,27 +194,58 @@ class NWWSClient(slixmpp.ClientXMPP):
         if inspect.isawaitable(res):
             await res
 
-        log.info(
-            "MUC join requested: %s (pw=%s)",
-            self.room_jid,
-            "set" if self.room_password else "none",
-        )
-        self._started_evt.set()
+        # Prefer self-presence confirmation, but don't brick the whole client if it never arrives.
+        try:
+            assert self._muc_self_presence_evt is not None
+            await asyncio.wait_for(
+                self._muc_self_presence_evt.wait(),
+                timeout=float(self._muc_confirm_timeout_seconds),
+            )
+            self._shared.set_muc(True)
+            self._muc_joined_evt.set()
+            log.info("NWWS MUC join CONFIRMED (self-presence) for %s", self.room_jid)
+        except Exception as e:
+            # Not fatal: groupchat traffic can confirm join too.
+            self._shared.set_error(f"MUC self-presence confirm not seen yet: {e!r}")
+            log.warning("NWWS MUC self-presence not seen (will accept groupchat confirm): %r", e)
 
     def _on_failed_auth(self, event) -> None:
+        self._shared.set_error("NWWS-OI authentication failed")
         log.error("NWWS-OI authentication failed")
         self._started_evt.set()
-        self.disconnect()
+        try:
+            self.disconnect(wait=False)
+        except TypeError:
+            self.disconnect()
 
     def _on_disconnected(self, event) -> None:
+        self._shared.mark_any()
         log.info("NWWS-OI disconnected")
+
+    def _on_presence(self, pres) -> None:
+        self._shared.mark_any()
+        try:
+            frm = pres.get("from")
+            if frm is None:
+                return
+
+            s = str(frm)
+            bare = getattr(frm, "bare", None) or s.split("/")[0]
+            resource = getattr(frm, "resource", None)
+            if resource is None:
+                resource = s.split("/", 1)[1] if "/" in s else ""
+
+            if str(bare).lower() == self.room_jid.lower() and str(resource) == self.nick:
+                if self._muc_self_presence_evt is not None and not self._muc_self_presence_evt.is_set():
+                    self._muc_self_presence_evt.set()
+        except Exception:
+            pass
 
     # ----------------------------
     # Message parsing + summarizing
     # ----------------------------
     @staticmethod
     def _looks_like_banner(body: str, msg_type: str, from_jid: str) -> bool:
-        # Big legal WARNING banner tends to arrive as type=normal from the server host.
         if msg_type == "normal" and body.startswith("**WARNING**"):
             return True
         if msg_type == "normal" and "**WARNING**WARNING**" in body[:80]:
@@ -171,15 +254,8 @@ class NWWSClient(slixmpp.ClientXMPP):
 
     @staticmethod
     def _extract_nwws_payload(msg) -> Optional[str]:
-        """
-        Try to extract the full NWWS product payload from the stanza.
-
-        In NWWS-OI, the raw product text is commonly inside an <x> element in an NWWS namespace.
-        If found, prefer that over msg['body'] which may be a short headline.
-        """
         try:
             xml = msg.xml
-            # We accept any <x> element whose tag namespace contains "nwws"
             for node in xml.iter():
                 tag = str(getattr(node, "tag", "") or "")
                 if not tag:
@@ -249,47 +325,20 @@ class NWWSClient(slixmpp.ClientXMPP):
 
         return (wmo, awips, title)
 
-    # ----------------------------
-    # Queue emission
-    # ----------------------------
-    def _emit(self, text: str) -> None:
-        text = (text or "").strip()
-        if not text:
-            return
-
-        if self._main_loop is not None:
-
-            def _put() -> None:
-                try:
-                    self.out_queue.put_nowait(text)
-                except asyncio.QueueFull:
-                    log.warning("NWWS queue full; dropping message")
-                except Exception:
-                    log.exception("NWWS queue push failed")
-
-            self._main_loop.call_soon_threadsafe(_put)
-            return
-
-        try:
-            self.out_queue.put_nowait(text)
-        except asyncio.QueueFull:
-            log.warning("NWWS queue full; dropping message")
-        except Exception:
-            log.exception("NWWS queue push failed")
-
-    def _should_log_rx(self, msg_type: str, summary: str) -> bool:
-        if self._rx_count <= 10:
+    def _should_log_rx(self, msg_type: str, rx_count: int) -> bool:
+        if rx_count <= 10:
             return True
         if msg_type != "groupchat":
             return True
-        return (self._rx_count % 10) == 0
+        return (rx_count % 10) == 0
 
     def _on_message(self, msg) -> None:
+        self._shared.mark_any()
+
         msg_type = str(msg.get("type") or "").strip()
         from_jid = str(msg.get("from") or "").strip()
         body = str(msg.get("body") or "").strip()
 
-        # Prefer embedded payload over body (payload-only stanzas exist)
         payload = self._extract_nwws_payload(msg)
         src = "payload" if payload else "body"
         text = (payload if payload else body).strip()
@@ -301,11 +350,14 @@ class NWWSClient(slixmpp.ClientXMPP):
             log.info("Ignoring NWWS server banner (type=%s from=%s)", msg_type, from_jid)
             return
 
-        self._rx_count += 1
-        self._last_rx_monotonic = time.monotonic()
+        self._shared.mark_rx()
+        snap = self._shared.snapshot()
+        rx_count = int(snap["rx_count"])
 
-        if (not self._muc_confirmed) and msg_type == "groupchat" and self.room_jid.lower() in from_jid.lower():
-            self._muc_confirmed = True
+        # If we see groupchat traffic from the room, that is a valid join confirmation.
+        if (not snap["muc_joined"]) and msg_type == "groupchat" and self.room_jid.lower() in from_jid.lower():
+            self._shared.set_muc(True)
+            self._muc_joined_evt.set()
             log.info("NWWS MUC join CONFIRMED via groupchat traffic")
 
         wmo, awips, title = self._summarize_payload(text)
@@ -318,10 +370,10 @@ class NWWSClient(slixmpp.ClientXMPP):
             parts.append(title)
         summary = " | ".join(parts) if parts else (title or (wmo or "message"))
 
-        if self._should_log_rx(msg_type, summary):
+        if self._should_log_rx(msg_type, rx_count):
             log.info(
                 "NWWS RX#%d type=%s src=%s from=%s len=%d summary=%s",
-                self._rx_count,
+                rx_count,
                 msg_type,
                 src,
                 from_jid,
@@ -329,138 +381,353 @@ class NWWSClient(slixmpp.ClientXMPP):
                 summary,
             )
 
-        self._emit(text)
+        try:
+            self._emit_cb(text)
+        except Exception:
+            log.exception("NWWS emit callback failed")
 
-    # ----------------------------
-    # Threaded runner
-    # ----------------------------
-    def _thread_main(self) -> None:
-        """
-        Runs Slixmpp's process loop in a dedicated thread.
+    def request_stop(self) -> None:
+        self._shared.mark_any()
+        try:
+            self.disconnect(wait=False)
+        except TypeError:
+            self.disconnect()
 
-        CRITICAL: Slixmpp stores the loop on self.loop; we must override it to the
-        thread's event loop or it will try to run the already-running main loop.
-        """
+
+class NWWSClient:
+    """
+    NWWS-OI supervisor:
+      - Slixmpp runs in a dedicated thread + dedicated asyncio loop
+      - Confirms MUC join via self-presence OR groupchat fallback
+      - Emits payloads into an asyncio.Queue[str] owned by the orchestrator loop
+      - Restarts on disconnect, startup failure, or stall
+    """
+
+    def __init__(
+        self,
+        jid: str,
+        password: str,
+        server: str,
+        port: int,
+        out_queue: "asyncio.Queue[str]",
+        *,
+        room_jid: str = "NWWS@conference.nwws-oi.weather.gov",
+        room_password: Optional[str] = None,
+        nick: str = "SeasonalWeather",
+    ) -> None:
+        self.jid = jid
+        self.password = password
+        self.server_host = server
+        self.server_port = int(port)
+
+        self.out_queue = out_queue
+        self.room_jid = room_jid
+        self.room_password = room_password
+        self.nick = nick
+
+        self._main_loop: Optional[asyncio.AbstractEventLoop] = None
+
+        self._thread: Optional[threading.Thread] = None
+        self._stop_evt = threading.Event()
+        self._started_evt = threading.Event()
+        self._muc_joined_evt = threading.Event()
+
+        self._shared = _SharedState(lock=threading.Lock())
+
+        self._xmpp_lock = threading.Lock()
+        self._xmpp: Optional[_NWWSXMPP] = None
+        self._xmpp_loop: Optional[asyncio.AbstractEventLoop] = None
+
+        self._worker_id = 0
+
+    def _emit(self, text: str) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+
+        loop = self._main_loop
+        if loop is None:
+            try:
+                self.out_queue.put_nowait(text)
+            except Exception:
+                pass
+            return
+
+        def _put() -> None:
+            try:
+                self.out_queue.put_nowait(text)
+            except asyncio.QueueFull:
+                log.warning("NWWS queue full; dropping message")
+            except Exception:
+                log.exception("NWWS queue push failed")
+
+        loop.call_soon_threadsafe(_put)
+
+    def _thread_main(self, worker_id: int, muc_confirm_timeout_seconds: int) -> None:
+        loop: Optional[asyncio.AbstractEventLoop] = None
+        xmpp: Optional[_NWWSXMPP] = None
+
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+            self._shared.mark_any()
 
-            # Force Slixmpp to use THIS thread loop
+            xmpp = _NWWSXMPP(
+                self.jid,
+                self.password,
+                room_jid=self.room_jid,
+                room_password=self.room_password,
+                nick=self.nick,
+                shared=self._shared,
+                muc_joined_evt=self._muc_joined_evt,
+                started_evt=self._started_evt,
+                stop_evt=self._stop_evt,
+                emit_cb=self._emit,
+                muc_confirm_timeout_seconds=muc_confirm_timeout_seconds,
+            )
+
+            # Force Slixmpp to use THIS loop
             try:
-                self.loop = loop  # slixmpp/xmlstream uses self.loop.run_forever()
+                xmpp.loop = loop
             except Exception:
                 pass
-            if hasattr(self, "event_loop"):
+            if hasattr(xmpp, "event_loop"):
                 try:
-                    setattr(self, "event_loop", loop)
+                    setattr(xmpp, "event_loop", loop)
                 except Exception:
                     pass
 
-            log.info("NWWS thread starting: connect %s:%d", self.server_host, self.server_port)
+            with self._xmpp_lock:
+                self._xmpp = xmpp
+                self._xmpp_loop = loop
 
-            res = self.connect(
+            log.info("NWWS worker[%d] connecting %s:%d", worker_id, self.server_host, self.server_port)
+
+            res = xmpp.connect(
                 (self.server_host, self.server_port),
                 use_ssl=False,
                 force_starttls=True,
             )
             if res is False:
-                log.error("Slixmpp connect() returned False (DNS/socket/port issue)")
+                self._shared.set_error("Slixmpp connect() returned False (DNS/socket/port issue)")
+                log.error("NWWS worker[%d] connect() returned False", worker_id)
                 self._started_evt.set()
                 return
 
-            # Blocks until disconnect
-            self.process(forever=True)
+            xmpp.process(forever=True)
 
-        except Exception:
-            log.exception("NWWS thread crashed")
+        except Exception as e:
+            self._shared.set_error(f"NWWS worker crashed: {e!r}")
+            log.exception("NWWS worker[%d] crashed", worker_id)
             self._started_evt.set()
+
         finally:
-            try:
-                self.disconnect()
-            except Exception:
-                pass
+            if xmpp is not None:
+                try:
+                    xmpp.disconnect(wait=False)
+                except TypeError:
+                    try:
+                        xmpp.disconnect()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            if loop is not None:
+                try:
+                    pending = asyncio.all_tasks(loop=loop)
+                except Exception:
+                    pending = set()
+
+                for t in list(pending):
+                    try:
+                        t.cancel()
+                    except Exception:
+                        pass
+
+                if pending:
+                    try:
+                        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    except Exception:
+                        pass
+
+                try:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                except Exception:
+                    pass
+
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+
+            with self._xmpp_lock:
+                self._xmpp = None
+                self._xmpp_loop = None
+
             self._stop_evt.set()
+            self._shared.mark_any()
 
     async def run_forever(self) -> None:
         """
-        Start the NWWS client and keep it running until cancelled.
+        Iterative supervisor loop (no recursion).
 
         Env knobs:
-          - SEASONAL_NWWS_STALL_SECONDS (default 60): after MUC confirmed, if no RX in this window -> restart
-          - SEASONAL_NWWS_MUC_CONFIRM_SECONDS (default 30): if no MUC-confirming groupchat within this window -> restart
+          - SEASONAL_NWWS_STALL_SECONDS (default 60)
+          - SEASONAL_NWWS_MUC_CONFIRM_SECONDS (default 30)
+          - SEASONAL_NWWS_START_WAIT_SECONDS (default 25)   # wait for session_start (auth ok)
+          - SEASONAL_NWWS_JOIN_WAIT_SECONDS (default 35)    # wait for MUC join confirm (presence or groupchat)
+          - SEASONAL_NWWS_BACKOFF_MAX_SECONDS (default 90)
         """
         self._main_loop = asyncio.get_running_loop()
 
         stall_seconds = _env_int("SEASONAL_NWWS_STALL_SECONDS", 60)
         muc_confirm_seconds = _env_int("SEASONAL_NWWS_MUC_CONFIRM_SECONDS", 30)
+        start_wait_seconds = _env_int("SEASONAL_NWWS_START_WAIT_SECONDS", 25)
+        join_wait_seconds = _env_int("SEASONAL_NWWS_JOIN_WAIT_SECONDS", 35)
+        max_backoff = float(_env_int("SEASONAL_NWWS_BACKOFF_MAX_SECONDS", 90))
 
         backoff = 2.0
-        max_backoff = 60.0
 
         try:
             while True:
-                # Reset run-state
-                self._stop_evt.clear()
-                self._started_evt.clear()
-                self._muc_confirmed = False
-                self._last_rx_monotonic = None
-
-                self._thread = threading.Thread(target=self._thread_main, name="NWWSClient", daemon=True)
-                self._thread.start()
-
-                # Wait for session_start / failed_auth best-effort
-                await asyncio.to_thread(self._started_evt.wait, 15)
-
-                started_at = time.monotonic()
-                if self._last_rx_monotonic is None:
-                    self._last_rx_monotonic = started_at
-
-                try:
-                    while True:
-                        await asyncio.sleep(5)
-
-                        if self._stop_evt.is_set():
-                            raise RuntimeError("NWWS disconnected / thread stopped")
-
-                        now = time.monotonic()
-
-                        if (not self._muc_confirmed) and muc_confirm_seconds > 0:
-                            if (now - started_at) > float(muc_confirm_seconds):
-                                raise RuntimeError(f"NWWS MUC join not confirmed within {muc_confirm_seconds}s")
-
-                        if self._muc_confirmed and stall_seconds > 0 and self._last_rx_monotonic is not None:
-                            age = now - self._last_rx_monotonic
-                            if age > float(stall_seconds):
-                                raise RuntimeError(f"NWWS stalled: no RX for {age:.1f}s (threshold {stall_seconds}s)")
-
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    log.warning("NWWS supervisor restarting: %s", e)
-
-                # Clean stop before restart
+                # Hard stop any previous worker before starting a new one
                 self.stop()
 
-                await asyncio.sleep(backoff + random.uniform(0, backoff * 0.25))
-                backoff = min(max_backoff, backoff * 1.6)
+                self._worker_id += 1
+                wid = self._worker_id
+
+                self._stop_evt.clear()
+                self._started_evt.clear()
+                self._muc_joined_evt.clear()
+                self._shared.reset()
+
+                t = threading.Thread(
+                    target=self._thread_main,
+                    args=(wid, muc_confirm_seconds),
+                    name=f"NWWSClient[{wid}]",
+                    daemon=True,
+                )
+                self._thread = t
+                t.start()
+
+                # 1) Wait for session_start (auth/bind ok)
+                started_ok = await _wait_evt(self._started_evt, float(start_wait_seconds))
+                snap = self._shared.snapshot()
+
+                if not started_ok:
+                    log.warning("NWWS supervisor restarting (session_start timeout after %ss)", start_wait_seconds)
+                    await asyncio.sleep(backoff + random.uniform(0, backoff * 0.25))
+                    backoff = min(max_backoff, backoff * 1.6)
+                    continue
+
+                if snap.get("last_error") and "authentication failed" in snap["last_error"].lower():
+                    log.warning("NWWS supervisor restarting (auth failed): %s", snap["last_error"])
+                    await asyncio.sleep(backoff + random.uniform(0, backoff * 0.25))
+                    backoff = min(max_backoff, backoff * 1.6)
+                    continue
+
+                # 2) Wait for MUC join confirmation (presence OR groupchat)
+                joined_ok = await _wait_evt(self._muc_joined_evt, float(join_wait_seconds))
+                snap = self._shared.snapshot()
+
+                if not joined_ok:
+                    # Not immediately fatal in theory, but for your use-case it should join quickly.
+                    log.warning(
+                        "NWWS supervisor restarting (MUC not confirmed after %ss). last_error=%r",
+                        join_wait_seconds,
+                        snap.get("last_error", ""),
+                    )
+                    await asyncio.sleep(backoff + random.uniform(0, backoff * 0.25))
+                    backoff = min(max_backoff, backoff * 1.6)
+                    continue
+
+                log.info("NWWS supervisor: started worker[%d], MUC joined=True", wid)
+                backoff = 2.0
+
+                # 3) Monitor loop
+                while True:
+                    await asyncio.sleep(5)
+
+                    if self._stop_evt.is_set():
+                        raise RuntimeError("NWWS disconnected / worker stopped")
+
+                    snap = self._shared.snapshot()
+                    if snap.get("last_error") and "authentication failed" in snap["last_error"].lower():
+                        raise RuntimeError(f"NWWS auth error: {snap['last_error']}")
+
+                    if stall_seconds > 0 and snap.get("muc_joined") and float(snap.get("last_rx_monotonic", 0.0)) > 0:
+                        age = time.monotonic() - float(snap["last_rx_monotonic"])
+                        if age > float(stall_seconds):
+                            raise RuntimeError(f"NWWS stalled: no RX for {age:.1f}s (threshold {stall_seconds}s)")
 
         except asyncio.CancelledError:
             self.stop()
             raise
+        except Exception as e:
+            log.warning("NWWS supervisor restarting: %s", e)
+            self.stop()
+            await asyncio.sleep(backoff + random.uniform(0, backoff * 0.25))
+            backoff = min(max_backoff, backoff * 1.6)
+            # loop continues (no recursion)
+            return await self.run_forever()
         finally:
             self.stop()
 
     def stop(self) -> None:
-        try:
-            self.disconnect()
-        except Exception:
-            pass
+        self._stop_evt.set()
+
+        xmpp = None
+        loop = None
+        with self._xmpp_lock:
+            xmpp = self._xmpp
+            loop = self._xmpp_loop
+
+        if xmpp is not None and loop is not None:
+            try:
+                loop.call_soon_threadsafe(xmpp.request_stop)
+            except Exception:
+                pass
 
         t = self._thread
         if t and t.is_alive():
             try:
-                t.join(timeout=3.0)
+                t.join(timeout=10.0)
             except Exception:
                 pass
+            if t.is_alive():
+                log.warning("NWWS stop: worker thread did not exit within timeout")
 
         self._thread = None
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+
+    jid = _env_str("NWWS_JID", "")
+    pw = _env_str("NWWS_PASSWORD", "")
+    if not jid or not pw:
+        raise SystemExit("Set NWWS_JID and NWWS_PASSWORD env vars to smoke-test this module.")
+
+    server = _env_str("NWWS_SERVER", "nwws-oi.weather.gov")
+    port = _env_int("NWWS_PORT", 5222)
+    room = _env_str("NWWS_ROOM", "NWWS@conference.nwws-oi.weather.gov")
+    nick = _env_str("NWWS_NICK", "SeasonalWeather")
+
+    async def _main() -> None:
+        q: asyncio.Queue[str] = asyncio.Queue(maxsize=50)
+        c = NWWSClient(jid, pw, server, port, q, room_jid=room, nick=nick)
+        task = asyncio.create_task(c.run_forever())
+        try:
+            msg = await asyncio.wait_for(q.get(), timeout=60)
+            print("GOT MESSAGE (first 500 chars):")
+            print(msg[:500])
+        finally:
+            task.cancel()
+            try:
+                await task
+            except Exception:
+                pass
+            c.stop()
+
+    asyncio.run(_main())
