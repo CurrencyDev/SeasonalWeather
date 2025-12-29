@@ -1,8 +1,8 @@
 station:
   name: "SeasonalWeather"
-  service_area_name: "Baltimore/Washington (KLWX — WXM42/WXM43/KHB36/KEC83 service area)"
+  service_area_name: "Baltimore/Washington DC"
   timezone: "America/New_York"
-  disclaimer: "This is an unofficial automated IP weather broadcast. It is not NOAA Weather Radio and is not endorsed by the National Weather Service. For critical information, use NOAA Weather Radio and weather.gov."
+  disclaimer: "This is an automated I P weather broadcast for the DC, Maryland, lower portions of Pennsylvania, and West Virginia areas by an independent hobbyist. It is not no ah Weather Radio and is not endorsed by the National Weather Service. For critical information, use no ah Weather Radio and weather.gov."
 
 stream:
   icecast_host: "127.0.0.1"
@@ -30,7 +30,7 @@ observations:
 nwws:
   server: "nwws-oi.weather.gov"
   port: 5222
-  allowed_wfos: ["KLWX"]
+  allowed_wfos: ["KLWX", "KCTP", "KPHI"]
 
 # KLWX tone-out product types (matches the NWR tone table)
 policy:
@@ -133,7 +133,7 @@ service_area:
       - { name: "Chesapeake Bay: Sandy Point to North Beach", same_fips: "073532" }
       - { name: "Chesapeake Bay: North Beach to Drum Point", same_fips: "073533" }
 
-    WXM42:  # Hagerstown, MD — WXM-42 162.550 MHz
+    WXM42:  # Hagerstown, MD — WXM-42 162.475 MHz
       - { name: "Allegany MD", same_fips: "024001" }
       - { name: "Carroll MD", same_fips: "024013" }
       - { name: "Frederick MD", same_fips: "024021" }
@@ -180,8 +180,8 @@ service_area:
 
 
 tts:
-  backend: "espeak-ng"  # espeak-ng | piper
-  voice: "en-us"        # espeak voice name OR piper model path (when backend=piper)
+  backend: "dectalk"  # espeak-ng | piper | festival | dectalk
+  voice: "9"        # backend voice switcher (dectalk, piper, and festival support this)
   rate_wpm: 165
   volume: 1.0
 
