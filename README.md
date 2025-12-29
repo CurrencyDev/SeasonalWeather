@@ -1,58 +1,69 @@
-# SeasonalWeather (VM build) — KLWX / LWX (WXM42, WXM43, KHB36, KEC83)
+# SeasonalWeather
 
-SeasonalWeather is an **unofficial** automated IP weather broadcast:
-- Listens to **NWWS-OI** (XMPP) for NWS products from **KLWX**
-- Fetches supporting context from **api.weather.gov**
-- Produces audio (TTS) and streams it via **Liquidsoap → Icecast**
+SeasonalWeather is a Python-based, internet-delivered weather/alert radio stream inspired by NOAA Weather Radio (NWR) broadcast workflows: continuous cycle audio plus interrupting alert cut-ins (SAME header bursts, 1050 Hz, spoken content, EOM).
 
-**Important:** This is *not* NOAA Weather Radio and should not be treated as an emergency alerting system.
+It’s designed for homelab / hobby broadcast use with a focus on resiliency, dedupe, and “don’t spam the entire service area by accident.”
 
-## What you get (v0.9)
-- Two-layer playout (like a mini NWR):
-  - **cycle** queue: routine info loop
-  - **alert** queue: interrupts with an attention tone + spoken alert + EOM beep
-- A tiny state machine:
-  - NORMAL cycle (default 5 min)
-  - HEIGHTENED cycle (shorter loop for a bit after severe products)
-- Service area filter: union of SAME/FIPS codes for LWX transmitters:
-  - **KEC-83** Baltimore
-  - **KHB-36** Manassas
-  - **WXM-42** Hagerstown
-  - **WXM-43** Frostburg
+> **Not affiliated with NOAA / NWS / FEMA.**
+> This is an **unofficial** hobby project. Do **not** rely on it for life safety.
 
-## Quick start (Debian 12 / Ubuntu 24.04)
-1) Copy this repo to the VM (or scp the zip contents)
-2) Run bootstrap:
-   ```bash
-   sudo bash scripts/00-bootstrap.sh
-   ```
-3) Edit env:
-   ```bash
-   sudo nano /etc/seasonalweather/seasonalweather.env
-   ```
-   Set:
-   - `NWWS_JID`
-   - `NWWS_PASSWORD`
+---
 
-4) Start services:
-   ```bash
-   sudo systemctl enable --now icecast2
-   sudo systemctl enable --now seasonalweather-liquidsoap
-   sudo systemctl enable --now seasonalweather
-   ```
+## What it does (current behavior)
 
-5) Listen:
-   - `http://<vm-ip>:8000/seasonalweather.ogg`
+### Sources / ingestion
+- **NWWS-OI (XMPP)** ingest (room monitoring) for alert payloads.
+- **NWS API** ingest for supporting products (forecasts, observations, text products).
+- **CAP ingest** via the NWS alerts API (active alerts polling).
 
-## Logs
-- Orchestrator: `journalctl -u seasonalweather -f`
-- Liquidsoap: `/var/log/seasonalweather/liquidsoap.log`
-- Icecast: `journalctl -u icecast2 -f`
+### Alert behavior
+- Full cut-ins (when enabled) typically follow:
+  1) **SAME header burst(s)** targeted to the alert’s affected SAME/FIPS
+  2) **1050 Hz tone**
+  3) **TTS narration**
+  4) **SAME EOM**
+  5) return to normal cycle
 
-## Config
-- `/etc/seasonalweather/config.yaml` (copied from `config/config.yaml`)
-- `/etc/seasonalweather/radio.liq` (Liquidsoap)
+- Low-severity CAP can optionally do **voice-only interruptions** (no SAME/1050/EOM) with cooldowns.
 
-## Dev notes
-- TTS backend default: `espeak-ng` → normalized to 48 kHz stereo WAVs for safe concatenation.
-- The NWWS parser is intentionally conservative; it keys off the AWIPS ID (e.g., `SVRLWX`) and WFO (e.g., `KLWX`).
+### Dedupe & safety gates
+- Cross-source **de-duping** to avoid immediately repeating the same alert via multiple feeds (e.g., NWWS then CAP).
+- Ledger-based tracking for CAP so previously processed alerts aren’t re-issued repeatedly.
+- “No global fallback” targeting discipline: alerts should not accidentally target *every* county in the service area.
+
+### Output
+- Audio output is produced for **Liquidsoap**, which feeds **Icecast**.
+- Typical mount: `/seasonalweather.ogg` (your setup may vary).
+
+### Hardening / ops
+- Designed to run under **systemd** (units included in `systemd/`).
+- Disk usage is managed via pruning/retention scripts in production deployments (see notes below).
+
+---
+
+## Repo layout
+
+- `seasonalweather/` — the Python application (orchestrator, decoders, ingestors)
+- `config/`
+  - `config.yaml` — service area + behavior config (SAME/FIPS lists live here)
+  - `example.env` — environment variable template (copy this for your deployment)
+- `liquidsoap/` — Liquidsoap script(s)
+- `systemd/` — service unit files
+- `scripts/` — bootstrap + helper scripts
+- `docs/` — design notes / state machine docs
+
+---
+
+## Quick start (dev / local)
+
+### 1) System deps
+You’ll need at least:
+- Python 3.11+ (3.10 may work depending on requirements)
+- `ffmpeg`
+- (If using Liquidsoap/Icecast locally) `liquidsoap`, `icecast2`
+
+### 2) Python env
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
