@@ -1019,6 +1019,7 @@ class Orchestrator:
             "High Wind Watch",
             "Wind Chill Watch",
             "Winter Weather Advisory",
+            "Snow Squall Warning",
         }
 
     def _cap_full_cooldown_seconds(self) -> int:
@@ -1433,6 +1434,7 @@ class Orchestrator:
             "Extreme Wind Warning": "EWW",
             "Wind Chill Warning": "WCW",
             "Wind Chill Watch": "WCA",
+            "Snow Squall Warning": "SQW",
             "Special Weather Statement": "SPS",
             "Severe Weather Statement": "SVS",
             "Flood Statement": "FLS",
