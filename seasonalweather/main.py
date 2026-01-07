@@ -309,6 +309,12 @@ class Orchestrator:
         self._zonecounty_loaded = False
         self._zonecounty_map: dict[str, list[str]] = {}
 
+
+        # --- Marine areas crosswalk (marine zone -> coastal county FIPS -> SAME) ---
+        self._mareas_lock = asyncio.Lock()
+        self._mareas_loaded = False
+        self._mareas_map: dict[str, list[str]] = {}
+
     def _norm_wfo_set(self, wfos: list[str] | set[str] | tuple[str, ...]) -> set[str]:
         """
         Normalizes allowed WFOs so YAML can use LWX or KLWX interchangeably.
@@ -772,6 +778,133 @@ class Orchestrator:
 
             self._zonecounty_loaded = True
 
+
+
+    # ---- Marine areas crosswalk (NWS mareas*.txt: marine zone -> coastal county FIPS -> SAME) ----
+    def _mareas_enabled(self) -> bool:
+        return _env_bool("SEASONAL_MAREAS_ENABLED", default=True)
+
+    def _mareas_url(self) -> str:
+        """Optional URL for a mareas*.txt style crosswalk."""
+        return _env_str("SEASONAL_MAREAS_URL", "").strip()
+
+    def _mareas_cache_days(self) -> int:
+        return _env_int("SEASONAL_MAREAS_CACHE_DAYS", 30)
+
+    def _mareas_path(self) -> Path:
+        _, _audio, cache_dir, _logs = self._paths()
+        return cache_dir / "mareas.txt"
+
+    def _parse_mareas_txt(self, path: Path) -> dict[str, list[str]]:
+        """
+        Forgiving parser: finds a marine zone token like ANZ530 and any 5-digit FIPS or 6-digit SAME codes on the line.
+        Outputs SAME codes (6 digits, leading 0 for county FIPS).
+        """
+        zone_re = re.compile(r"\b([A-Z]{3}\d{3})\b")
+        fips5_re = re.compile(r"\b(\d{5})\b")
+        same6_re = re.compile(r"\b(\d{6})\b")
+
+        m: dict[str, list[str]] = {}
+        seen: dict[str, set[str]] = {}
+
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for ln in f:
+                s0 = (ln or "").strip()
+                if not s0 or s0.startswith("#"):
+                    continue
+
+                s = s0.upper()
+                zm = zone_re.search(s)
+                if not zm:
+                    continue
+                zone = zm.group(1).upper()
+
+                codes: list[str] = []
+
+                for x in same6_re.findall(s):
+                    d = "".join(ch for ch in x if ch.isdigit())
+                    if len(d) == 6:
+                        codes.append(d)
+
+                for x in fips5_re.findall(s):
+                    d = "".join(ch for ch in x if ch.isdigit())
+                    if len(d) == 5:
+                        codes.append("0" + d)
+
+                if not codes:
+                    continue
+
+                if zone not in m:
+                    m[zone] = []
+                    seen[zone] = set()
+
+                for c in codes:
+                    c2 = "".join(ch for ch in c if ch.isdigit()).zfill(6)
+                    if len(c2) != 6:
+                        continue
+                    if c2 in seen[zone]:
+                        continue
+                    seen[zone].add(c2)
+                    m[zone].append(c2)
+
+        return m
+
+    async def _ensure_mareas_loaded(self) -> None:
+        if self._mareas_loaded:
+            return
+
+        async with self._mareas_lock:
+            if self._mareas_loaded:
+                return
+
+            if not self._mareas_enabled():
+                self._mareas_loaded = True
+                self._mareas_map = {}
+                return
+
+            path = self._mareas_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+
+            url = self._mareas_url()
+            max_age_days = max(1, int(self._mareas_cache_days()))
+            now = dt.datetime.now(tz=self._tz)
+
+            need_download = True
+            if path.exists():
+                try:
+                    mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=self._tz)
+                    need_download = (now - mtime).total_seconds() > (max_age_days * 86400)
+                except Exception:
+                    need_download = True
+
+            if url and need_download:
+                try:
+                    client = await self._ensure_zone_client()
+                    r = await client.get(url)
+                    if r.status_code == 200 and r.content and len(r.content) > 256:
+                        tmp = path.with_suffix(".tmp")
+                        tmp.write_bytes(r.content)
+                        tmp.replace(path)
+                        log.info("Marine areas crosswalk refreshed: %s (%d bytes)", path, len(r.content))
+                    else:
+                        log.warning("Marine areas crosswalk fetch failed (status=%s). Using cache if present.", r.status_code)
+                except Exception:
+                    log.exception("Marine areas crosswalk download failed; using cache if present")
+
+            if not path.exists():
+                log.info("Marine areas crosswalk not available (no cache file). Marine zone->SAME mapping unavailable.")
+                self._mareas_loaded = True
+                self._mareas_map = {}
+                return
+
+            try:
+                self._mareas_map = await asyncio.to_thread(self._parse_mareas_txt, path)
+                log.info("Marine areas loaded: zones=%d file=%s", len(self._mareas_map), path)
+            except Exception:
+                log.exception("Marine areas parse failed; disabling marine mapping for this run")
+                self._mareas_map = {}
+
+            self._mareas_loaded = True
     async def _ensure_zone_client(self) -> httpx.AsyncClient:
         if self._zone_client is not None:
             return self._zone_client
@@ -900,7 +1033,19 @@ class Orchestrator:
             except Exception:
                 pass
 
-        # Otherwise, ask NWS API. Most UGC tokens are forecast zones; marine ones might be under "marine".
+        
+
+        # Marine zones: try mareas crosswalk (ANZ/AMZ/GMZ/LMZ/PZZ/etc)
+        if re.fullmatch(r"[A-Z]{3}\d{3}", zid):
+            try:
+                await self._ensure_mareas_loaded()
+                lst2 = self._mareas_map.get(zid)
+                if lst2:
+                    self._zone_cache_same[zid] = list(lst2)
+                    return list(lst2)
+            except Exception:
+                pass
+# Otherwise, ask NWS API. Most UGC tokens are forecast zones; marine ones might be under "marine".
         # We try a small ordered list.
         async with self._zone_lock:
             # Check again after acquiring lock (double-checked caching)
@@ -1879,6 +2024,19 @@ class Orchestrator:
         vtec_actions = {act for (_t, act) in tracks} if tracks else set()
         should_full = (not tracks) or bool(vtec_actions & full_actions)
 
+
+
+        # Critical safety gate:
+        # If we have UGC zones but could not map ANY of them to SAME, we do NOT air FULL.
+        # This prevents blind tone-outs (especially marine zones) when mapping fails.
+        if zones and (not mapped_ok) and should_full:
+            log.warning(
+                "NWWS SAME targeting failed (no zone->SAME mapping). Forcing voice-only type=%s wfo=%s zones=%s",
+                parsed.product_type,
+                parsed.wfo,
+                ",".join(zones[:12]) + ("..." if len(zones) > 12 else ""),
+            )
+            should_full = False
         keys: list[str] = []
 
         # Track-level dedupe prevents CAP+NWWS double-air.
