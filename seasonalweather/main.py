@@ -314,6 +314,21 @@ class Orchestrator:
         self._dedupe_lock = asyncio.Lock()
         self._recent_air_keys: dict[str, dt.datetime] = {}
 
+
+        # --- Periodic rebroadcast rotation (no re-tone) ---
+        # Replays voice-only copies of recently-aired products so info isn't heard only once.
+        # Disabled by default; enable via SEASONAL_REBROADCAST_ENABLED=1.
+        self.rebroadcast_enabled = _env_bool("SEASONAL_REBROADCAST_ENABLED", default=False)
+        self.rebroadcast_interval_seconds = _env_int("SEASONAL_REBROADCAST_INTERVAL_SECONDS", 900)  # min spacing baseline
+        self.rebroadcast_min_gap_seconds = _env_int("SEASONAL_REBROADCAST_MIN_GAP_SECONDS", 300)    # don't spam cut-ins
+        self.rebroadcast_ttl_seconds = _env_int("SEASONAL_REBROADCAST_TTL_SECONDS", 3600)           # safety cap if no VTEC
+        self.rebroadcast_max_items = _env_int("SEASONAL_REBROADCAST_MAX_ITEMS", 6)
+        self.rebroadcast_include_voice = _env_bool("SEASONAL_REBROADCAST_INCLUDE_VOICE", default=False)
+
+        self._rebroadcast_lock = asyncio.Lock()
+        self._rebroadcast_items: dict[str, SimpleNamespace] = {}
+        self._rebroadcast_last_any_at = None
+
         # --- NWWS decision visibility counters ---
         self._nwws_seen = 0
         self._nwws_acted = 0
@@ -1275,6 +1290,294 @@ class Orchestrator:
         in_area = self._filter_same_locations_to_service_area(dedup)
         return (zones, in_area, src, any_mapped)
 
+
+    # ---- Rebroadcast rotation (no re-tone) ----
+    def _parse_vtec_dt_utc(self, s: str) -> dt.datetime | None:
+        '''
+        Parse VTEC timestamps like:
+          20260111T2300Z  (YYYYMMDD)
+          260111T2300Z    (YYMMDD legacy)
+        Returns an aware UTC datetime or None.
+        '''
+        txt = (s or "").strip().upper()
+        m = re.fullmatch(r"(\d{8}|\d{6})T(\d{4})Z", txt)
+        if not m:
+            return None
+
+        d = m.group(1)
+        hm = m.group(2)
+
+        try:
+            if len(d) == 8:
+                year = int(d[0:4])
+                month = int(d[4:6])
+                day = int(d[6:8])
+            else:
+                year = 2000 + int(d[0:2])
+                month = int(d[2:4])
+                day = int(d[4:6])
+
+            hour = int(hm[0:2])
+            minute = int(hm[2:4])
+
+            return dt.datetime(year, month, day, hour, minute, tzinfo=dt.timezone.utc)
+        except Exception:
+            return None
+
+    def _best_expiry_from_vtec(self, vtec_list: list[str]) -> dt.datetime | None:
+        '''
+        Returns the latest END time found across VTEC codes (UTC), or None.
+        '''
+        ends: list[dt.datetime] = []
+        for raw in vtec_list or []:
+            s = "".join(str(raw).split()).strip()
+            if not s:
+                continue
+
+            # Pull the END token after the '-' if present: ...-YYYYMMDDThhmmZ/
+            m = re.search(r"-((?:\d{8}|\d{6})T\d{4}Z)", s)
+            if not m:
+                continue
+
+            t = self._parse_vtec_dt_utc(m.group(1))
+            if t:
+                ends.append(t)
+
+        if not ends:
+            return None
+        return max(ends)
+
+    def _rebroadcast_clamp_expiry(self, now_local: dt.datetime, exp_utc: dt.datetime | None) -> dt.datetime:
+        '''
+        Clamp expiry to a safety TTL so rotation can't grow unbounded if upstream is weird.
+        '''
+        ttl = max(60, int(self.rebroadcast_ttl_seconds))
+        cap = now_local + dt.timedelta(seconds=ttl)
+
+        if not exp_utc:
+            return cap
+
+        try:
+            if exp_utc.tzinfo is None:
+                exp_utc = exp_utc.replace(tzinfo=dt.timezone.utc)
+            exp_local = exp_utc.astimezone(self._tz)
+
+            if exp_local <= now_local + dt.timedelta(seconds=20):
+                exp_local = now_local + dt.timedelta(seconds=20)
+
+            return min(exp_local, cap)
+        except Exception:
+            return cap
+
+    def _rebroadcast_make_key(
+        self,
+        *,
+        source: str,
+        kind: str,
+        event_code: str,
+        tracks: list[tuple[str, str]] | None,
+        same_locs: list[str] | None,
+        script: str,
+    ) -> str:
+        '''
+        Stable-ish identity for the rotation item.
+        Prefer track id, else functional FULL key, else script hash.
+        '''
+        src = "".join(ch for ch in (source or "").upper() if ch.isalnum())[:8] or "SRC"
+        knd = "".join(ch for ch in (kind or "").upper() if ch.isalnum())[:8] or "KIND"
+        code = _safe_event_code(event_code)
+
+        if tracks:
+            t0 = tracks[0][0]
+            if t0:
+                return f"RB:{src}:{knd}:TRK:{t0}"
+
+        if knd == "FULL":
+            fkey = self._dedupe_func_full_key(code, same_locs)
+            if fkey:
+                return f"RB:{src}:{knd}:{fkey}"
+
+        sh = self._sha1_12((script or "")[:4000])
+        return f"RB:{src}:{knd}:{code}:{sh}"
+
+    async def _rebroadcast_prune_locked(self, now: dt.datetime) -> None:
+        dead: list[str] = []
+        for k, it in self._rebroadcast_items.items():
+            try:
+                if getattr(it, "expires_at", None) and now >= it.expires_at:
+                    dead.append(k)
+            except Exception:
+                dead.append(k)
+
+        for k in dead:
+            it = self._rebroadcast_items.pop(k, None)
+            if not it:
+                continue
+            ap = Path(str(getattr(it, "audio_path", "") or ""))
+            if ap and ap.exists():
+                try:
+                    ap.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        max_items = max(1, int(self.rebroadcast_max_items))
+        if len(self._rebroadcast_items) > max_items:
+            items = list(self._rebroadcast_items.items())
+            items.sort(key=lambda kv: (
+                getattr(kv[1], "expires_at", now),
+                getattr(kv[1], "created_at", now),
+            ))
+            for k, it in items[: max(0, len(items) - max_items)]:
+                self._rebroadcast_items.pop(k, None)
+                ap = Path(str(getattr(it, "audio_path", "") or ""))
+                if ap and ap.exists():
+                    try:
+                        ap.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+    def _rebroadcast_pick_due_locked(self, now: dt.datetime) -> SimpleNamespace | None:
+        due: list[SimpleNamespace] = []
+        for it in self._rebroadcast_items.values():
+            try:
+                if getattr(it, "expires_at", None) and now >= it.expires_at:
+                    continue
+                nd = getattr(it, "next_due_at", None)
+                if nd and now >= nd:
+                    due.append(it)
+            except Exception:
+                continue
+
+        if not due:
+            return None
+
+        due.sort(key=lambda it: (
+            getattr(it, "last_aired_at", None) or getattr(it, "created_at", now),
+            getattr(it, "created_at", now),
+        ))
+        return due[0]
+
+    async def _rebroadcast_add(self, *, key: str, desc: str, script: str, expires_at: dt.datetime) -> None:
+        if not self.rebroadcast_enabled:
+            return
+        s = (script or "").strip()
+        if not s:
+            return
+
+        now = dt.datetime.now(tz=self._tz)
+        script_hash = self._sha1_12(s[:4000])
+
+        async with self._rebroadcast_lock:
+            await self._rebroadcast_prune_locked(now)
+            it = self._rebroadcast_items.get(key)
+            if it and getattr(it, "script_hash", "") == script_hash:
+                it.desc = desc
+                it.expires_at = max(getattr(it, "expires_at", now), expires_at)
+                it.next_due_at = min(getattr(it, "next_due_at", now), now + dt.timedelta(seconds=60))
+                return
+
+        # Render outside lock
+        out_wav = await self._render_voice_only_audio(s, prefix="rebcast")
+
+        async with self._rebroadcast_lock:
+            await self._rebroadcast_prune_locked(now)
+
+            it2 = self._rebroadcast_items.get(key)
+            if it2:
+                try:
+                    Path(out_wav).unlink(missing_ok=True)
+                except Exception:
+                    pass
+                it2.desc = desc
+                it2.expires_at = max(getattr(it2, "expires_at", now), expires_at)
+                it2.next_due_at = min(getattr(it2, "next_due_at", now), now + dt.timedelta(seconds=60))
+                return
+
+            self._rebroadcast_items[key] = SimpleNamespace(
+                key=key,
+                desc=desc,
+                script_hash=script_hash,
+                audio_path=str(out_wav),
+                created_at=now,
+                last_aired_at=None,
+                next_due_at=now + dt.timedelta(seconds=max(60, int(self.rebroadcast_interval_seconds))),
+                expires_at=expires_at,
+            )
+
+            await self._rebroadcast_prune_locked(now)
+
+    async def _rebroadcast_maybe_air(self) -> None:
+        if not self.rebroadcast_enabled:
+            return
+
+        now = dt.datetime.now(tz=self._tz)
+
+        self._update_mode()
+        if self.mode == "heightened":
+            return
+
+        if self.last_toneout_at and (now - self.last_toneout_at).total_seconds() < float(self.rebroadcast_min_gap_seconds):
+            return
+
+        if self._rebroadcast_last_any_at and (now - self._rebroadcast_last_any_at).total_seconds() < float(self.rebroadcast_min_gap_seconds):
+            return
+
+        async with self._rebroadcast_lock:
+            await self._rebroadcast_prune_locked(now)
+            it = self._rebroadcast_pick_due_locked(now)
+            if not it:
+                return
+
+            ap = Path(str(getattr(it, "audio_path", "") or ""))
+            if not ap.exists():
+                it.next_due_at = now + dt.timedelta(seconds=120)
+                return
+
+            it.next_due_at = now + dt.timedelta(seconds=max(60, int(self.rebroadcast_interval_seconds)))
+
+        async with self._cycle_lock:
+            try:
+                self.telnet.flush_cycle()
+            except Exception:
+                pass
+            self.telnet.push_alert(str(ap))
+
+        async with self._rebroadcast_lock:
+            it2 = self._rebroadcast_items.get(getattr(it, "key", ""))
+            if it2:
+                it2.last_aired_at = now
+                n_items = max(1, len(self._rebroadcast_items))
+                it2.next_due_at = now + dt.timedelta(seconds=max(60, int(self.rebroadcast_interval_seconds)) * n_items)
+
+            self._rebroadcast_last_any_at = now
+
+        self._schedule_cycle_refill("post-rebroadcast")
+        log.info("REBROADCAST: aired desc=%s audio=%s", getattr(it, "desc", ""), str(ap))
+
+    async def _rebroadcast_loop(self) -> None:
+        tick = 20
+        try:
+            tick = max(10, min(60, int(self.rebroadcast_interval_seconds) // 10))
+        except Exception:
+            tick = 20
+
+        log.info(
+            "Rebroadcast loop starting (enabled=%s interval=%ss ttl=%ss max_items=%d include_voice=%s tick=%ss)",
+            self.rebroadcast_enabled,
+            self.rebroadcast_interval_seconds,
+            self.rebroadcast_ttl_seconds,
+            self.rebroadcast_max_items,
+            self.rebroadcast_include_voice,
+            tick,
+        )
+
+        while True:
+            await asyncio.sleep(tick)
+            try:
+                await self._rebroadcast_maybe_air()
+            except Exception:
+                log.exception("Rebroadcast tick failed")
+
     # ---- CAP toggles ----
     def _cap_enabled(self) -> bool:
         return _env_bool("SEASONAL_CAP_ENABLED", default=False)
@@ -1561,6 +1864,16 @@ class Orchestrator:
         tasks.append(asyncio.create_task(xmpp.run_forever(), name="nwws_xmpp"))
         tasks.append(asyncio.create_task(self._consume_nwws(), name="nwws_consumer"))
         tasks.append(asyncio.create_task(self._cycle_loop(), name="cycle_loop"))
+
+        if self.rebroadcast_enabled:
+            tasks.append(asyncio.create_task(self._rebroadcast_loop(), name="rebroadcast_loop"))
+            log.info(
+                "Rebroadcast enabled (interval=%ss ttl=%ss max_items=%d include_voice=%s)",
+                self.rebroadcast_interval_seconds,
+                self.rebroadcast_ttl_seconds,
+                self.rebroadcast_max_items,
+                self.rebroadcast_include_voice,
+            )
 
         if self._cap_enabled():
             if NwsCapPoller is None or CapAlertEvent is None:
@@ -1931,6 +2244,24 @@ class Orchestrator:
                 pass
 
             self._schedule_cycle_refill("post-cap-full")
+
+            # Rebroadcast rotation (no re-tone)
+            try:
+                if self.rebroadcast_enabled:
+                    exp_utc = self._best_expiry_from_vtec(vtec)
+                    expires_at = self._rebroadcast_clamp_expiry(now, exp_utc)
+                    key_rb = self._rebroadcast_make_key(
+                        source="CAP",
+                        kind="FULL",
+                        event_code=same_code,
+                        tracks=tracks,
+                        same_locs=same_locs,
+                        script=script,
+                    )
+                    desc_rb = f"CAP FULL {ev.event}".strip()
+                    await self._rebroadcast_add(key=key_rb, desc=desc_rb, script=script, expires_at=expires_at)
+            except Exception:
+                log.exception("Rebroadcast: failed to add CAP FULL item")
             log.info("CAP ACTION: aired FULL event=%s code=%s id=%s sent=%s vtec=%s audio=%s", ev.event, same_code, ev.alert_id, ev.sent, ",".join(vtec[:2]) if vtec else "", out_wav)
         except Exception:
             await self._dedupe_release(keys)
@@ -1985,6 +2316,25 @@ class Orchestrator:
             self.last_product_desc = f"CAP {ev.event}".strip()
 
             self._schedule_cycle_refill("post-cap-voice")
+
+            # Rebroadcast rotation (no re-tone) - optional for voice-only CAP
+            try:
+                if self.rebroadcast_enabled and self.rebroadcast_include_voice:
+                    exp_utc = self._best_expiry_from_vtec(vtec)
+                    expires_at = self._rebroadcast_clamp_expiry(now, exp_utc)
+                    same_code2 = self._cap_event_to_same_code((ev.event or "").strip())
+                    key_rb = self._rebroadcast_make_key(
+                        source="CAP",
+                        kind="VOICE",
+                        event_code=same_code2,
+                        tracks=tracks,
+                        same_locs=self._filter_same_locations_to_service_area(list(ev.same_fips) if getattr(ev, "same_fips", None) else []),
+                        script=script,
+                    )
+                    desc_rb = f"CAP VOICE {ev.event}".strip()
+                    await self._rebroadcast_add(key=key_rb, desc=desc_rb, script=script, expires_at=expires_at)
+            except Exception:
+                log.exception("Rebroadcast: failed to add CAP VOICE item")
             log.info("CAP ACTION: aired voice-only event=%s id=%s sent=%s audio=%s", ev.event, ev.alert_id, ev.sent, out_wav)
         except Exception:
             await self._dedupe_release(keys)
@@ -2375,6 +2725,25 @@ class Orchestrator:
             )
 
             self._schedule_cycle_refill("post-alert")
+
+            # Rebroadcast rotation (no re-tone)
+            try:
+                if self.rebroadcast_enabled and (should_full or self.rebroadcast_include_voice):
+                    exp_utc = self._best_expiry_from_vtec(vtec)
+                    expires_at = self._rebroadcast_clamp_expiry(now, exp_utc)
+                    kind_rb = "FULL" if should_full else "VOICE"
+                    key_rb = self._rebroadcast_make_key(
+                        source="NWWS",
+                        kind=kind_rb,
+                        event_code=_safe_event_code(parsed.product_type),
+                        tracks=tracks,
+                        same_locs=in_area_same,
+                        script=spoken.script,
+                    )
+                    desc_rb = f"NWWS {kind_rb} {parsed.product_type} {parsed.wfo} {parsed.awips_id or ''}".strip()
+                    await self._rebroadcast_add(key=key_rb, desc=desc_rb, script=spoken.script, expires_at=expires_at)
+            except Exception:
+                log.exception("Rebroadcast: failed to add NWWS item")
         except Exception:
             await self._dedupe_release(keys)
             raise
