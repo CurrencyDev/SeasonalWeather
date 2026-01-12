@@ -390,6 +390,29 @@ class Orchestrator:
         h = hashlib.sha1((s or "").encode("utf-8", errors="ignore")).hexdigest()
         return h[:12]
 
+    def _dedupe_func_full_key(self, event_code: str, same_locs: list[str] | None) -> str | None:
+        """
+        Cross-source "functional" FULL-alert dedupe key.
+
+        ERN cannot map to VTEC, so we dedupe FULL tone-outs by:
+          (event code) + (in-area SAME locations)
+
+        Locations are normalized to:
+          - service-area filtered
+          - unique
+          - order-independent (sorted)
+
+        Returns None if no usable locations exist (avoid deduping on empty targets).
+        """
+        code_u = _safe_event_code(event_code).strip().upper()
+        locs_in = [str(x).strip() for x in (same_locs or []) if str(x).strip()]
+        locs = self._filter_same_locations_to_service_area(locs_in)
+        if not locs:
+            return None
+        locs_norm = sorted(set(locs))
+        blob = code_u + "|" + ",".join(locs_norm)
+        return f"FUNC_FULL:{code_u}:{self._sha1_12(blob)}"
+
     def _extract_vtec(self, text: str) -> list[str]:
         if not text:
             return []
@@ -1679,6 +1702,10 @@ class Orchestrator:
         vtec = self._cap_vtec_list(ev)
         tracks = self._vtec_tracks(vtec)
 
+        same_code = self._cap_event_to_same_code((ev.event or "").strip())
+        same_locs_raw = list(ev.same_fips) if getattr(ev, "same_fips", None) else []
+        same_locs = self._filter_same_locations_to_service_area(same_locs_raw)
+
         keys: list[str] = []
 
         # Track-level dedupe (prevents CAP vs NWWS double-air)
@@ -1689,7 +1716,12 @@ class Orchestrator:
         for v in vtec:
             keys.append(f"VTEC:{v}")
 
-        fips_part = ",".join(sorted(set(str(x).strip() for x in (ev.same_fips or []) if str(x).strip())))[:800]
+        # Functional FULL dedupe shared with ERN (VTEC-independent)
+        fkey = self._dedupe_func_full_key(same_code, same_locs)
+        if fkey:
+            keys.append(fkey)
+
+        fips_part = ",".join(sorted(set(str(x).strip() for x in (same_locs or []) if str(x).strip())))[:800]
         keys.append(f"CAPFULL:{(ev.event or '').strip()}:{(ev.sent or '').strip()}:{self._sha1_12((ev.alert_id or '') + '|' + fips_part)}")
 
         ok, hit = await self._dedupe_reserve(keys)
@@ -1705,11 +1737,8 @@ class Orchestrator:
             return
 
         try:
-            same_code = self._cap_event_to_same_code((ev.event or "").strip())
             dummy = SimpleNamespace(product_type=same_code, awips_id=None, wfo="CAP", raw_text="")
-
-            same_locs = list(ev.same_fips) if getattr(ev, "same_fips", None) else None
-            out_wav = await self._render_alert_audio(dummy, script, same_locations=same_locs)
+            out_wav = await self._render_alert_audio(dummy, script, same_locations=same_locs if same_locs else None)
 
             async with self._cycle_lock:
                 try:
@@ -1949,6 +1978,35 @@ class Orchestrator:
                 )
                 continue
 
+            # Cross-source dedupe: reserve keys BEFORE rendering/airing
+
+            keys: list[str] = []
+
+            fkey3 = self._dedupe_func_full_key(code, in_area_locs)
+
+            if fkey3:
+
+                keys.append(fkey3)
+
+
+            # ERN-specific fallback (suppresses identical repeats even if functional key is absent)
+
+            sender_u2 = (ev.sender or "").strip().upper()
+
+            loc_sig = ",".join(sorted(set(in_area_locs)))[:1200]
+
+            keys.append(f"ERNRELAY:{code}:{self._sha1_12(sender_u2 + '|' + loc_sig)}")
+
+
+            ok, hit = await self._dedupe_reserve(keys)
+
+            if not ok:
+
+                log.info("ERN relay skipped (dedupe hit=%s) event=%s sender=%s same=%s", hit, code, ev.sender, loc_sig[:160])
+
+                continue
+
+
             script = self._build_ern_relay_script(ev)
             dummy = SimpleNamespace(product_type=code, awips_id=None, wfo="ERN", raw_text="")
 
@@ -2046,6 +2104,12 @@ class Orchestrator:
         # Keep VTEC strings too (helps when track parse fails on weird edge cases)
         for v in vtec:
             keys.append(f"VTEC:{v}")
+
+        # Functional FULL dedupe shared with ERN (VTEC-independent)
+        if should_full:
+            fkey2 = self._dedupe_func_full_key(parsed.product_type, in_area_same)
+            if fkey2:
+                keys.append(fkey2)
 
         # Message-level fallback key
         keys.append(f"NWWS:{parsed.product_type}:{parsed.wfo}:{self._sha1_12(official_text[:1200])}:{'FULL' if should_full else 'VOICE'}")
