@@ -1620,11 +1620,38 @@ class Orchestrator:
 
         return "SPS"
 
+
     def _cap_should_full(self, ev: "CapAlertEvent") -> bool:  # type: ignore[name-defined]
         if not self._cap_full_enabled():
             return False
         if not self._cap_is_actionable(ev):
             return False
+
+        # VTEC-aware gate for CAP Update:
+        # CAP can send VTEC CON/EXT/COR/ROU as msgType=Update.
+        # Do NOT FULL-tone those unless VTEC indicates a FULL-worthy action.
+        try:
+            mt = str(ev.message_type or "").strip().lower()
+        except Exception:
+            mt = ""
+
+        if mt == "update":
+            try:
+                vtec = self._cap_vtec_list(ev)
+                tracks = self._vtec_tracks(vtec)
+                full_actions = {"NEW", "UPG", "EXA", "EXB"}
+                vtec_actions = {act for (_t, act) in tracks} if tracks else set()
+
+                # If we have VTEC and none are FULL-worthy actions, treat as non-FULL.
+                if tracks and not (vtec_actions & full_actions):
+                    return False
+
+                # If update has no usable VTEC, be conservative: don't FULL-tone it.
+                if not tracks:
+                    return False
+            except Exception:
+                # Parsing failed; be conservative on updates.
+                return False
 
         event = (ev.event or "").strip()
         if event and event in self._cap_full_events():
