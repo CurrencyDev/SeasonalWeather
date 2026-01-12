@@ -71,6 +71,26 @@ log = logging.getLogger("seasonalweather")
 # because we will insert a live-updating time WAV right after it.
 _TIME_SENTENCE_RE = re.compile(r"\bThe current time is [^.]+\.\s*", re.IGNORECASE)
 
+
+# NWS header timestamp line (common in SPS/SVS/etc):
+#   "310 PM EST Sun Jan 11 2026"
+_NWS_HEADER_ISSUED_RE = re.compile(
+    r"^(?P<hhmm>\d{3,4})\s*(?P<ampm>AM|PM)\s*(?P<tz>[A-Z]{2,4})\s+"
+    r"(?P<dow>[A-Za-z]{3})\s+(?P<mon>[A-Za-z]{3})\s+(?P<day>\d{1,2})\s+(?P<year>\d{4})\s*$"
+)
+
+# Generic intro sentences we may have at the top of spoken scripts (we replace these for SPS).
+_SPS_INTRO_LEAD_RE = re.compile(
+    r"(?is)^(?:This is a statement from the National Weather Service\.|The National Weather Service has issued the following message\.)\s*"
+)
+
+# Expiration-ish lines that are usually the only thing we actually want to narrate on EXP/CAN updates.
+_EXPIRY_LINE_RE = re.compile(
+    r"\b(has expired|has been allowed to expire|has ended|is no longer in effect)\b",
+    re.IGNORECASE
+)
+
+
 # VTEC finder (accepts YYYYMMDD or legacy YYMMDD date digits)
 _VTEC_FIND_RE = re.compile(
     r"/[A-Z]\.[A-Z]{3}\.[A-Z]{4}\.[A-Z0-9]{2}\.[A-Z]\.\d{4}\.(?:\d{8}|\d{6})T\d{4}Z-(?:\d{8}|\d{6})T\d{4}Z/"
@@ -546,6 +566,129 @@ class Orchestrator:
             seen.add(f)
             out.append(f)
         return out
+
+    # ---- Spoken-script post-processing (NWWS path) ----
+    def _nws_header_issued_phrase(self, text: str) -> str | None:
+        """
+        Extract a nicer spoken timestamp from an NWS header line like:
+          "310 PM EST Sun Jan 11 2026"
+        Returns e.g. "3:10 PM EST Sunday January 11 2026"
+        """
+        if not text:
+            return None
+
+        dow_map = {
+            "SUN": "Sunday",
+            "MON": "Monday",
+            "TUE": "Tuesday",
+            "WED": "Wednesday",
+            "THU": "Thursday",
+            "FRI": "Friday",
+            "SAT": "Saturday",
+        }
+        mon_map = {
+            "JAN": "January",
+            "FEB": "February",
+            "MAR": "March",
+            "APR": "April",
+            "MAY": "May",
+            "JUN": "June",
+            "JUL": "July",
+            "AUG": "August",
+            "SEP": "September",
+            "OCT": "October",
+            "NOV": "November",
+            "DEC": "December",
+        }
+
+        for ln in (text or "").splitlines()[:80]:
+            s = (ln or "").strip()
+            if not s:
+                continue
+            m = _NWS_HEADER_ISSUED_RE.match(s)
+            if not m:
+                continue
+
+            hhmm = m.group("hhmm")
+            ampm = m.group("ampm").upper()
+            tz = m.group("tz").upper()
+            dow = dow_map.get(m.group("dow").strip().upper(), m.group("dow").strip())
+            mon = mon_map.get(m.group("mon").strip().upper(), m.group("mon").strip())
+            day = str(int(m.group("day")))
+            year = m.group("year")
+
+            # hhmm: "310" or "1234"
+            if len(hhmm) == 3:
+                hour = int(hhmm[0])
+                minute = int(hhmm[1:])
+            else:
+                hour = int(hhmm[:2])
+                minute = int(hhmm[2:])
+
+            return f"{hour}:{minute:02d} {ampm} {tz} {dow} {mon} {day} {year}"
+
+        return None
+
+    def _fix_sps_preamble(self, script: str, official_text: str) -> str:
+        """
+        SPS should sound like NWR-style: "And now, a Special Weather Statement..."
+        We also try to include the issued time from the product header.
+        """
+        s = (script or "").strip()
+        if not s:
+            return s
+
+        issued = self._nws_header_issued_phrase(official_text)
+        lead = "And now, a Special Weather Statement."
+        if issued:
+            lead = f"And now, a Special Weather Statement, issued at {issued}."
+
+        s2 = _SPS_INTRO_LEAD_RE.sub(lead + "\n", s, count=1)
+        if s2 == s:
+            s2 = lead + "\n" + s
+
+        # If the next line is literally "Special Weather Statement.", drop it to avoid double-intro.
+        s2 = re.sub(r"(?im)^\s*Special Weather Statement\.\s*", "", s2, count=1)
+        return s2.strip()
+
+    def _expiry_summary_script(self, official_text: str) -> str | None:
+        """
+        For VTEC EXP (and often CAN) updates, don't read the whole product.
+        Try to narrate the first 1-2 human-friendly 'has expired' lines from the header region.
+        """
+        if not official_text:
+            return None
+
+        hits: list[str] = []
+        for ln in (official_text or "").splitlines()[:240]:
+            s = re.sub(r"\s+", " ", (ln or "")).strip()
+            if not s:
+                continue
+            if _EXPIRY_LINE_RE.search(s):
+                if not s.endswith((".", "!", "?")):
+                    s += "."
+                hits.append(s)
+                if len(hits) >= 2:
+                    break
+
+        if not hits:
+            # Fallback: search a flattened window for a sentence containing "has expired"
+            flat = re.sub(r"\s+", " ", (official_text or "")[:7000]).strip()
+            m = re.search(
+                r"([^.]{0,220}\bhas (?:expired|been allowed to expire|ended)\b[^.]{0,220}\.)",
+                flat,
+                flags=re.IGNORECASE,
+            )
+            if m:
+                hits = [m.group(1).strip()]
+
+        if not hits:
+            return None
+
+        lines = ["The National Weather Service reports the following update."]
+        lines.extend(hits)
+        lines.append("End of message.")
+        return "\n".join(lines).strip()
 
     # ---- NWWS UGC -> SAME targeting helpers ----
     def _state_to_fips2(self, st: str) -> str | None:
@@ -2156,6 +2299,36 @@ class Orchestrator:
 
         try:
             spoken = build_spoken_alert(parsed, official_text)
+
+
+            # --- Less-urgent polish / todos ---
+            # SPS preamble: NWR-ish intro, avoid duplicated boilerplate.
+            try:
+                if (parsed.product_type or '').strip().upper() == 'SPS':
+                    old0 = (spoken.script or '').strip()
+                    spoken.script = self._fix_sps_preamble(spoken.script, official_text)
+                    if (spoken.script or '').strip() != old0:
+                        log.info('NWWS SPS preamble normalized (awips=%s wfo=%s)', parsed.awips_id or '', parsed.wfo)
+            except Exception:
+                log.exception('NWWS SPS preamble normalization failed; continuing with original script')
+
+            # EXP/CAN short narration: if VTEC says expired/cancel and this is voice-only,
+            # prefer a small 'has expired' narration instead of reading the whole product.
+            try:
+                if tracks and not should_full:
+                    if ('EXP' in vtec_actions) or ('CAN' in vtec_actions):
+                        summ = self._expiry_summary_script(official_text)
+                        if summ:
+                            spoken.script = summ
+                            log.info(
+                                'NWWS EXP/CAN summary enabled (act=%s type=%s awips=%s wfo=%s)',
+                                ','.join(sorted(vtec_actions))[:64],
+                                parsed.product_type,
+                                parsed.awips_id or '',
+                                parsed.wfo,
+                            )
+            except Exception:
+                log.exception('NWWS EXP/CAN summary failed; continuing with original script')
 
             if should_full:
                 # If we have in-area SAME targets, use them. Otherwise, AIR WITHOUT SAME (no 67 fallback).
