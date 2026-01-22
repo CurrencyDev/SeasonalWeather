@@ -67,3 +67,15 @@ You’ll need at least:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+
+---
+
+## Debug / test tool: inject
+
+This repo ships an inject helper used to generate a test alert WAV (and optionally push it into the Liquidsoap alert queue).
+
+Run from the repo root using the SeasonalWeather venv Python:
+
+```bash
+/opt/seasonalweather/venv/bin/python -m seasonalweather.cli.inject --help
+/opt/seasonalweather/venv/bin/python -m seasonalweather.cli.inject --event DMO --loc 024021 test-alert "hello world"
