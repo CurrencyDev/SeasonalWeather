@@ -2,10 +2,22 @@
 
 SeasonalWeather is a Python-based, internet-delivered weather/alert radio stream inspired by NOAA Weather Radio (NWR) broadcast workflows: continuous cycle audio plus interrupting alert cut-ins (SAME header bursts, 1050 Hz, spoken content, EOM).
 
-It’s designed for homelab / hobby broadcast use with a focus on resiliency, dedupe, and “don’t spam the entire service area by accident.”
+It’s designed for homelab / hobby IP based stream use with a focus on resiliency, dedupe, and “don’t spam the entire service area by accident.”
 
 > **Not affiliated with NOAA / NWS / FEMA.**
-> This is an **unofficial** hobby project. Do **not** rely on it for life safety.
+> This is an **unofficial** hobby project. **Do not** rely on it for life safety.
+> Always use official sources for real warnings (e.g., NOAA Weather Radio, NWS/NOAA alerts, local authorities).
+
+## Safety, scope, and acceptable use
+SeasonalWeather can generate **valid SAME headers** and **1050 Hz attention tones**. That power comes with responsibility.
+
+- **Intended use:** homelab / internal / IP-based streaming and testing.
+- **Not intended for:** over-the-air broadcasting, public alert origination, or any use that could be confused with an official EAS/NWR source.
+- **You are responsible** for compliance with your local laws/regulations and for preventing misuse.
+
+## Support and warranty
+- Provided **as-is**, with **no warranty** of any kind.
+- Support is **best-effort** and may be limited depending on available time.
 
 ---
 
@@ -80,3 +92,4 @@ Run from the repo root using the SeasonalWeather venv Python:
 ```bash
 /opt/seasonalweather/venv/bin/python -m seasonalweather.cli.inject --help
 /opt/seasonalweather/venv/bin/python -m seasonalweather.cli.inject --event DMO --loc 024021 test-alert "hello world"
+```
