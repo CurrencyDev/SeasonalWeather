@@ -319,7 +319,7 @@ class Orchestrator:
         # Replays voice-only copies of recently-aired products so info isn't heard only once.
         # Disabled by default; enable via SEASONAL_REBROADCAST_ENABLED=1.
         self.rebroadcast_enabled = _env_bool("SEASONAL_REBROADCAST_ENABLED", default=False)
-        self.rebroadcast_interval_seconds = _env_int("SEASONAL_REBROADCAST_INTERVAL_SECONDS", 900)  # min spacing baseline
+        self.rebroadcast_interval_seconds = _env_int("SEASONAL_REBROADCAST_INTERVAL_SECONDS", 300)  # min spacing baseline
         self.rebroadcast_min_gap_seconds = _env_int("SEASONAL_REBROADCAST_MIN_GAP_SECONDS", 300)    # don't spam cut-ins
         self.rebroadcast_ttl_seconds = _env_int("SEASONAL_REBROADCAST_TTL_SECONDS", 3600)           # safety cap if no VTEC
         self.rebroadcast_max_items = _env_int("SEASONAL_REBROADCAST_MAX_ITEMS", 6)
@@ -1436,6 +1436,74 @@ class Orchestrator:
                     except Exception:
                         pass
 
+    async def _rebroadcast_remove_by_tracks(
+        self, *, tracks: list[tuple[str, str]] | None, reason: str
+    ) -> int:
+        """Remove rebroadcast rotation items that match given VTEC track ids."""
+        if not self.rebroadcast_enabled or not tracks:
+            return 0
+
+        track_ids: set[str] = {str(t[0]).strip() for t in tracks if t and str(t[0]).strip()}
+        if not track_ids:
+            return 0
+
+        now = dt.datetime.now(self.local_tz)
+        removed = 0
+
+        async with self._rebroadcast_lock:
+            await self._rebroadcast_prune_locked(now)
+            for k in list(self._rebroadcast_items.keys()):
+                parts = k.split(":")
+                # Key formats:
+                #   RB:src:knd:TRK:<track_id>:<same_sig>
+                #   RB:src:knd:ANON:<same_sig>:<hash>
+                if len(parts) >= 6 and parts[3] == "TRK" and parts[4] in track_ids:
+                    self._rebroadcast_items.pop(k, None)
+                    removed += 1
+
+        if removed:
+            self.log.info(
+                "Rebroadcast: removed %d item(s) tracks=%s reason=%s",
+                removed,
+                ",".join(sorted(track_ids)),
+                reason,
+            )
+        return removed
+
+
+    async def _rebroadcast_touch_expiry_by_tracks(
+        self, *, tracks: list[tuple[str, str]] | None, expires_at: dt.datetime, reason: str
+    ) -> int:
+        """Refresh expiry on any matching rotation items without creating new ones."""
+        if not self.rebroadcast_enabled or not tracks:
+            return 0
+
+        track_ids: set[str] = {str(t[0]).strip() for t in tracks if t and str(t[0]).strip()}
+        if not track_ids:
+            return 0
+
+        now = dt.datetime.now(self.local_tz)
+        touched = 0
+
+        async with self._rebroadcast_lock:
+            await self._rebroadcast_prune_locked(now)
+            for k, it in self._rebroadcast_items.items():
+                parts = k.split(":")
+                if len(parts) >= 6 and parts[3] == "TRK" and parts[4] in track_ids:
+                    it.expires_at = expires_at
+                    touched += 1
+
+        if touched:
+            self.log.debug(
+                "Rebroadcast: refreshed expiry for %d item(s) tracks=%s expires_at=%s reason=%s",
+                touched,
+                ",".join(sorted(track_ids)),
+                expires_at.isoformat(),
+                reason,
+            )
+        return touched
+
+
     def _rebroadcast_pick_due_locked(self, now: dt.datetime) -> SimpleNamespace | None:
         due: list[SimpleNamespace] = []
         for it in self._rebroadcast_items.values():
@@ -1472,7 +1540,7 @@ class Orchestrator:
             it = self._rebroadcast_items.get(key)
             if it and getattr(it, "script_hash", "") == script_hash:
                 it.desc = desc
-                it.expires_at = max(getattr(it, "expires_at", now), expires_at)
+                it.expires_at = expires_at
                 it.next_due_at = min(getattr(it, "next_due_at", now), now + dt.timedelta(seconds=60))
                 return
 
@@ -2136,6 +2204,27 @@ class Orchestrator:
             vtec = self._cap_vtec_list(ev)
             tracks = self._vtec_tracks(vtec)
 
+            # Keep rebroadcast rotation in sync with VTEC lifecycle.
+            # - CAN/EXP => remove immediately so we don't re-air a dead event.
+            # - CON/EXT/etc => refresh expiry for any existing rotation items.
+            if self.rebroadcast_enabled and tracks:
+                vtec_actions = {act for (_t, act) in tracks} if tracks else set()
+                now_local = dt.datetime.now(self.local_tz)
+                exp_utc = self._best_expiry_from_vtec(vtec)
+                expires_at = self._rebroadcast_clamp_expiry(now_local, exp_utc)
+
+                if vtec_actions & {"CAN", "EXP"}:
+                    await self._rebroadcast_remove_by_tracks(
+                        tracks=tracks,
+                        reason=f"cap:{mt}:{','.join(sorted(vtec_actions & {'CAN','EXP'}))}",
+                    )
+                else:
+                    await self._rebroadcast_touch_expiry_by_tracks(
+                        tracks=tracks,
+                        expires_at=expires_at,
+                        reason=f"cap:{mt}:{','.join(sorted(vtec_actions))}",
+                    )
+
             log.info(
                 "CAP match: event=%s severity=%s urgency=%s certainty=%s status=%s msgType=%s sent=%s same=%s headline=%s id=%s vtec=%s tracks=%s",
                 ev.event,
@@ -2601,6 +2690,24 @@ class Orchestrator:
         full_actions = {"NEW", "UPG", "EXA", "EXB"}
         vtec_actions = {act for (_t, act) in tracks} if tracks else set()
         should_full = (not tracks) or bool(vtec_actions & full_actions)
+
+        # Keep rebroadcast rotation in sync with VTEC lifecycle.
+        if self.rebroadcast_enabled and tracks:
+            now_local = dt.datetime.now(self.local_tz)
+            exp_utc = self._best_expiry_from_vtec(vtec)
+            expires_at = self._rebroadcast_clamp_expiry(now_local, exp_utc)
+
+            if vtec_actions & {"CAN", "EXP"}:
+                await self._rebroadcast_remove_by_tracks(
+                    tracks=tracks,
+                    reason=f"nwws:{parsed.product_type}:{','.join(sorted(vtec_actions & {'CAN','EXP'}))}",
+                )
+            else:
+                await self._rebroadcast_touch_expiry_by_tracks(
+                    tracks=tracks,
+                    expires_at=expires_at,
+                    reason=f"nwws:{parsed.product_type}:{','.join(sorted(vtec_actions))}",
+                )
 
 
 
