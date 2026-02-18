@@ -589,8 +589,8 @@ class NWWSClient:
 
         backoff = 2.0
 
-        try:
-            while True:
+        while True:
+            try:
                 # Hard stop any previous worker before starting a new one
                 self.stop()
 
@@ -616,13 +616,16 @@ class NWWSClient:
                 snap = self._shared.snapshot()
 
                 if not started_ok:
-                    log.warning("NWWS supervisor restarting (session_start timeout after %ss)", start_wait_seconds)
+                    log.warning(
+                        "NWWS supervisor restarting (session_start timeout after %ss)",
+                        start_wait_seconds,
+                    )
                     await asyncio.sleep(backoff + random.uniform(0, backoff * 0.25))
                     backoff = min(max_backoff, backoff * 1.6)
                     continue
 
-                if snap.get("last_error") and "authentication failed" in snap["last_error"].lower():
-                    log.warning("NWWS supervisor restarting (auth failed): %s", snap["last_error"])
+                if snap.get('last_error') and 'authentication failed' in str(snap['last_error']).lower():
+                    log.warning('NWWS supervisor restarting (auth failed): %s', snap['last_error'])
                     await asyncio.sleep(backoff + random.uniform(0, backoff * 0.25))
                     backoff = min(max_backoff, backoff * 1.6)
                     continue
@@ -632,11 +635,10 @@ class NWWSClient:
                 snap = self._shared.snapshot()
 
                 if not joined_ok:
-                    # Not immediately fatal in theory, but for your use-case it should join quickly.
                     log.warning(
                         "NWWS supervisor restarting (MUC not confirmed after %ss). last_error=%r",
                         join_wait_seconds,
-                        snap.get("last_error", ""),
+                        snap.get('last_error', ''),
                     )
                     await asyncio.sleep(backoff + random.uniform(0, backoff * 0.25))
                     backoff = min(max_backoff, backoff * 1.6)
@@ -653,27 +655,25 @@ class NWWSClient:
                         raise RuntimeError("NWWS disconnected / worker stopped")
 
                     snap = self._shared.snapshot()
-                    if snap.get("last_error") and "authentication failed" in snap["last_error"].lower():
+                    if snap.get('last_error') and 'authentication failed' in str(snap['last_error']).lower():
                         raise RuntimeError(f"NWWS auth error: {snap['last_error']}")
 
-                    if stall_seconds > 0 and snap.get("muc_joined") and float(snap.get("last_rx_monotonic", 0.0)) > 0:
-                        age = time.monotonic() - float(snap["last_rx_monotonic"])
+                    if stall_seconds > 0 and snap.get('muc_joined') and float(snap.get('last_rx_monotonic', 0.0)) > 0:
+                        age = time.monotonic() - float(snap['last_rx_monotonic'])
                         if age > float(stall_seconds):
-                            raise RuntimeError(f"NWWS stalled: no RX for {age:.1f}s (threshold {stall_seconds}s)")
+                            raise RuntimeError(
+                                f"NWWS stalled: no RX for {age:.1f}s (threshold {stall_seconds}s)"
+                            )
 
-        except asyncio.CancelledError:
-            self.stop()
-            raise
-        except Exception as e:
-            log.warning("NWWS supervisor restarting: %s", e)
-            self.stop()
-            await asyncio.sleep(backoff + random.uniform(0, backoff * 0.25))
-            backoff = min(max_backoff, backoff * 1.6)
-            # loop continues (no recursion)
-            return await self.run_forever()
-        finally:
-            self.stop()
-
+            except asyncio.CancelledError:
+                self.stop()
+                raise
+            except Exception as e:
+                log.warning("NWWS supervisor restarting: %s", e)
+                self.stop()
+                await asyncio.sleep(backoff + random.uniform(0, backoff * 0.25))
+                backoff = min(max_backoff, backoff * 1.6)
+                continue
     def stop(self) -> None:
         self._stop_evt.set()
 

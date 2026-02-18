@@ -25,11 +25,20 @@ def _utcnow() -> dt.datetime:
 
 def _parse_iso(s: str) -> Optional[dt.datetime]:
     try:
-        # Accept "Z" or offset forms
-        s2 = s.replace("Z", "+00:00")
-        return dt.datetime.fromisoformat(s2)
+        if not s:
+            return None
+        # Accept "Z" or offset forms; normalize to aware UTC
+        s2 = s.strip().replace("Z", "+00:00")
+        t = dt.datetime.fromisoformat(s2)
+        if t.tzinfo is None:
+            # Treat naive timestamps as UTC (older ledgers, edits, bugs)
+            t = t.replace(tzinfo=dt.timezone.utc)
+        else:
+            t = t.astimezone(dt.timezone.utc)
+        return t
     except Exception:
         return None
+
 
 
 @dataclass
@@ -93,13 +102,26 @@ class CapLedger:
         self._seen[key] = _utcnow().isoformat()
 
     def cleanup(self) -> None:
-        self._load()
+        # Avoid recursion weirdness: if not loaded, load will call cleanup once.
+        if not self._loaded:
+            self._load()
+            return
+
         cutoff = _utcnow() - dt.timedelta(days=max(3, int(self.max_age_days)))
         out: Dict[str, str] = {}
+
         for k, v in self._seen.items():
-            t = _parse_iso(v) or _utcnow()
+            t = _parse_iso(v)
+
+            # If it won't parse, repair it to "now" (prevents permanent non-expiring junk)
+            if t is None:
+                t = _utcnow()
+                v = t.isoformat()
+
+            # t is guaranteed aware UTC now -> safe compare
             if t >= cutoff:
                 out[k] = v
+
         self._seen = out
 
     def flush(self) -> None:
