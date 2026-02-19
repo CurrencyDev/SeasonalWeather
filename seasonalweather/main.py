@@ -18,6 +18,8 @@ import hashlib
 import logging
 import math
 import os
+import time
+
 import re
 import sys
 import uuid
@@ -56,6 +58,16 @@ except Exception:  # pragma: no cover
     NwsCapPoller = None  # type: ignore
     CapAlertEvent = None  # type: ignore
 
+
+# Optional Station Alert Feed (handled alerts JSON for radio UI)
+try:
+    from .station_feed import FeedSender, StationFeedAlert, atomic_write_json, build_station_feed_payload
+except Exception:
+    FeedSender = None  # type: ignore
+    StationFeedAlert = None  # type: ignore
+    atomic_write_json = None  # type: ignore
+    build_station_feed_payload = None  # type: ignore
+
 # Optional ERN/GWES SAME monitor (Level 3 source)
 try:
     from .ern_gwes import ErnGwesMonitor, ErnSameEvent, defaults_from_env
@@ -66,6 +78,237 @@ except Exception:  # pragma: no cover
 
 
 log = logging.getLogger("seasonalweather")
+
+# --- Station Alert Feed (handled alerts JSON for radio UI) ---
+# SeasonalWeather writes a tiny JSON file with the most recently *handled* alerts.
+# nginx serves it from /api/station/ so the radio site can display “what’s being aired”.
+
+_STATION_FEED_STATE = {}  # id -> (StationFeedAlert, expires_ts)
+_STATION_FEED_LAST_WRITE_TS = 0.0
+
+
+def _sf_now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _sf_parse_dt(value):
+    if value is None:
+        return None
+    if isinstance(value, dt.datetime):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            return dt.datetime.fromisoformat(s)
+        except Exception:
+            return None
+    return None
+
+
+def _sf_iso(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+def _sf_sha1_12(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8", "ignore")).hexdigest()[:12]
+
+
+def _sf_enabled() -> bool:
+    if StationFeedAlert is None or atomic_write_json is None or build_station_feed_payload is None:
+        return False
+    v = os.getenv("SEASONAL_STATION_FEED_ENABLED", "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    return bool(os.getenv("SEASONAL_STATION_FEED_PATH", "").strip())
+
+
+def _sf_cfg():
+    station_id = os.getenv("SEASONAL_STATION_FEED_STATION_ID", "seasonalweather").strip() or "seasonalweather"
+    path = os.getenv("SEASONAL_STATION_FEED_PATH", "/srv/seasonalweather/api/station/handled-alerts.json").strip() or "/srv/seasonalweather/api/station/handled-alerts.json"
+    source = os.getenv("SEASONAL_STATION_FEED_SOURCE", "seasonalweather").strip() or "seasonalweather"
+    max_items = int(os.getenv("SEASONAL_STATION_FEED_MAX_ITEMS", "24") or 24)
+    ttl_s = int(os.getenv("SEASONAL_STATION_FEED_TTL_SECONDS", "7200") or 7200)
+    min_write_s = float(os.getenv("SEASONAL_STATION_FEED_MIN_WRITE_SECONDS", "0.5") or 0.5)
+    return station_id, path, source, max_items, ttl_s, min_write_s
+
+
+def _sf_prune(now_ts: float, *, max_items: int) -> None:
+    expired = [k for k, (_, exp) in _STATION_FEED_STATE.items() if exp <= now_ts]
+    for k in expired:
+        _STATION_FEED_STATE.pop(k, None)
+    if len(_STATION_FEED_STATE) > max_items:
+        items = sorted(_STATION_FEED_STATE.items(), key=lambda kv: kv[1][1], reverse=True)
+        keep = dict(items[:max_items])
+        _STATION_FEED_STATE.clear()
+        _STATION_FEED_STATE.update(keep)
+
+
+def _sf_write(now_ts: float) -> None:
+    global _STATION_FEED_LAST_WRITE_TS
+    station_id, path, source, max_items, ttl_s, min_write_s = _sf_cfg()
+    if now_ts - _STATION_FEED_LAST_WRITE_TS < min_write_s:
+        return
+    _sf_prune(now_ts, max_items=max_items)
+    alerts = [a for (a, _) in _STATION_FEED_STATE.values()]
+    payload = build_station_feed_payload(
+        station_id=station_id,
+        source=source,
+        generated_at_iso=_sf_now_iso(),
+        alerts=alerts,
+    )
+    atomic_write_json(path, payload)
+    _STATION_FEED_LAST_WRITE_TS = now_ts
+
+
+def _sf_emit(alert, *, expires_at=None) -> None:
+    if not _sf_enabled():
+        return
+    try:
+        _station_id, _path, _source, max_items, ttl_s, _min_write_s = _sf_cfg()
+        now_ts = time.time()
+        exp_dt = _sf_parse_dt(expires_at)
+        exp_ts = exp_dt.timestamp() if exp_dt else (now_ts + ttl_s)
+        _STATION_FEED_STATE[alert.id] = (alert, exp_ts)
+        _sf_write(now_ts)
+    except Exception:
+        log.exception("Station feed: failed to write handled-alerts.json")
+
+
+def _station_feed_note_cap(ev, *, mode: str, same_locations, out_wav: str, same_code=None, vtec=None) -> None:
+    if not _sf_enabled():
+        return
+    try:
+        alert_id = getattr(ev, "alert_id", None) or getattr(ev, "id", None) or _sf_sha1_12(str(ev))
+        event = getattr(ev, "event", None) or "Alert"
+        headline = getattr(ev, "headline", None) or event
+        severity = getattr(ev, "severity", None) or "Unknown"
+        urgency = getattr(ev, "urgency", None) or "Unknown"
+        certainty = getattr(ev, "certainty", None) or "Unknown"
+        area = getattr(ev, "area_desc", None) or getattr(ev, "area", None) or ""
+        effective = _sf_iso(getattr(ev, "effective", None))
+        ends = _sf_iso(getattr(ev, "ends", None))
+        expires = _sf_iso(getattr(ev, "expires", None))
+        sent = _sf_iso(getattr(ev, "sent", None))
+
+        wfo = getattr(ev, "wfo", None) or getattr(ev, "office", None)
+        sender_name = f"NWS CAP{f'/{wfo}' if wfo else ''}"
+        sender = FeedSender(name=sender_name, kind="origin") if FeedSender else None
+
+        links = {"mode": mode, "wav": out_wav}
+        if isinstance(alert_id, str) and re.fullmatch(r"[0-9a-fA-F-]{30,}", alert_id):
+            links["nws"] = f"https://api.weather.gov/alerts/{alert_id}"
+        if same_code:
+            links["same"] = f"same:{same_code}"
+        if vtec:
+            links["vtec"] = vtec
+
+        alert = StationFeedAlert(
+            id=str(alert_id),
+            event=str(event),
+            headline=str(headline),
+            severity=str(severity),
+            urgency=str(urgency),
+            certainty=str(certainty),
+            area=str(area),
+            effective=effective,
+            ends=ends,
+            expires=expires,
+            sent=sent,
+            sameCodes=[str(x) for x in (same_locations or [])],
+            from_=sender,
+            links=links,
+        )
+        _sf_emit(alert, expires_at=getattr(ev, "expires", None) or getattr(ev, "ends", None))
+    except Exception:
+        log.exception("Station feed: failed to note CAP alert")
+
+
+def _station_feed_note_ern(ev, *, same_locations, out_wav: str) -> None:
+    if not _sf_enabled():
+        return
+    try:
+        sender_name = getattr(ev, "sender", None) or "ERN"
+        sender_kind = getattr(ev, "sender_kind", None) or "relay"
+        sender = FeedSender(name=str(sender_name), kind=str(sender_kind)) if FeedSender else None
+
+        event = getattr(ev, "event", None) or "SAME Relay"
+        headline = getattr(ev, "headline", None) or getattr(ev, "text", None) or str(event)
+        alert_id = getattr(ev, "id", None) or _sf_sha1_12(f"ern:{event}:{headline}:{sender_name}:{out_wav}")
+
+        links = {"mode": "REL", "wav": out_wav}
+
+        alert = StationFeedAlert(
+            id=str(alert_id),
+            event=str(event),
+            headline=str(headline),
+            severity="Unknown",
+            urgency="Unknown",
+            certainty="Unknown",
+            area=str(getattr(ev, "area", None) or ""),
+            effective=None,
+            ends=None,
+            expires=None,
+            sent=_sf_iso(getattr(ev, "sent", None)),
+            sameCodes=[str(x) for x in (same_locations or [])],
+            from_=sender,
+            links=links,
+        )
+        _sf_emit(alert)
+    except Exception:
+        log.exception("Station feed: failed to note ERN relay")
+
+
+def _station_feed_note_nwws(parsed, *, mode: str, same_locations, out_wav: str, product_id=None) -> None:
+    if not _sf_enabled():
+        return
+    try:
+        awips = getattr(parsed, "awips_id", None) or getattr(parsed, "awips", None) or ""
+        wfo = getattr(parsed, "wfo", None) or ""
+        prod_type = getattr(parsed, "product_type", None) or "NWWS"
+        issued = getattr(parsed, "issued", None)
+        key = f"nwws:{prod_type}:{awips}:{wfo}:{issued}"
+        alert_id = _sf_sha1_12(key)
+
+        headline = f"{prod_type} {awips}".strip()
+        sender = FeedSender(name="NWWS-OI", kind="relay") if FeedSender else None
+
+        links = {"mode": mode, "wav": out_wav}
+        if product_id:
+            links["nws"] = f"https://api.weather.gov/products/{product_id}"
+
+        alert = StationFeedAlert(
+            id=str(alert_id),
+            event=str(prod_type),
+            headline=headline,
+            severity="Unknown",
+            urgency="Unknown",
+            certainty="Unknown",
+            area=str(wfo),
+            effective=None,
+            ends=None,
+            expires=None,
+            sent=_sf_iso(issued),
+            sameCodes=[str(x) for x in (same_locations or [])],
+            from_=sender,
+            links=links,
+        )
+        _sf_emit(alert)
+    except Exception:
+        log.exception("Station feed: failed to note NWWS toneout")
+
 
 # We surgically remove the stale time sentence from the Station ID segment,
 # because we will insert a live-updating time WAV right after it.
@@ -2352,6 +2595,7 @@ class Orchestrator:
             except Exception:
                 log.exception("Rebroadcast: failed to add CAP FULL item")
             log.info("CAP ACTION: aired FULL event=%s code=%s id=%s sent=%s vtec=%s audio=%s", ev.event, same_code, ev.alert_id, ev.sent, ",".join(vtec[:2]) if vtec else "", out_wav)
+            _station_feed_note_cap(ev, mode="FULL", same_locations=(same_locs if same_locs else same_locs_raw), out_wav=str(out_wav), same_code=same_code, vtec=vtec)
         except Exception:
             await self._dedupe_release(keys)
             raise
@@ -2425,6 +2669,7 @@ class Orchestrator:
             except Exception:
                 log.exception("Rebroadcast: failed to add CAP VOICE item")
             log.info("CAP ACTION: aired voice-only event=%s id=%s sent=%s audio=%s", ev.event, ev.alert_id, ev.sent, out_wav)
+            _station_feed_note_cap(ev, mode="VOICE", same_locations=[], out_wav=str(out_wav), vtec=vtec)
         except Exception:
             await self._dedupe_release(keys)
             raise
@@ -2639,6 +2884,7 @@ class Orchestrator:
                 len(in_area_locs),
                 out_wav,
             )
+            _station_feed_note_ern(ev, same_locations=in_area_locs, out_wav=str(out_wav))
 
     async def _handle_toneout(self, parsed: ParsedProduct) -> None:
         log.info("NWWS toneout candidate: type=%s awips=%s wfo=%s", parsed.product_type, parsed.awips_id or "", parsed.wfo)
@@ -2830,6 +3076,7 @@ class Orchestrator:
                 ",".join(t for (t, _a) in tracks[:2]) if tracks else "",
                 out_wav,
             )
+            _station_feed_note_nwws(parsed, mode=spoken.mode, same_locations=(same_for_render if spoken.mode == "FULL" else []), out_wav=str(out_wav), product_id=pid)
 
             self._schedule_cycle_refill("post-alert")
 
