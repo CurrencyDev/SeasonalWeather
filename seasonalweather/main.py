@@ -198,17 +198,107 @@ def _station_feed_note_cap(ev, *, mode: str, same_locations, out_wav: str, same_
         urgency = getattr(ev, "urgency", None) or "Unknown"
         certainty = getattr(ev, "certainty", None) or "Unknown"
         area = getattr(ev, "area_desc", None) or getattr(ev, "area", None) or ""
-        effective = _sf_iso(getattr(ev, "effective", None))
-        ends = _sf_iso(getattr(ev, "ends", None))
-        expires = _sf_iso(getattr(ev, "expires", None))
-        sent = _sf_iso(getattr(ev, "sent", None))
+        # Times: internal CAP event objects don't always carry these fields.
+        # Prefer explicit ev.* fields; otherwise derive END from VTEC; optionally backfill from api.weather.gov.
+        effective_raw = getattr(ev, "effective", None)
+        ends_raw = getattr(ev, "ends", None)
+        expires_raw = getattr(ev, "expires", None)
+        sent_raw = getattr(ev, "sent", None)
+
+        def _sf_truthy_env(name: str) -> bool:
+            v = (os.getenv(name, "") or "").strip().lower()
+            return v in ("1", "true", "yes", "on")
+
+        def _sf_best_end_from_vtec(vtec_list):
+            # Pull the END token after '-' if present: ...-YYYYMMDDThhmmZ/
+            try:
+                ends = []
+                for raw in vtec_list or []:
+                    ss = "".join(str(raw).split()).strip()
+                    if not ss:
+                        continue
+                    m = re.search(r"-((?:\d{8}|\d{6})T\d{4}Z)", ss)
+                    if not m:
+                        continue
+                    txt = m.group(1).upper()
+                    mm = re.fullmatch(r"(\d{8}|\d{6})T(\d{4})Z", txt)
+                    if not mm:
+                        continue
+
+                    d = mm.group(1)
+                    hm = mm.group(2)
+
+                    if len(d) == 8:
+                        year = int(d[0:4])
+                        month = int(d[4:6])
+                        day = int(d[6:8])
+                    else:
+                        year = 2000 + int(d[0:2])
+                        month = int(d[2:4])
+                        day = int(d[4:6])
+
+                    hour = int(hm[0:2])
+                    minute = int(hm[2:4])
+
+                    ends.append(dt.datetime(year, month, day, hour, minute, tzinfo=dt.timezone.utc))
+
+                return max(ends) if ends else None
+            except Exception:
+                return None
+
+        # Try to derive end time from VTEC if missing
+        vtec_list = vtec or getattr(ev, "vtec", None) or getattr(ev, "vtec_list", None)
+        if not isinstance(vtec_list, list):
+            vtec_list = [vtec_list] if vtec_list else []
+        vtec_end = _sf_best_end_from_vtec(vtec_list)
+
+        if vtec_end:
+            ends_raw = ends_raw or vtec_end
+            expires_raw = expires_raw or vtec_end
+            effective_raw = effective_raw or sent_raw  # best-effort
+
+        # Optional: backfill from NWS alert detail endpoint (handles urn:oid IDs)
+        if _sf_truthy_env("SEASONAL_STATION_FEED_FETCH_NWS") and isinstance(alert_id, str) and alert_id.strip():
+            try:
+                import requests  # type: ignore
+                url = f"https://api.weather.gov/alerts/{alert_id}"
+                r = requests.get(
+                    url,
+                    headers={"User-Agent": "(seasonalnet.org, info@seasonalnet.org)"},
+                    timeout=8,
+                )
+                if r.ok:
+                    props = (r.json() or {}).get("properties", {}) or {}
+                    sent_raw = sent_raw or props.get("sent")
+                    effective_raw = effective_raw or props.get("effective")
+                    ends_raw = ends_raw or props.get("ends") or props.get("eventEndingTime")
+                    expires_raw = expires_raw or props.get("expires")
+            except Exception:
+                pass
+
+        effective = _sf_iso(effective_raw)
+        ends = _sf_iso(ends_raw)
+        expires = _sf_iso(expires_raw)
+        sent = _sf_iso(sent_raw)
+
+        expires_at = expires_raw or ends_raw
+
+        if _sf_truthy_env("SEASONAL_STATION_FEED_DEBUG"):
+            try:
+                keys = sorted(getattr(ev, "__dict__", {}).keys())
+            except Exception:
+                keys = []
+            log.info(
+                "Station feed CAP: id=%r sent=%r effective=%r expires=%r ends=%r vtec=%r keys=%s",
+                alert_id, sent, effective, expires, ends, vtec_list, keys
+            )
 
         wfo = getattr(ev, "wfo", None) or getattr(ev, "office", None)
         sender_name = f"NWS CAP{f'/{wfo}' if wfo else ''}"
         sender = FeedSender(name=sender_name, kind="origin") if FeedSender else None
 
         links = {"mode": mode, "wav": out_wav}
-        if isinstance(alert_id, str) and re.fullmatch(r"[0-9a-fA-F-]{30,}", alert_id):
+        if isinstance(alert_id, str) and alert_id.strip():
             links["nws"] = f"https://api.weather.gov/alerts/{alert_id}"
         if same_code:
             links["same"] = f"same:{same_code}"
@@ -231,7 +321,7 @@ def _station_feed_note_cap(ev, *, mode: str, same_locations, out_wav: str, same_
             from_=sender,
             links=links,
         )
-        _sf_emit(alert, expires_at=getattr(ev, "expires", None) or getattr(ev, "ends", None))
+        _sf_emit(alert, expires_at=expires_at)
     except Exception:
         log.exception("Station feed: failed to note CAP alert")
 
