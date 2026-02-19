@@ -484,6 +484,7 @@ class Orchestrator:
         )
 
         self._tz = ZoneInfo(cfg.station.timezone)
+        self.local_tz = self._tz  # alias for newer code paths (rebroadcast, etc.)
 
         # NWWS-OI
         self.jid = _env_required("NWWS_JID")
@@ -2455,6 +2456,7 @@ class Orchestrator:
                 now_local = dt.datetime.now(self.local_tz)
                 exp_utc = self._best_expiry_from_vtec(vtec)
                 expires_at = self._rebroadcast_clamp_expiry(now_local, exp_utc)
+                mt = str(getattr(ev, "message_type", None) or "Alert")
 
                 if vtec_actions & {"CAN", "EXP"}:
                     await self._rebroadcast_remove_by_tracks(
@@ -2942,6 +2944,7 @@ class Orchestrator:
             now_local = dt.datetime.now(self.local_tz)
             exp_utc = self._best_expiry_from_vtec(vtec)
             expires_at = self._rebroadcast_clamp_expiry(now_local, exp_utc)
+            mt = str(getattr(ev, "message_type", None) or "Alert")
 
             if vtec_actions & {"CAN", "EXP"}:
                 await self._rebroadcast_remove_by_tracks(
