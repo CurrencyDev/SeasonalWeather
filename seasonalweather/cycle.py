@@ -401,18 +401,31 @@ class CycleBuilder:
 
         # --- Forecast snippets (gridpoint) ---
         fc_lines: List[str] = []
-        max_points = 1 if ctx.mode == "heightened" else 3
-        for lat, lon, label in self.points[:max_points]:
+        max_points = 1 if ctx.mode == "heightened" else _env_int("SEASONAL_CYCLE_FC_MAX_POINTS_NORMAL", 6)
+        field = "shortForecast" if _env_int("SEASONAL_CYCLE_FC_USE_SHORT", 1) else "detailedForecast"
+        max_periods = 1 if ctx.mode == "heightened" else _env_int("SEASONAL_CYCLE_FC_PERIODS_NORMAL", 1)
+        line_max = _env_int("SEASONAL_CYCLE_FC_LINE_MAX_CHARS", 260)
+
+        pts = list(self.points)
+        if pts:
+            rot_period = _env_int("SEASONAL_CYCLE_FC_ROTATE_PERIOD_S", 300)
+            rot_step = _env_int("SEASONAL_CYCLE_FC_ROTATE_STEP", max_points)
+            slot = int(now.timestamp() // max(rot_period, 1))
+            offset = (slot * max(rot_step, 1)) % len(pts)
+            pts = pts[offset:] + pts[:offset]
+
+        for lat, lon, label in pts[:max_points]:
             try:
                 periods = await self.api.point_forecast_periods(lat, lon)
                 if periods:
                     p1 = periods[0]
                     p2 = periods[1] if len(periods) > 1 else None
 
-                    line = f"{label}: {p1.get('name','')} — {p1.get('detailedForecast','')}"
-                    if ctx.mode != "heightened" and p2 and p2.get("detailedForecast"):
-                        line += f" {p2.get('name','')} — {p2.get('detailedForecast','')}"
+                    line = f"{label}: {p1.get('name','')} — {p1.get(field,'')}"
+                    if max_periods >= 2 and p2 and p2.get(field):
+                        line += f" {p2.get('name','')} — {p2.get(field,'')}"
                     line = _scrub_nws_product_text(line)
+                    line = _trim_chars(line, line_max)
                     if line:
                         fc_lines.append(line)
             except Exception:

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 
 # =========================================================================================
 #      MP"""""`MM                                                       dP              MM'"""'YMM
@@ -178,6 +179,7 @@ def _sf_emit(alert, *, expires_at=None) -> None:
         return
     try:
         _station_id, _path, _source, max_items, ttl_s, _min_write_s = _sf_cfg()
+        _sf_station_feed_hk_start()
         now_ts = time.time()
         exp_dt = _sf_parse_dt(expires_at)
         exp_ts = exp_dt.timestamp() if exp_dt else (now_ts + ttl_s)
@@ -186,6 +188,445 @@ def _sf_emit(alert, *, expires_at=None) -> None:
     except Exception:
         log.exception("Station feed: failed to write handled-alerts.json")
 
+
+
+def _sf_eas_article(word: str) -> str:
+    w = (word or "").strip()
+    return "an" if (w[:1].lower() in "aeiou") else "a"
+
+
+_SF_EAS_ORG_PREFIX = {
+    "WXR": "The National Weather Service has issued",
+    "CIV": "A civil authority has issued",
+    "EAS": "An EAS participant has issued",
+    "PEP": "A primary entry point station has issued",
+}
+
+# Minimal event map; unknown codes fall back to the code itself
+_SF_EAS_EVENT_LABELS = {
+    "RWT": "Required Weekly Test",
+    "RMT": "Required Monthly Test",
+    "DMO": "Practice/Demo Warning",
+    "FFW": "Flash Flood Warning",
+    "FFA": "Flash Flood Watch",
+    "FLW": "Flood Warning",
+    "FLS": "Flood Statement",
+    "SVR": "Severe Thunderstorm Warning",
+    "SVA": "Severe Thunderstorm Watch",
+    "TOR": "Tornado Warning",
+    "TOA": "Tornado Watch",
+    "SMW": "Special Marine Warning",
+    "SPS": "Special Weather Statement",
+}
+
+# ZCZC-ORG-EEE-LLLLLL-LLLLLL+TTTT-JJJHHMM-SENDER-
+_SF_ZCZC_RE = re.compile(
+    r"^ZCZC-"
+    r"(?P<org>[A-Z]{3})-"
+    r"(?P<event>[A-Z0-9]{3})-"
+    r"(?P<locs>(?:\d{6}-)+)"
+    r"\+(?P<dur>\d{4})-"
+    r"(?P<jday>\d{3})(?P<hh>\d{2})(?P<mm>\d{2})-"
+    r"(?P<sender>[^-]{1,16})-?$"
+)
+
+def _sf_same_jday_to_utc(jday: int, hh: int, mm: int):
+    now = dt.datetime.now(dt.timezone.utc)
+    base = dt.datetime(now.year, 1, 1, tzinfo=dt.timezone.utc)
+    cand = base + dt.timedelta(days=jday - 1, hours=hh, minutes=mm)
+
+    # Year rollover sanity: choose the closest plausible year
+    cands = [cand]
+    try:
+        cands.append(cand.replace(year=cand.year - 1))
+        cands.append(cand.replace(year=cand.year + 1))
+    except Exception:
+        pass
+    return min(cands, key=lambda x: abs((x - now).total_seconds()))
+
+def _sf_parse_same_header(zczc_text):
+    s = str(zczc_text or "").strip()
+    # Sometimes downstream strings may include extra whitespace/newlines
+    s = "".join(s.split())
+    m = _SF_ZCZC_RE.match(s)
+    if not m:
+        return None
+    org = m.group("org")
+    event_code = m.group("event")
+    same_codes = [x for x in m.group("locs").split("-") if x]
+    dur = m.group("dur")
+    jday = int(m.group("jday"))
+    hh = int(m.group("hh"))
+    mm = int(m.group("mm"))
+    sender = m.group("sender")
+
+    start_utc = _sf_same_jday_to_utc(jday, hh, mm)
+    end_utc = start_utc + dt.timedelta(hours=int(dur[:2]), minutes=int(dur[2:]))
+
+    return {
+        "org": org,
+        "event_code": event_code,
+        "same_codes": same_codes,
+        "sender": sender,
+        "start_utc": start_utc,
+        "end_utc": end_utc,
+        "raw": s,
+    }
+
+def _sf_fmt_local(dt_obj):
+    try:
+        return dt_obj.astimezone().strftime("%-I:%M %p on %b %-d, %Y")
+    except Exception:
+        try:
+            return dt_obj.isoformat()
+        except Exception:
+            return str(dt_obj)
+
+def _sf_make_eas_headline(*, org, event_text, area_text, start_utc, end_utc, sender):
+    prefix = _SF_EAS_ORG_PREFIX.get(str(org or "").upper(), "An alert originator has issued")
+    event_text = str(event_text or "Alert").strip() or "Alert"
+    area_text = str(area_text or "").strip() or "Unknown area"
+    article = _sf_eas_article(event_text)
+    return (
+        f"{prefix} {article.upper()} {event_text.upper()} for the following counties or areas: "
+        f"{area_text}; at {_sf_fmt_local(start_utc)} Effective until {_sf_fmt_local(end_utc)}. "
+        f"Message from {sender}."
+    )
+
+
+
+### STATION_FEED_EAS_LABELS_FULL_PATCH ###
+# Full current FCC EAS event-code labels (47 CFR §11.31 Table 2 to paragraph (e), incl. MEP)
+# This block is intentionally additive and tries to patch whatever helper/dict names your prior patch used.
+
+_SF_EAS_EVENT_LABELS_FULL = {
+    # National (required)
+    "EAN": "Emergency Action Notification",
+    "NIC": "National Information Center",
+    "NPT": "National Periodic Test",
+    "RMT": "Required Monthly Test",
+    "RWT": "Required Weekly Test",
+
+    # State / local (optional)
+    "ADR": "Administrative Message",
+    "AVW": "Avalanche Warning",
+    "AVA": "Avalanche Watch",
+    "BZW": "Blizzard Warning",
+    "BLU": "Blue Alert",
+    "CAE": "Child Abduction Emergency",
+    "CDW": "Civil Danger Warning",
+    "CEM": "Civil Emergency Message",
+    "CFW": "Coastal Flood Warning",
+    "CFA": "Coastal Flood Watch",
+    "DSW": "Dust Storm Warning",
+    "EQW": "Earthquake Warning",
+    "EVI": "Evacuation Immediate",
+    "EWW": "Extreme Wind Warning",
+    "FRW": "Fire Warning",
+    "FFW": "Flash Flood Warning",
+    "FFA": "Flash Flood Watch",
+    "FFS": "Flash Flood Statement",
+    "FLW": "Flood Warning",
+    "FLA": "Flood Watch",
+    "FLS": "Flood Statement",
+    "HMW": "Hazardous Materials Warning",
+    "HWW": "High Wind Warning",
+    "HWA": "High Wind Watch",
+    "HUW": "Hurricane Warning",
+    "HUA": "Hurricane Watch",
+    "HLS": "Hurricane Statement",
+    "LEW": "Law Enforcement Warning",
+    "LAE": "Local Area Emergency",
+    "MEP": "Missing and Endangered Persons",
+    "NMN": "Network Message Notification",
+    "TOE": "911 Telephone Outage Emergency",
+    "NUW": "Nuclear Power Plant Warning",
+    "DMO": "Practice/Demo Warning",
+    "RHW": "Radiological Hazard Warning",
+    "SVR": "Severe Thunderstorm Warning",
+    "SVA": "Severe Thunderstorm Watch",
+    "SVS": "Severe Weather Statement",
+    "SPW": "Shelter in Place Warning",
+    "SMW": "Special Marine Warning",
+    "SPS": "Special Weather Statement",
+    "SSA": "Storm Surge Watch",
+    "SSW": "Storm Surge Warning",
+    "TOR": "Tornado Warning",
+    "TOA": "Tornado Watch",
+    "TRW": "Tropical Storm Warning",
+    "TRA": "Tropical Storm Watch",
+    "TSW": "Tsunami Warning",
+    "TSA": "Tsunami Watch",
+    "VOW": "Volcano Warning",
+    "WSW": "Winter Storm Warning",
+    "WSA": "Winter Storm Watch",
+}
+
+# A few common legacy/enthusiast aliases you may still see in the wild.
+# (Harmless if unused; keeps UI from falling back to raw code text.)
+_SF_EAS_EVENT_LABELS_FULL.setdefault("EAT", "Emergency Action Termination")
+_SF_EAS_EVENT_LABELS_FULL.setdefault("NAT", "National Audible Test")
+_SF_EAS_EVENT_LABELS_FULL.setdefault("NEM", "National Emergency Message")
+_SF_EAS_EVENT_LABELS_FULL.setdefault("NST", "National Silent Test")
+
+def _sf_eas_event_label_full(code):
+    c = (str(code or "").strip().upper())
+    if not c:
+        return "Alert"
+    return _SF_EAS_EVENT_LABELS_FULL.get(c, c)
+
+def _sf_patch_eas_label_helpers():
+    # 1) Patch common dict names by updating them in place
+    dict_candidates = (
+        "_EAS_EVENT_LABELS",
+        "EAS_EVENT_LABELS",
+        "_EAS_EVENT_NAMES",
+        "EAS_EVENT_NAMES",
+        "_SF_EAS_EVENT_LABELS",
+        "_SF_EAS_EVENT_NAMES",
+        "_SAME_EVENT_LABELS",
+        "_SAME_EVENT_NAMES",
+    )
+    for nm in dict_candidates:
+        try:
+            obj = globals().get(nm)
+            if isinstance(obj, dict):
+                obj.update(_SF_EAS_EVENT_LABELS_FULL)
+        except Exception:
+            pass
+
+    # 2) Wrap common helper function names so they fall back to the full map
+    fn_candidates = (
+        "_sf_eas_event_name",
+        "_sf_eas_event_label",
+        "_same_event_name",
+        "_same_event_label",
+        "_eas_event_name",
+        "_eas_event_label",
+    )
+    for nm in fn_candidates:
+        try:
+            fn = globals().get(nm)
+            if not callable(fn):
+                continue
+            # Avoid double-wrapping
+            if getattr(fn, "__name__", "") == "_sf_eas_event_label_full_wrapper":
+                continue
+
+            def _make_wrapper(_orig):
+                def _sf_eas_event_label_full_wrapper(code, *args, **kwargs):
+                    c = (str(code or "").strip().upper())
+                    if c in _SF_EAS_EVENT_LABELS_FULL:
+                        return _SF_EAS_EVENT_LABELS_FULL[c]
+                    try:
+                        return _orig(code, *args, **kwargs)
+                    except TypeError:
+                        return _orig(code)
+                return _sf_eas_event_label_full_wrapper
+
+            globals()[nm] = _make_wrapper(fn)
+        except Exception:
+            pass
+
+_sf_patch_eas_label_helpers()
+
+
+### STATION_FEED_HOUSEKEEPING_PATCH ###
+
+
+# Safe station-feed housekeeping helpers (startup-safe JSON prune)
+def _sf_hk_truthy_env(name: str, default: str = "1") -> bool:
+    v = str(os.getenv(name, default) or default).strip().lower()
+    return v in {"1", "true", "yes", "on", "y"}
+
+def _sf_hk_int_env(name: str, default: int) -> int:
+    try:
+        return int(str(os.getenv(name, str(default)) or str(default)).strip())
+    except Exception:
+        return int(default)
+
+def _sf_hk_interval_s() -> int:
+    # How often the housekeeping thread checks handled-alerts.json
+    return max(5, _sf_hk_int_env("SEASONAL_STATION_FEED_HK_INTERVAL_SEC", 60))
+
+def _sf_hk_grace_s() -> int:
+    # Small grace so clock skew / second rounding doesn't prune too aggressively
+    return max(0, _sf_hk_int_env("SEASONAL_STATION_FEED_HK_GRACE_SEC", 5))
+
+def _sf_hk_keep_unparseable() -> bool:
+    # If an alert has no parseable ends/expires, keep it by default (safer than deleting)
+    return _sf_hk_truthy_env("SEASONAL_STATION_FEED_HK_KEEP_UNPARSEABLE", "1")
+
+def _sf_hk_alert_expiry_ts(alert_obj):
+    """
+    Return the best expiry timestamp for a station-feed alert dict using ends/expires.
+    Uses the latest parseable time so entries don't get pruned too early.
+    """
+    if not isinstance(alert_obj, dict):
+        return None
+
+    candidates = []
+    for k in ("ends", "expires"):
+        raw = alert_obj.get(k)
+        dt_obj = _sf_parse_dt(raw)
+        if dt_obj is None:
+            continue
+        try:
+            candidates.append(float(dt_obj.timestamp()))
+        except Exception:
+            continue
+
+    return max(candidates) if candidates else None
+
+def _sf_hk_prune_json_file(now_ts: float) -> bool:
+    """
+    Prune expired entries directly from handled-alerts.json without rewriting from
+    the in-memory station-feed cache. This avoids startup nukes when memory is empty.
+    Returns True if the file was rewritten.
+    """
+    if not _sf_enabled():
+        return False
+
+    if not _sf_hk_truthy_env("SEASONAL_STATION_FEED_HOUSEKEEPING_ENABLED", "1"):
+        return False
+
+    _station_id, path, _source, _max_items, _ttl_s, _min_write_s = _sf_cfg()
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except FileNotFoundError:
+        return False
+    except Exception:
+        log.exception("Station feed housekeeping: could not read %s", path)
+        return False
+
+    if not isinstance(payload, dict):
+        return False
+
+    alerts = payload.get("alerts")
+    if not isinstance(alerts, list):
+        return False
+
+    grace_s = float(_sf_hk_grace_s())
+    keep_unparseable = _sf_hk_keep_unparseable()
+
+    kept = []
+    removed = 0
+
+    for item in alerts:
+        if not isinstance(item, dict):
+            removed += 1
+            continue
+
+        exp_ts = _sf_hk_alert_expiry_ts(item)
+
+        if exp_ts is None:
+            if keep_unparseable:
+                kept.append(item)
+            else:
+                removed += 1
+            continue
+
+        # Keep if still valid. Only remove if definitely expired.
+        if (exp_ts + grace_s) >= now_ts:
+            kept.append(item)
+        else:
+            removed += 1
+
+    if removed <= 0:
+        return False
+
+    payload["alerts"] = kept
+    payload["generatedAt"] = _sf_now_iso()
+
+    try:
+        atomic_write_json(path, payload)
+        log.info(
+            "Station feed housekeeping: pruned handled-alerts.json (removed=%s kept=%s path=%s)",
+            removed,
+            len(kept),
+            path,
+        )
+        return True
+    except Exception:
+        log.exception("Station feed housekeeping: failed to rewrite %s after prune", path)
+        return False
+
+
+# Periodic station-feed housekeeping:
+# - one forced startup write (clears stale JSON after restart)
+# - ongoing expiry pruning even when no new alerts arrive
+# - writes only when a prune/max-items trim actually changed the in-memory set
+
+_STATION_FEED_HK_STARTED = False
+_STATION_FEED_HK_FIRST_WRITE_DONE = False
+
+def _sf_station_feed_housekeeping_once():
+    """
+    Startup-safe station-feed housekeeping:
+    - prune in-memory cache (fine)
+    - prune handled-alerts.json directly (safe)
+    - DO NOT write handled-alerts.json from memory here, because memory may be empty on startup
+    """
+    if not _sf_enabled():
+        return
+    if not _sf_hk_truthy_env("SEASONAL_STATION_FEED_HOUSEKEEPING_ENABLED", "1"):
+        return
+
+    try:
+        now_ts = time.time()
+        _station_id, _path, _source, max_items, _ttl_s, _min_write_s = _sf_cfg()
+
+        # Keep the in-memory set tidy, but don't write from it here.
+        _sf_prune(now_ts, max_items=max_items)
+
+        # Prune the JSON file itself based on ends/expires so valid alerts survive restarts.
+        _sf_hk_prune_json_file(now_ts)
+    except Exception:
+        log.exception("Station feed housekeeping: tick failed")
+
+def _sf_station_feed_hk_loop():
+    while True:
+        try:
+            _sf_station_feed_housekeeping_once()
+        except Exception:
+            log.exception("Station feed housekeeping: loop error")
+        time.sleep(_sf_hk_interval_s())
+
+def _sf_station_feed_hk_start():
+    global _STATION_FEED_HK_STARTED
+    if _STATION_FEED_HK_STARTED:
+        return
+    if not _sf_enabled():
+        return
+
+    try:
+        import threading
+
+        t = threading.Thread(
+            target=_sf_station_feed_hk_loop,
+            name="station-feed-housekeeping",
+            daemon=True,
+        )
+        t.start()
+        _STATION_FEED_HK_STARTED = True
+
+        try:
+            log.info(
+                "Station feed housekeeping enabled (interval=%ss)",
+                os.getenv("SEASONAL_STATION_FEED_HOUSEKEEP_SECONDS", "30"),
+            )
+        except Exception:
+            pass
+    except Exception:
+        try:
+            log.exception("Station feed housekeeping: failed to start")
+        except Exception:
+            pass
+
+# Start once at import time if station feed is enabled.
+_sf_station_feed_hk_start()
 
 def _station_feed_note_cap(ev, *, mode: str, same_locations, out_wav: str, same_code=None, vtec=None) -> None:
     if not _sf_enabled():
@@ -276,6 +717,20 @@ def _station_feed_note_cap(ev, *, mode: str, same_locations, out_wav: str, same_
             except Exception:
                 pass
 
+
+        # Final safety fallback so station-feed entries don't end up immortal/blank
+        # (some CAP paths, especially SPS-ish cases, may arrive without ends/expires/VTEC end)
+        if not ends_raw and not expires_raw:
+            try:
+                sent_dt = _sf_parse_dt(sent_raw) if sent_raw else None
+            except Exception:
+                sent_dt = None
+            if sent_dt is not None:
+                fallback_end = sent_dt + dt.timedelta(hours=6)
+                ends_raw = ends_raw or fallback_end
+                expires_raw = expires_raw or fallback_end
+                effective_raw = effective_raw or sent_dt
+
         effective = _sf_iso(effective_raw)
         ends = _sf_iso(ends_raw)
         expires = _sf_iso(expires_raw)
@@ -330,38 +785,90 @@ def _station_feed_note_ern(ev, *, same_locations, out_wav: str) -> None:
     if not _sf_enabled():
         return
     try:
-        sender_name = getattr(ev, "sender", None) or "ERN"
-        sender_kind = getattr(ev, "sender_kind", None) or "relay"
-        sender = FeedSender(name=str(sender_name), kind=str(sender_kind)) if FeedSender else None
+        raw_text = getattr(ev, "text", None) or ""
+        parsed = _sf_parse_same_header(raw_text)
 
-        event = getattr(ev, "event", None) or "SAME Relay"
-        headline = getattr(ev, "headline", None) or getattr(ev, "text", None) or str(event)
-        alert_id = getattr(ev, "id", None) or _sf_sha1_12(f"ern:{event}:{headline}:{sender_name}:{out_wav}")
+        # Sender badge: use header sender if we parsed it; otherwise fall back
+        sender_name = None
+        if parsed:
+            sender_name = parsed.get("sender")
+        sender_name = sender_name or getattr(ev, "sender", None) or "ERN"
+        # Keep this "unknown" so the UI doesn't auto-append "(relay)" if it uses sender.kind in labels
+        sender = FeedSender(name=str(sender_name), kind="unknown") if FeedSender else None
 
-        links = {"mode": "REL", "wav": out_wav}
+        # Event text: prefer ev.event if already human-readable, else map from SAME event code
+        ev_event = (getattr(ev, "event", None) or "").strip()
+        event_text = ev_event
+        if parsed:
+            code = str(parsed.get("event_code") or "").upper()
+            if (not event_text) or (event_text.upper() == code):
+                event_text = _SF_EAS_EVENT_LABELS.get(code, code or "EAS Alert")
+        if not event_text:
+            event_text = "EAS Alert"
+
+        # Area text: prefer any precomputed area string, else join whatever same_locations contains
+        area_text = str(getattr(ev, "area", None) or "").strip()
+        if not area_text:
+            area_text = "; ".join([str(x) for x in (same_locations or []) if str(x).strip()])
+
+        # SAME codes + timestamps from header when available
+        same_codes = [str(x) for x in (same_locations or [])]
+        sent_iso = _sf_iso(getattr(ev, "sent", None))
+        effective_iso = None
+        ends_iso = None
+        expires_iso = None
+        expires_at = None
+
+        if parsed:
+            same_codes = [str(x) for x in (parsed.get("same_codes") or [])] or same_codes
+            start_utc = parsed["start_utc"]
+            end_utc = parsed["end_utc"]
+            sent_iso = sent_iso or _sf_iso(start_utc)
+            effective_iso = _sf_iso(start_utc)
+            ends_iso = _sf_iso(end_utc)
+            expires_iso = _sf_iso(end_utc)
+            expires_at = end_utc
+
+            headline = _sf_make_eas_headline(
+                org=parsed.get("org"),
+                event_text=event_text,
+                area_text=area_text,
+                start_utc=start_utc,
+                end_utc=end_utc,
+                sender=str(sender_name),
+            )
+        else:
+            # Fallback if SAME parse fails: at least don't explode
+            headline = getattr(ev, "headline", None) or raw_text or str(event_text)
+
+        alert_id = getattr(ev, "id", None) or _sf_sha1_12(
+            f"ern:{event_text}:{headline}:{sender_name}:{out_wav}"
+        )
+
+        links = {"mode": "REL", "wav": out_wav, "via": "ERN/GWES"}
 
         alert = StationFeedAlert(
             id=str(alert_id),
-            event=str(event),
+            event=str(event_text),
             headline=str(headline),
             severity="Unknown",
             urgency="Unknown",
             certainty="Unknown",
-            area=str(getattr(ev, "area", None) or ""),
-            effective=None,
-            ends=None,
-            expires=None,
-            sent=_sf_iso(getattr(ev, "sent", None)),
-            sameCodes=[str(x) for x in (same_locations or [])],
+            area=str(area_text or "Unknown area"),
+            effective=effective_iso,
+            ends=ends_iso,
+            expires=expires_iso,
+            sent=sent_iso,
+            sameCodes=same_codes,
             from_=sender,
             links=links,
         )
-        _sf_emit(alert)
+        _sf_emit(alert, expires_at=expires_at)
     except Exception:
         log.exception("Station feed: failed to note ERN relay")
 
 
-def _station_feed_note_nwws(parsed, *, mode: str, same_locations, out_wav: str, product_id=None) -> None:
+def _station_feed_note_nwws(parsed, *, mode: str, same_locations, out_wav: str, product_id=None, expires_at=None) -> None:
     if not _sf_enabled():
         return
     try:
@@ -375,6 +882,25 @@ def _station_feed_note_nwws(parsed, *, mode: str, same_locations, out_wav: str, 
         headline = f"{prod_type} {awips}".strip()
         sender = FeedSender(name="NWWS-OI", kind="relay") if FeedSender else None
 
+        # Prefer upstream computed expiry (exp_utc) if provided, then fall back to parsed fields.
+        end_raw = (
+            expires_at
+            or getattr(parsed, "expires", None)
+            or getattr(parsed, "expires_at", None)
+            or getattr(parsed, "end", None)
+            or getattr(parsed, "end_time", None)
+            or getattr(parsed, "valid_until", None)
+        )
+
+        # Final safety fallback so NWWS items still prune if upstream didn't provide an end
+        if not end_raw:
+            try:
+                issued_dt = _sf_parse_dt(issued) if issued else None
+            except Exception:
+                issued_dt = None
+            if issued_dt is not None:
+                end_raw = issued_dt + dt.timedelta(hours=6)
+
         links = {"mode": mode, "wav": out_wav}
         if product_id:
             links["nws"] = f"https://api.weather.gov/products/{product_id}"
@@ -387,15 +913,15 @@ def _station_feed_note_nwws(parsed, *, mode: str, same_locations, out_wav: str, 
             urgency="Unknown",
             certainty="Unknown",
             area=str(wfo),
-            effective=None,
-            ends=None,
-            expires=None,
+            effective=_sf_iso(issued),
+            ends=_sf_iso(end_raw),
+            expires=_sf_iso(end_raw),
             sent=_sf_iso(issued),
             sameCodes=[str(x) for x in (same_locations or [])],
             from_=sender,
             links=links,
         )
-        _sf_emit(alert)
+        _sf_emit(alert, expires_at=end_raw)
     except Exception:
         log.exception("Station feed: failed to note NWWS toneout")
 
@@ -3034,7 +3560,6 @@ class Orchestrator:
             now_local = dt.datetime.now(self.local_tz)
             exp_utc = self._best_expiry_from_vtec(vtec)
             expires_at = self._rebroadcast_clamp_expiry(now_local, exp_utc)
-            mt = str(getattr(ev, "message_type", None) or "Alert")
 
             if vtec_actions & {"CAN", "EXP"}:
                 await self._rebroadcast_remove_by_tracks(
@@ -3169,7 +3694,7 @@ class Orchestrator:
                 ",".join(t for (t, _a) in tracks[:2]) if tracks else "",
                 out_wav,
             )
-            _station_feed_note_nwws(parsed, mode=spoken.mode, same_locations=(same_for_render if spoken.mode == "FULL" else []), out_wav=str(out_wav), product_id=pid)
+            _station_feed_note_nwws(parsed, mode=spoken.mode, same_locations=(same_for_render if spoken.mode == "FULL" else []), out_wav=str(out_wav), product_id=pid, expires_at=exp_utc)
 
             self._schedule_cycle_refill("post-alert")
 
