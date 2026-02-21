@@ -3694,7 +3694,15 @@ class Orchestrator:
                 ",".join(t for (t, _a) in tracks[:2]) if tracks else "",
                 out_wav,
             )
-            _station_feed_note_nwws(parsed, mode=spoken.mode, same_locations=(same_for_render if spoken.mode == "FULL" else []), out_wav=str(out_wav), product_id=pid, expires_at=exp_utc)
+            _sf_mode = getattr(spoken, "mode", ("FULL" if should_full else "VOICE"))
+            _station_feed_note_nwws(
+                parsed,
+                mode=_sf_mode,
+                same_locations=(same_for_render if _sf_mode == "FULL" else []),
+                out_wav=str(out_wav),
+                product_id=pid,
+                expires_at=exp_utc,
+            )
 
             self._schedule_cycle_refill("post-alert")
 
