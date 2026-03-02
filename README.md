@@ -8,6 +8,9 @@ It’s designed for homelab / hobby IP based stream use with a focus on resilien
 > This is an **unofficial** hobby project. **Do not** rely on it for life safety.
 > Always use official sources for real warnings (e.g., NOAA Weather Radio, NWS/NOAA alerts, local authorities).
 
+> **Please note, SeasonalWeather was a project coded with the use of AI.**
+> Keep this in mind if you're against certain projects coded with the use of such tools.
+
 ## Safety, scope, and acceptable use
 SeasonalWeather can generate **valid SAME headers** and **1050 Hz attention tones**. That power comes with responsibility.
 
