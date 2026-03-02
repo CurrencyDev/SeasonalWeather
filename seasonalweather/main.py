@@ -19,6 +19,7 @@ import hashlib
 import logging
 import math
 import os
+import shutil
 import time
 
 import re
@@ -1761,6 +1762,8 @@ class Orchestrator:
         return m
 
     async def _ensure_zonecounty_loaded(self) -> None:
+        # ZONECOUNTY_DBX_DISCOVERY_PATCH_v1
+        # Hard rule: never delete the last-known-good DBX on a failed refresh.
         if self._zonecounty_loaded:
             return
 
@@ -1774,35 +1777,123 @@ class Orchestrator:
 
             dbx_path = self._zonecounty_dbx_path()
             dbx_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = dbx_path.with_suffix(".tmp")
+            lastgood_path = dbx_path.with_suffix(".lastgood")
 
-            url = self._zonecounty_dbx_url()
+            url = (self._zonecounty_dbx_url() or "").strip()
             max_age_days = max(1, int(self._zonecounty_cache_days()))
             now = dt.datetime.now(tz=self._tz)
 
-            need_download = True
-            if dbx_path.exists():
+            def _cache_is_fresh() -> bool:
+                if not dbx_path.exists():
+                    return False
                 try:
                     mtime = dt.datetime.fromtimestamp(dbx_path.stat().st_mtime, tz=self._tz)
-                    need_download = (now - mtime).total_seconds() > (max_age_days * 86400)
+                    age_s = (now - mtime).total_seconds()
+                    return age_s <= (max_age_days * 86400) and dbx_path.stat().st_size > 1024
                 except Exception:
-                    need_download = True
+                    return False
 
-            if url and need_download:
+            async def _try_fetch(candidate_url: str) -> dict[str, list[str]] | None:
                 try:
                     client = await self._ensure_zone_client()  # reuse UA/timeouts/headers
-                    r = await client.get(url)
-                    if r.status_code == 200 and r.content and len(r.content) > 1024:
-                        tmp = dbx_path.with_suffix(".tmp")
-                        tmp.write_bytes(r.content)
-                        os.replace(str(tmp), str(dbx_path))
-                        log.info("ZoneCounty DBX refreshed: %s (%d bytes)", dbx_path, len(r.content))
-                    else:
+                    r = await client.get(candidate_url)
+                    if r.status_code != 200 or not r.content or len(r.content) <= 1024:
                         log.warning(
-                            "ZoneCounty DBX fetch failed (status=%s). Using existing cache if present.",
+                            "ZoneCounty DBX fetch failed (status=%s url=%s).",
                             r.status_code,
+                            candidate_url,
                         )
+                        return None
+
+                    # Write to temp then validate by parsing.
+                    tmp_path.write_bytes(r.content)
+                    parsed = await asyncio.to_thread(self._parse_zonecounty_dbx, tmp_path)
+
+                    if not parsed:
+                        log.warning("ZoneCounty DBX candidate parsed 0 zones (url=%s).", candidate_url)
+                        try:
+                            tmp_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        return None
+
+                    # Backup lastgood and atomically replace.
+                    if dbx_path.exists():
+                        try:
+                            shutil.copy2(dbx_path, lastgood_path)
+                        except Exception:
+                            log.warning("ZoneCounty lastgood backup failed (file=%s).", dbx_path)
+
+                    os.replace(str(tmp_path), str(dbx_path))
+                    log.info("ZoneCounty DBX refreshed: %s (%d bytes) src=%s", dbx_path, len(r.content), candidate_url)
+                    return parsed
                 except Exception:
-                    log.exception("ZoneCounty DBX download failed; using existing cache if present")
+                    log.exception("ZoneCounty DBX download/validate failed (url=%s).", candidate_url)
+                    return None
+
+            # If cache is fresh, just load it and bail early.
+            if _cache_is_fresh():
+                try:
+                    self._zonecounty_map = await asyncio.to_thread(self._parse_zonecounty_dbx, dbx_path)
+                    log.info("ZoneCounty loaded: zones=%d file=%s", len(self._zonecounty_map), dbx_path)
+                except Exception:
+                    log.exception("ZoneCounty parse failed; disabling ZoneCounty mapping for this run")
+                    self._zonecounty_map = {}
+                self._zonecounty_loaded = True
+                return
+
+            # Refresh path: try explicit URL first (unless 'auto'), then discover from index page.
+            updated_map: dict[str, list[str]] | None = None
+
+            if url and url.lower() != "auto":
+                updated_map = await _try_fetch(url)
+
+            if updated_map is None:
+                # Discovery: scrape https://www.weather.gov/gis/ZoneCounty for bp*.dbx tokens.
+                index_url = (os.getenv("SEASONAL_ZONECOUNTY_INDEX_URL", "https://www.weather.gov/gis/ZoneCounty") or "").strip()
+                base_url = (os.getenv("SEASONAL_ZONECOUNTY_BASE_URL", "https://www.weather.gov/source/gis/Shapefiles/County/") or "").strip()
+                if base_url and not base_url.endswith("/"):
+                    base_url += "/"
+
+                token_re = re.compile(r"\bbp\d{2}[a-z]{2}\d{2}\.dbx\b", re.IGNORECASE)
+                mon_map = {
+                    "ja": 1, "fe": 2, "mr": 3, "ap": 4, "my": 5, "jn": 6,
+                    "jl": 7, "au": 8, "se": 9, "oc": 10, "no": 11, "de": 12,
+                }
+
+                def tok_key(tok: str) -> tuple[int, int, int]:
+                    # bp18mr25.dbx -> (2025, 3, 18)
+                    try:
+                        t = tok.lower()
+                        dd = int(t[2:4])
+                        mm = mon_map.get(t[4:6], 0)
+                        yy = 2000 + int(t[6:8])
+                        return (yy, mm, dd)
+                    except Exception:
+                        return (0, 0, 0)
+
+                try:
+                    client = await self._ensure_zone_client()
+                    r = await client.get(index_url)
+                    if r.status_code == 200 and r.text:
+                        toks = sorted({m.group(0).lower() for m in token_re.finditer(r.text)}, key=tok_key, reverse=True)
+                        # Try newest-first; cap tries to avoid hammering.
+                        for tok in toks[:20]:
+                            cand = base_url + tok
+                            updated_map = await _try_fetch(cand)
+                            if updated_map is not None:
+                                break
+                    else:
+                        log.warning("ZoneCounty discovery fetch failed (status=%s url=%s).", r.status_code, index_url)
+                except Exception:
+                    log.exception("ZoneCounty discovery failed (index_url=%s).", index_url)
+
+            # Load from updated_map if we refreshed successfully, otherwise fall back to existing cache.
+            if updated_map is not None:
+                self._zonecounty_map = updated_map
+                self._zonecounty_loaded = True
+                return
 
             if not dbx_path.exists():
                 log.warning("ZoneCounty DBX not available (no cache file). Zone->SAME mapping will be unavailable.")
@@ -1819,9 +1910,6 @@ class Orchestrator:
 
             self._zonecounty_loaded = True
 
-
-
-    # ---- Marine areas crosswalk (NWS mareas*.txt: marine zone -> coastal county FIPS -> SAME) ----
     def _mareas_enabled(self) -> bool:
         return _env_bool("SEASONAL_MAREAS_ENABLED", default=True)
 
