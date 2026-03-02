@@ -214,7 +214,7 @@ class _NWWSXMPP(slixmpp.ClientXMPP):
         super().__init__(jid, password)
 
         self.room_jid = room_jid
-        self.room_password = room_password if room_password is not None else password
+        self.room_password = room_password  # None means: no room password
         self.nick = nick
 
         self._shared = shared
@@ -234,13 +234,76 @@ class _NWWSXMPP(slixmpp.ClientXMPP):
         self.register_plugin("xep_0045")  # Multi-User Chat (MUC)
 
         # Events
-        self.add_event_handler("session_start", self._on_session_start)
+        self.add_event_handler("session_start", self._on_session_start_safe)
         self.add_event_handler("message", self._on_message)
         self.add_event_handler("presence", self._on_presence)
         self.add_event_handler("failed_auth", self._on_failed_auth)
         self.add_event_handler("disconnected", self._on_disconnected)
 
-    async def _on_session_start(self, event) -> None:
+    def _spawn_guarded(self, aw, label: str) -> None:
+
+        """Spawn a coroutine/Future/Task and swallow exceptions so slixmpp callbacks never explode."""
+
+        try:
+
+            # ensure_future accepts coroutine OR Future/Task and returns a Future-like object.
+
+            task = asyncio.ensure_future(aw)
+
+        except Exception as e:
+
+            self._shared.set_error(f"{label} spawn failed: {e!r}")
+
+            log.warning("NWWS: %s spawn failed (non-fatal): %r", label, e, exc_info=True)
+
+            return
+
+
+        def _done(t):
+
+            try:
+
+                t.result()
+
+            except asyncio.TimeoutError as e:
+
+                self._shared.set_error(f"{label} timed out: {e!r}")
+
+                log.warning("NWWS: %s timed out (non-fatal): %r", label, e)
+
+            except Exception as e:
+
+                self._shared.set_error(f"{label} failed: {e!r}")
+
+                log.warning("NWWS: %s failed (non-fatal): %r", label, e, exc_info=True)
+
+
+        try:
+
+            task.add_done_callback(_done)
+
+        except Exception:
+
+            # Extremely defensive: some Future impls might not support callbacks (rare).
+
+            pass
+
+
+    async def _on_session_start_safe(self, event) -> None:
+
+        """Guard wrapper so exceptions never escape into slixmpp's callback runner."""
+
+        try:
+
+            await self._on_session_start_impl(event)
+
+        except Exception as e:
+
+            self._shared.set_error(f"session_start crashed: {e!r}")
+
+            log.exception("NWWS: session_start crashed (guarded)")
+
+    async def _on_session_start_impl(self, event) -> None:
         self._shared.mark_any()
 
         # IMPORTANT: session_start means auth/bind succeeded.
@@ -264,24 +327,50 @@ class _NWWSXMPP(slixmpp.ClientXMPP):
 
         log.info("NWWS-OI session started; joining MUC %s as %s", self.room_jid, self.nick)
 
+        
         # Portable join (no join_muc_wait, no maxhistory).
+
+        # NOTE: In some slixmpp versions, join_muc() returns an awaitable that may internally wait and
+
+        # raise asyncio.TimeoutError. Spawn it guarded and rely on our own confirmation below.
+
         try:
-            res = self.plugin["xep_0045"].join_muc(
-                self.room_jid,
-                self.nick,
-                password=(self.room_password or None),
-            )
-        except TypeError:
-            res = self.plugin["xep_0045"].join_muc(
-                self.room_jid,
-                self.nick,
-                self.room_password or None,
-            )
 
-        if inspect.isawaitable(res):
-            await res
+            try:
 
-        # Prefer self-presence confirmation, but don't brick the whole client if it never arrives.
+                res = self.plugin["xep_0045"].join_muc(
+
+                    self.room_jid,
+
+                    self.nick,
+
+                    password=(self.room_password or None),
+
+                )
+
+            except TypeError:
+
+                res = self.plugin["xep_0045"].join_muc(
+
+                    self.room_jid,
+
+                    self.nick,
+
+                    self.room_password or None,
+
+                )
+
+
+            if inspect.isawaitable(res):
+
+                self._spawn_guarded(res, "join_muc")
+
+        except Exception as e:
+
+            self._shared.set_error(f"join_muc threw: {e!r}")
+
+            log.warning("NWWS: join_muc threw (non-fatal): %r", e, exc_info=True)
+# Prefer self-presence confirmation, but don't brick the whole client if it never arrives.
         try:
             assert self._muc_self_presence_evt is not None
             await asyncio.wait_for(

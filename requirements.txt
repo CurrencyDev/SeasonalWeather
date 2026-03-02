@@ -13,4 +13,3 @@ python-dateutil
 slixmpp
 SQLAlchemy
 uvicorn
-telnetlib3

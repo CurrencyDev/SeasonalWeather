@@ -1,3 +1,27 @@
+# ======
+# Python
+# ======
 __pycache__/
 *.bak*
 *.pyc
+# ==================================== 
+# local dependency artifacts / backups
+# ====================================
+*.bak*
+requirements*.lock*.txt
+requirements.txt.old.*
+requirements.in.old.*
+requirements.txt.bak.*
+requirements.in.bak.*
+requirements*.trixie*.txt
+requirements*.bookworm*.txt
+#=============
+# other stuff
+#=============
+seasonalweather/*.bak
+seasonalweather/*.bak.*
+seasonalweather/*.bak_*
+seasonalweather/*.bak-*
+seasonalweather/*.pre_fix_*.bak.*
+seasonalweather/_graveyard/
+seasonalweather/_graveyard_*.tar.gz
