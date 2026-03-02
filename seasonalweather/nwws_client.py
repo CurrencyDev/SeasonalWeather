@@ -31,6 +31,93 @@ _AWIPS_RE = re.compile(r"^[A-Z0-9]{6,9}$")
 _NUMONLY_RE = re.compile(r"^\d{1,6}$")
 
 
+def _slixmpp_connect_compat(xmpp, *, host: str, port: int, **kwargs):
+    """
+    Slixmpp connect() compatibility shim across versions.
+
+    Old slixmpp:
+      - connect((host, port), use_ssl=..., force_starttls=..., disable_starttls=..., reattempt=...)
+
+    New slixmpp:
+      - connect(host: Optional[str] = None, port: Optional[int] = None) -> Future
+      - no TLS kwargs, and passing a tuple as "host" will silently disable your override.
+
+    Strategy:
+      1) Inspect xmpp.connect signature, decide whether it wants host/port or an address tuple.
+      2) Filter kwargs down to supported parameters.
+      3) If we still hit "unexpected keyword argument", strip and retry.
+    """
+    kw = dict(kwargs or {})
+
+    def _call_with(filtered_kw: dict):
+        import inspect
+        sig = inspect.signature(xmpp.connect)
+        params = list(sig.parameters.values())
+        names = [p.name for p in params if p.name != "self"]
+
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+        # If **kwargs exists, it won't TypeError, but we still prefer to avoid feeding junk.
+        allowed = set(names)
+        allowed.discard("host")
+        allowed.discard("port")
+        allowed.discard("address")
+
+        if not has_var_kw:
+            filtered_kw = {k: v for k, v in filtered_kw.items() if k in allowed}
+
+        # New slixmpp wants host/port keywords.
+        if "host" in names and "port" in names:
+            return xmpp.connect(host=host, port=int(port), **filtered_kw)
+
+        # Some older variants might accept (host, port) as positional args.
+        if len(names) >= 2 and names[0] in ("host", "hostname") and names[1] == "port":
+            return xmpp.connect(host, int(port), **filtered_kw)
+
+        # Old sleek/slix style: address tuple.
+        return xmpp.connect((host, int(port)), **filtered_kw)
+
+    # First try: signature-based call
+    try:
+        return _call_with(kw)
+    except TypeError as te:
+        # Fallback: strip unexpected kwargs and retry
+        while True:
+            m = re.search(r"unexpected keyword argument '([A-Za-z_][A-Za-z0-9_]*)'", str(te))
+            if not m:
+                raise
+            bad = m.group(1)
+            if bad not in kw:
+                raise
+            kw.pop(bad, None)
+            try:
+                return _call_with(kw)
+            except TypeError as te2:
+                te = te2
+
+
+def _slixmpp_run_compat(xmpp, loop):
+    """
+    Slixmpp >= 1.9 removes xmpp.process().
+    Equivalent behavior is:
+      - forever: loop.run_forever()
+      - until disconnected: loop.run_until_complete(xmpp.disconnected)
+
+    We choose "until disconnected" to match your supervisor/restart model cleanly.
+    """
+    if hasattr(xmpp, "process"):
+        # Older slixmpp: keep working.
+        try:
+            return xmpp.process(forever=True)
+        except TypeError:
+            return xmpp.process()
+
+    # New slixmpp: run the loop until the stream disconnects.
+    fut = getattr(xmpp, "disconnected", None)
+    if fut is not None:
+        return loop.run_until_complete(fut)
+
+    # Worst-case fallback: just run the loop forever.
+    return loop.run_forever()
 def _env_int(key: str, default: int) -> int:
     try:
         v = os.environ.get(key, "").strip()
@@ -503,19 +590,24 @@ class NWWSClient:
 
             log.info("NWWS worker[%d] connecting %s:%d", worker_id, self.server_host, self.server_port)
 
-            res = xmpp.connect(
-                (self.server_host, self.server_port),
+            res = _slixmpp_connect_compat(
+                xmpp,
+                host=self.server_host,
+                port=self.server_port,
+                # XMPP on 5222 should be STARTTLS (not legacy 5223 SSL-wrapped).
                 use_ssl=False,
+                use_tls=True,
+                # Some slixmpp versions support this; compat shim will drop it if not.
                 force_starttls=True,
+                # Let *your* supervisor own reconnection/backoff policy.
+                reattempt=False,
             )
             if res is False:
                 self._shared.set_error("Slixmpp connect() returned False (DNS/socket/port issue)")
                 log.error("NWWS worker[%d] connect() returned False", worker_id)
                 self._started_evt.set()
                 return
-
-            xmpp.process(forever=True)
-
+            _slixmpp_run_compat(xmpp, loop)
         except Exception as e:
             self._shared.set_error(f"NWWS worker crashed: {e!r}")
             log.exception("NWWS worker[%d] crashed", worker_id)

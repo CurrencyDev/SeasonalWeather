@@ -13,3 +13,4 @@ python-dateutil
 slixmpp
 SQLAlchemy
 uvicorn
+telnetlib3; python_version >= "3.13"
