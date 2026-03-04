@@ -103,9 +103,12 @@ Run from the repo root using the SeasonalWeather venv Python:
 
   This requires that you install rust and samedec system wide though. So if Rust is not desired for SAME decoding. You can change the script in use back to the original.
 
+  To do this, open the ern_gwes.py script in your text editor, for most Linux users, this is done with the following command.
+
 ```bash
 nano seasonalweather/ern_gwes.py
 ```
 
-And around def _same_listen_module_cmd, look for seasonalweather.same_listen_samedec, change it to seasonalweather.same_listen, Ctrl+O (Save), and Ctrl+X (Exit).
-Restart the services or stop your instance with Ctrl+C if running SeasonalWeather in the terminal directly, and ern_gwes.py will now be using the slower decoding script instead.
+Scroll through the file, and around "def _same_listen_module_cmd", look for seasonalweather.same_listen_samedec in the execution parameters. Change it to seasonalweather.same_listen, Ctrl+O (Save), and Ctrl+X (Exit).
+
+> Restart the services or stop your instance with Ctrl+C if running SeasonalWeather in the terminal directly, and ern_gwes.py will now be using the slower decoding script instead.
