@@ -2939,6 +2939,47 @@ class Orchestrator:
                 pass
             self.telnet.push_alert(str(out_wav))
 
+        # --- Station feed note (radio UI: handled-alerts.json) ---
+        try:
+            if _sf_enabled() and StationFeedAlert is not None:
+                now_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+                exp_utc = now_utc + dt.timedelta(minutes=30)
+
+                # Human label if available, else fall back to the raw code
+                try:
+                    label = _sf_eas_event_label_full(code)
+                except Exception:
+                    label = code
+
+                sender = FeedSender(name="SeasonalWeather", kind="origin") if FeedSender else None
+
+                same_codes = []
+                try:
+                    same_codes = sorted(getattr(self, "_same_fips_allow_set", None) or [])
+                except Exception:
+                    same_codes = []
+                same_codes = [str(x) for x in same_codes[:32]]
+
+                alert = StationFeedAlert(
+                    id=_sf_sha1_12(f"test:{code}:{now_utc.isoformat()}"),
+                    event=str(label),
+                    headline=f"{label} (Local origination)",
+                    severity="Unknown",
+                    urgency="Unknown",
+                    certainty="Unknown",
+                    area="SeasonalWeather",
+                    effective=now_utc.isoformat(),
+                    ends=exp_utc.isoformat(),
+                    expires=exp_utc.isoformat(),
+                    sent=now_utc.isoformat(),
+                    sameCodes=same_codes,
+                    from_=sender,
+                    links={"mode": "TEST", "wav": str(out_wav)},
+                )
+                _sf_emit(alert, expires_at=exp_utc)
+        except Exception:
+            log.exception("Station feed: failed to note originated %s test", code)
+
         self._schedule_cycle_refill("post-test")
         log.info("Originated %s test (audio=%s)", code, out_wav)
 

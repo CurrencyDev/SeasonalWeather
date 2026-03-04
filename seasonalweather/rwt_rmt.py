@@ -174,7 +174,7 @@ class RwtRmtScheduler:
                 await asyncio.sleep(5)
                 continue
 
-            event_code, due = min(next_events, key=lambda x: x[1])
+            event_code, due = min(next_events, key=lambda x: (x[1], 0 if x[0] == "RMT" else 1))  # PATCH: prefer RMT on tie
             self.log(f"[RWT/RMT] next={event_code} at {due.isoformat()}")
 
             # wait in chunks so stop is responsive
