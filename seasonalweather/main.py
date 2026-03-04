@@ -225,7 +225,7 @@ _SF_ZCZC_RE = re.compile(
     r"^ZCZC-"
     r"(?P<org>[A-Z]{3})-"
     r"(?P<event>[A-Z0-9]{3})-"
-    r"(?P<locs>(?:\d{6}-)+)"
+    r"(?P<locs>\d{6}(?:-\d{6})*)"
     r"\+(?P<dur>\d{4})-"
     r"(?P<jday>\d{3})(?P<hh>\d{2})(?P<mm>\d{2})-"
     r"(?P<sender>[^-]{1,16})-?$"
@@ -1026,6 +1026,10 @@ _STATE_ABBR_TO_FIPS: dict[str, str] = {
     "MP": "69",
 }
 
+# Reverse lookup (FIPS2 -> state abbr) for SAME->county name mapping
+_FIPS2_TO_STATE_ABBR: dict[str, str] = {v: k for (k, v) in _STATE_ABBR_TO_FIPS.items()}
+
+
 
 def _setup_logging() -> None:
     logging.basicConfig(
@@ -1210,6 +1214,11 @@ class Orchestrator:
         self._mareas_lock = asyncio.Lock()
         self._mareas_loaded = False
         self._mareas_map: dict[str, list[str]] = {}
+
+        # --- SAME county name cache (for station feed ERN area display) ---
+        self._same_name_cache: dict[str, str] = {}
+        self._same_name_fail: dict[str, dt.datetime] = {}
+        self._same_name_lock = asyncio.Lock()
 
     def _norm_wfo_set(self, wfos: list[str] | set[str] | tuple[str, ...]) -> set[str]:
         """
@@ -1579,6 +1588,75 @@ class Orchestrator:
         if not f2 or len(c3) != 3:
             return None
         return f"0{f2}{c3}"
+
+    # ---- Station-feed helpers: SAME(6) -> County names (ERN relays) ----
+    def _same6_to_county_zone_id(self, same6: str) -> tuple[str | None, str | None]:
+        """Convert SAME PSSCCC (6 digits) to NWS county-zone ID like 'MDC031'."""
+        s = "".join(ch for ch in str(same6 or "").strip() if ch.isdigit())
+        if len(s) != 6:
+            return (None, None)
+        st_fips2 = s[1:3]  # ignore partition
+        cty3 = s[3:6]
+        st = _FIPS2_TO_STATE_ABBR.get(st_fips2)
+        if not st:
+            return (None, None)
+        return (f"{st}C{cty3}", st)
+
+    async def _same6_area_label(self, same6: str) -> str | None:
+        """Best-effort county label for SAME via api.weather.gov/zones/county/<ST>C### (cached)."""
+        code = "".join(ch for ch in str(same6 or "").strip() if ch.isdigit())
+        if len(code) != 6:
+            return None
+        hit = self._same_name_cache.get(code)
+        if hit:
+            return hit
+        now = dt.datetime.now(tz=self._tz)
+        fail_at = self._same_name_fail.get(code)
+        if fail_at and (now - fail_at).total_seconds() < 300:
+            return None
+        zone_id, st = self._same6_to_county_zone_id(code)
+        if not zone_id:
+            return None
+        async with self._same_name_lock:
+            hit2 = self._same_name_cache.get(code)
+            if hit2:
+                return hit2
+            fail_at2 = self._same_name_fail.get(code)
+            if fail_at2 and (now - fail_at2).total_seconds() < 300:
+                return None
+            data = await self._get_zone_json("county", zone_id)
+            if not data:
+                self._same_name_fail[code] = now
+                return None
+            props = data.get("properties") if isinstance(data.get("properties"), dict) else {}
+            name = str(props.get("name") or "").strip()
+            state = str(props.get("state") or st or "").strip().upper()
+            if not name:
+                self._same_name_fail[code] = now
+                return None
+            label = f"{name}, {state}" if state else name
+            self._same_name_cache[code] = label
+            return label
+
+    async def _sf_area_text_from_same_codes(self, same_codes: list[str]) -> str:
+        """Resolve SAME codes to a '; '-joined area label string for station feed ERN items."""
+        if not _env_bool("SEASONAL_STATION_FEED_ERN_AREA_NAMES", default=True):
+            return ""
+        codes = [str(x).strip() for x in (same_codes or []) if str(x).strip()]
+        if not codes:
+            return ""
+        results = await asyncio.gather(*(self._same6_area_label(c) for c in codes), return_exceptions=True)
+        out: list[str] = []
+        seen: set[str] = set()
+        for r in results:
+            if isinstance(r, Exception) or not r:
+                continue
+            s = str(r).strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+        return "; ".join(out)
 
     def _extract_ugc_block(self, text: str) -> str:
         """
@@ -3590,7 +3668,21 @@ class Orchestrator:
                 len(in_area_locs),
                 out_wav,
             )
-            _station_feed_note_ern(ev, same_locations=in_area_locs, out_wav=str(out_wav))
+            sf_ev = ev
+            try:
+                area_text = await self._sf_area_text_from_same_codes(in_area_locs)
+                if area_text:
+                    try:
+                        setattr(sf_ev, "area", area_text)
+                    except Exception:
+                        try:
+                            sf_ev = SimpleNamespace(**getattr(ev, "__dict__", {}))
+                            setattr(sf_ev, "area", area_text)
+                        except Exception:
+                            sf_ev = ev
+            except Exception:
+                pass
+            _station_feed_note_ern(sf_ev, same_locations=in_area_locs, out_wav=str(out_wav))
 
     async def _handle_toneout(self, parsed: ParsedProduct) -> None:
         log.info("NWWS toneout candidate: type=%s awips=%s wfo=%s", parsed.product_type, parsed.awips_id or "", parsed.wfo)
