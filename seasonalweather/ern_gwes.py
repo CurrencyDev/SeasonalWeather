@@ -44,7 +44,7 @@ def _same_listen_module_cmd(url: str, *, sr: int, dedupe: float, trigger_ratio: 
     return [
         sys.executable,
         "-m",
-        "seasonalweather.same_listen",
+        "seasonalweather.same_listen_samedec",
         "--url",
         url,
         "--sr",
