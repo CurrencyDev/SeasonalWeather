@@ -96,3 +96,16 @@ Run from the repo root using the SeasonalWeather venv Python:
 /opt/seasonalweather/venv/bin/python -m seasonalweather.cli.inject --help
 /opt/seasonalweather/venv/bin/python -m seasonalweather.cli.inject --event DMO --loc 024021 test-alert "hello world"
 ```
+
+## GWES-ERN SAME Decoding Notice
+
+> SeasonalWeather can now optionally use the same_listen_samedec.py script in ern_gwes.py to decode streams faster.
+
+  This requires that you install rust and samedec system wide though. So if Rust is not desired for SAME decoding. You can change the script in use back to the original.
+
+```bash
+nano seasonalweather/ern_gwes.py
+```
+
+And around def _same_listen_module_cmd, look for seasonalweather.same_listen_samedec, change it to seasonalweather.same_listen, Ctrl+O (Save), and Ctrl+X (Exit).
+Restart the services or stop your instance with Ctrl+C if running SeasonalWeather in the terminal directly, and ern_gwes.py will now be using the slower decoding script instead.
