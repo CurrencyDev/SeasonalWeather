@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import re
+import httpx
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
+from typing import Any, Dict, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 from .nws_api import NWSApi
@@ -267,6 +270,36 @@ class CycleSegment:
     text: str
 
 
+
+def _spc_threats_phrase(torn_prob: int, hail_prob: int, wind_prob: int, *, severity_dn: int) -> str:
+    """
+    Build a short, broadcast-friendly threat phrase from SPC probabilistic layers.
+
+    Probabilities are typically percent (e.g., 2, 5, 15, 30).
+    """
+    threats: List[str] = []
+
+    if torn_prob >= 2:
+        threats.append("a few tornadoes")
+    if hail_prob >= 5:
+        threats.append("large hail")
+    if wind_prob >= 5:
+        threats.append("damaging winds")
+
+    if threats:
+        if len(threats) == 1:
+            return threats[0].capitalize()
+        if len(threats) == 2:
+            return f"{threats[0].capitalize()} and {threats[1]}"
+        return f"{threats[0].capitalize()}, {threats[1]}, and {threats[2]}"
+
+    if severity_dn >= 6:
+        return "Large hail, damaging winds, and a few tornadoes"
+    if severity_dn >= 4:
+        return "Large hail and damaging winds"
+    return "Isolated severe storms"
+
+
 class CycleBuilder:
     def __init__(
         self,
@@ -281,6 +314,10 @@ class CycleBuilder:
         self.obs_stations = obs_stations
         self.points = reference_points
         self.same_fips = set(same_fips_all)
+
+        # caches for SPC/CWA lookups (best-effort)
+        self._wfo_geom_cache: Dict[str, Dict[str, Any]] = {}
+        self._arcgis_layer_cache: Dict[str, int] = {}
 
         # Derive CAP "area=" list from SAME/FIPS list (keeps PA/PHI/CTP etc automatically in sync)
         self.alert_areas = _areas_from_same_fips(same_fips_all)
@@ -360,6 +397,249 @@ class CycleBuilder:
 
         return None
 
+    async def _arcgis_get_json(self, url: str, params: Mapping[str, Any], timeout_s: float) -> Optional[Dict[str, Any]]:
+        try:
+            async with httpx.AsyncClient(timeout=timeout_s, headers={"User-Agent": "SeasonalWeather/SeasonalNet"}) as client:
+                r = await client.get(url, params=dict(params))
+                r.raise_for_status()
+                return r.json()
+        except Exception:
+            return None
+
+    async def _arcgis_find_layer_id(self, base_url: str, want_keywords: Iterable[str], timeout_s: float) -> Optional[int]:
+        """
+        Fetch MapServer metadata and find the first layer whose name contains all keywords.
+        Caches results per (base_url, keywords).
+        """
+        key = f"{base_url}|" + "|".join(k.lower().strip() for k in want_keywords if k)
+        if key in self._arcgis_layer_cache:
+            return self._arcgis_layer_cache[key]
+
+        svc = await self._arcgis_get_json(base_url, {"f": "pjson"}, timeout_s)
+        layers = (svc or {}).get("layers") or []
+        want = [k.lower().strip() for k in want_keywords if k and k.strip()]
+        for layer in layers:
+            name = str((layer or {}).get("name") or "").lower()
+            if name and all(k in name for k in want):
+                lid = (layer or {}).get("id")
+                if isinstance(lid, int):
+                    self._arcgis_layer_cache[key] = lid
+                    return lid
+        return None
+
+    async def _arcgis_query(
+        self,
+        base_url: str,
+        layer_id: int,
+        where: str,
+        *,
+        geometry: Optional[Dict[str, Any]] = None,
+        out_fields: str = "*",
+        return_geometry: bool = False,
+        timeout_s: float = 6.0,
+    ) -> List[Dict[str, Any]]:
+        url = f"{base_url.rstrip('/')}/{layer_id}/query"
+        params: Dict[str, Any] = {
+            "f": "pjson",
+            "where": where,
+            "outFields": out_fields,
+            "returnGeometry": "true" if return_geometry else "false",
+            "outSR": 4326,
+        }
+        if geometry:
+            params.update(
+                {
+                    "geometry": json.dumps(geometry),
+                    "geometryType": "esriGeometryPolygon",
+                    "spatialRel": "esriSpatialRelIntersects",
+                    "inSR": 4326,
+                }
+            )
+
+        data = await self._arcgis_get_json(url, params, timeout_s)
+        feats = (data or {}).get("features") or []
+        out: List[Dict[str, Any]] = []
+        for f in feats:
+            if isinstance(f, dict):
+                out.append(f)
+        return out
+
+    async def _wfo_cwa_geometry(self, wfo: str, timeout_s: float) -> Optional[Dict[str, Any]]:
+        """
+        Returns an ESRI polygon geometry (wkid 4326) for a WFO CWA, best-effort.
+        """
+        wfo = (wfo or "").strip().upper()
+        if not wfo:
+            return None
+        if wfo in self._wfo_geom_cache:
+            return self._wfo_geom_cache[wfo]
+
+        ref_base = "https://mapservices.weather.noaa.gov/static/rest/services/nws_reference_maps/nws_reference_map/MapServer"
+        layer_id = (
+            await self._arcgis_find_layer_id(ref_base, ["county warning area"], timeout_s)
+            or await self._arcgis_find_layer_id(ref_base, ["cwa"], timeout_s)
+            or await self._arcgis_find_layer_id(ref_base, ["weather forecast office"], timeout_s)
+            or await self._arcgis_find_layer_id(ref_base, ["wfo"], timeout_s)
+        )
+        if layer_id is None:
+            return None
+
+        field_candidates = ["WFO", "WFO_ID", "WFOID", "CWA", "OFFICE", "SITE", "SITEID", "ID"]
+        for fld in field_candidates:
+            feats = await self._arcgis_query(ref_base, layer_id, f"{fld}='{wfo}'", return_geometry=True, timeout_s=timeout_s)
+            if feats:
+                geom = (feats[0] or {}).get("geometry")
+                if isinstance(geom, dict) and ("rings" in geom):
+                    self._wfo_geom_cache[wfo] = geom
+                    return geom
+        return None
+
+    def _spc_dn_to_code(self, dn: int) -> str:
+        if dn >= 8:
+            return "HIGH"
+        if dn >= 6:
+            return "MDT"
+        if dn >= 5:
+            return "ENH"
+        if dn >= 4:
+            return "SLGT"
+        if dn >= 3:
+            return "MRGL"
+        if dn >= 2:
+            return "TSTM"
+        return ""
+
+    def _spc_code_to_spoken(self, code: str) -> str:
+        c = (code or "").strip().upper()
+        return {
+            "MRGL": "marginal",
+            "SLGT": "slight",
+            "ENH": "enhanced",
+            "MDT": "moderate",
+            "HIGH": "high",
+            "TSTM": "general thunderstorm",
+        }.get(c, c.lower())
+
+    async def _spc_max_risk_dn(self, day: int, wfos: List[str], timeout_s: float) -> int:
+        """
+        Return the maximum categorical risk DN intersecting any WFO CWA.
+        Best-effort: returns 0 on failure.
+        """
+        spc_base = "https://mapservices.weather.noaa.gov/vector/rest/services/outlooks/SPC_wx_outlks/MapServer"
+        layer_id = await self._arcgis_find_layer_id(spc_base, [f"day {day}", "categorical"], timeout_s)
+        if layer_id is None:
+            return 0
+
+        max_dn = 0
+        for wfo in wfos:
+            geom = await self._wfo_cwa_geometry(wfo, timeout_s)
+            if not geom:
+                continue
+            feats = await self._arcgis_query(spc_base, layer_id, "1=1", geometry=geom, return_geometry=False, timeout_s=timeout_s)
+            for f in feats:
+                attrs = (f or {}).get("attributes") or {}
+                for k in ("LABEL", "CAT", "CATEGORY", "RISK", "RISK_CAT", "OUTLOOK"):
+                    v = attrs.get(k)
+                    if isinstance(v, str) and v.strip().upper() in {"TSTM", "MRGL", "SLGT", "ENH", "MDT", "HIGH"}:
+                        dn_guess = {"TSTM": 2, "MRGL": 3, "SLGT": 4, "ENH": 5, "MDT": 6, "HIGH": 8}[v.strip().upper()]
+                        max_dn = max(max_dn, dn_guess)
+                        break
+                else:
+                    dn = attrs.get("DN")
+                    if isinstance(dn, (int, float)):
+                        max_dn = max(max_dn, int(dn))
+        return max_dn
+
+    async def _spc_max_prob(self, day: int, hazard: str, wfos: List[str], timeout_s: float) -> int:
+        """
+        Max probability (percent) for a hazard (tornado/hail/wind) intersecting any WFO CWA.
+        Returns 0 on failure.
+        """
+        spc_base = "https://mapservices.weather.noaa.gov/vector/rest/services/outlooks/SPC_wx_outlks/MapServer"
+        haz = (hazard or "").strip().lower()
+        if haz not in {"tornado", "hail", "wind"}:
+            return 0
+
+        layer_id = await self._arcgis_find_layer_id(spc_base, [f"day {day}", haz], timeout_s)
+        if layer_id is None and haz == "tornado":
+            layer_id = await self._arcgis_find_layer_id(spc_base, [f"day {day}", "torn"], timeout_s)
+        if layer_id is None:
+            return 0
+
+        max_p = 0
+        for wfo in wfos:
+            geom = await self._wfo_cwa_geometry(wfo, timeout_s)
+            if not geom:
+                continue
+            feats = await self._arcgis_query(spc_base, layer_id, "1=1", geometry=geom, return_geometry=False, timeout_s=timeout_s)
+            for f in feats:
+                attrs = (f or {}).get("attributes") or {}
+                for k in ("PROB", "PROBABILITY", "PERCENT", "VALUE", "VAL", "DN"):
+                    v = attrs.get(k)
+                    if isinstance(v, (int, float)):
+                        max_p = max(max_p, int(v))
+                        break
+        return max_p
+
+    async def _build_spc_outlook_text(self, ctx: CycleContext, now: dt.datetime) -> Optional[str]:
+        """
+        Optional SPC convective outlook readout (Day 1-3) scoped to configured WFO CWAs.
+
+        Enabled with:
+          SEASONAL_CYCLE_SPC_ENABLE=1
+          SEASONAL_CYCLE_SPC_WFOS=LWX,CTP,PHI
+          SEASONAL_CYCLE_SPC_MIN_DN=3  (3=MRGL)
+          SEASONAL_CYCLE_SPC_DAYS=3    (1..3)
+        """
+        if _env_int("SEASONAL_CYCLE_SPC_ENABLE", 0) != 1:
+            return None
+
+        wfos = [x.strip().upper() for x in os.environ.get("SEASONAL_CYCLE_SPC_WFOS", "LWX").split(",") if x.strip()]
+        if not wfos:
+            wfos = ["LWX"]
+
+        days = 1 if ctx.mode == "heightened" else max(1, min(3, _env_int("SEASONAL_CYCLE_SPC_DAYS", 3)))
+        min_dn = _env_int("SEASONAL_CYCLE_SPC_MIN_DN", 3)
+        try:
+            timeout_s = float(os.environ.get("SEASONAL_CYCLE_SPC_TIMEOUT_S", "6.0") or "6.0")
+        except Exception:
+            timeout_s = 6.0
+
+        lines: List[str] = []
+
+        for day in range(1, days + 1):
+            dn = await self._spc_max_risk_dn(day, wfos, timeout_s)
+            if dn < min_dn:
+                continue
+
+            code = self._spc_dn_to_code(dn)
+            spoken = self._spc_code_to_spoken(code)
+
+            if day == 1:
+                torn = await self._spc_max_prob(1, "tornado", wfos, timeout_s)
+                hail = await self._spc_max_prob(1, "hail", wfos, timeout_s)
+                wind = await self._spc_max_prob(1, "wind", wfos, timeout_s)
+                threats = _spc_threats_phrase(torn, hail, wind, severity_dn=dn)
+                lines.append(
+                    f"For today's convective outlook in our service area, there is a {spoken} risk of severe thunderstorms. {threats} will be possible."
+                )
+            elif day == 2:
+                torn = await self._spc_max_prob(2, "tornado", wfos, timeout_s)
+                hail = await self._spc_max_prob(2, "hail", wfos, timeout_s)
+                wind = await self._spc_max_prob(2, "wind", wfos, timeout_s)
+                threats = _spc_threats_phrase(torn, hail, wind, severity_dn=dn)
+                lines.append(
+                    f"For tomorrow's convective outlook in our service area, there is a {spoken} risk of severe thunderstorms. {threats} will be possible."
+                )
+            elif day == 3:
+                d3 = now + dt.timedelta(days=2)
+                lines.append(f"For {d3.strftime('%A')}, a {spoken} risk of severe thunderstorms is possible.")
+
+        if not lines:
+            return None
+
+        return "And now, for the Storm Prediction Center's convective outlook for severe thunderstorms in our area. " + " ".join(lines)
+
     async def build_segments(
         self,
         station_name: str,
@@ -403,7 +683,7 @@ class CycleBuilder:
         fc_lines: List[str] = []
         max_points = 1 if ctx.mode == "heightened" else _env_int("SEASONAL_CYCLE_FC_MAX_POINTS_NORMAL", 6)
         field = "shortForecast" if _env_int("SEASONAL_CYCLE_FC_USE_SHORT", 1) else "detailedForecast"
-        max_periods = 1 if ctx.mode == "heightened" else _env_int("SEASONAL_CYCLE_FC_PERIODS_NORMAL", 1)
+        max_periods = 1 if ctx.mode == "heightened" else _env_int("SEASONAL_CYCLE_FC_PERIODS_NORMAL", 2)
         line_max = _env_int("SEASONAL_CYCLE_FC_LINE_MAX_CHARS", 260)
 
         pts = list(self.points)
@@ -466,34 +746,36 @@ class CycleBuilder:
         # --- Station ID ---
         if ctx.mode == "heightened":
             station_id = (
-                f"This is {station_name}, an automated I P radio station weather broadcast stream for {service_area_name}. "
-                f"This station is currently in a heightened, shortened broadcast cycle state due to severe weather affecting the service area. "
+                f"This is the SeasonalNet I P Weather Radio Station, {station_name}, "
+                f"with station programming and streaming facilities originating from SeasonalNet, "
+                f"providing weather information for {service_area_name}. "
+                f"Due to severe weather affecting the service area, normal broadcasts have been curtailed to bring you the latest severe weather information. "
                 f"The current time is {time_str}, {tz_short}. "
                 f"{disclaimer}"
             )
         else:
             station_id = (
-                f"This is {station_name}, an automated I P radio station, powered by Icecast, providing weather broadcasts for {service_area_name}. "
-                f"This station provides National Weather Service forecasts, hazardous weather outlooks, and severe weather information for the service area. "
+                f"This is the SeasonalNet I P Weather Radio Station, {station_name}, "
+                f"with station programming and streaming facilities originating from SeasonalNet, "
+                f"providing weather information for {service_area_name}. "
                 f"The current time is {time_str}, {tz_short}. "
                 f"{disclaimer}"
             )
-
         # --- Status ---
         status_bits: List[str] = []
-        status_bits.append(f"Broadcast mode: {ctx.mode}.")
+        status_bits.append(f"The station's broadcast mode is currently in {ctx.mode} broadcast mode at this time.")
         if ctx.last_heightened_ago:
-            status_bits.append(f"Most recent heightened mode activation was {ctx.last_heightened_ago} ago.")
+            status_bits.append(f"The most recent, heightened broadcast cycle mode activation was {ctx.last_heightened_ago} ago.")
         if ctx.last_product_desc:
             line = _last_product_status_line(ctx.last_product_desc)
             if line:
                 status_bits.append(line)
         if active_titles:
-            status_bits.append("Active alerts in the service area include: " + ", ".join(active_titles) + ".")
+            status_bits.append("These are the active watches, warnings, and advisories in effect: " + ", ".join(active_titles) + ".")
         else:
-            status_bits.append("There are no active warnings in the service area at this time.")
+            status_bits.append("There are no active watches, warnings, or advisories in the service area at this time.")
 
-        status_text = "Station status. " + " ".join(status_bits)
+        status_text = "And now for the overall station status, and alerts in the service area. " + " ".join(status_bits)
 
         segments: List[CycleSegment] = [
             CycleSegment(key="id", title="Station ID", text=station_id),
@@ -506,9 +788,31 @@ class CycleBuilder:
                 CycleSegment(
                     key="hwo",
                     title="Hazardous Weather Outlook",
-                    text="Hazardous Weather Outlook. " + hwo_text,
+                    text="And now for the hazardous weather outlook for the service area. " + hwo_text,
                 )
             )
+        else:
+            if _env_int("SEASONAL_CYCLE_HWO_SPEAK_UNAVAILABLE", 1) == 1:
+                segments.append(
+                    CycleSegment(
+                        key="hwo-unavailable",
+                        title="Hazardous Weather Outlook",
+                        text="The hazardous weather outlook from LWX was unavailable.",
+                    )
+                )
+
+        # --- SPC Convective Outlook (optional) ---
+        spc_text = await self._build_spc_outlook_text(ctx, now)
+        if spc_text:
+            segments.append(
+                CycleSegment(
+                    key="spc",
+                    title="SPC Convective Outlook",
+                    text=spc_text,
+                )
+            )
+
+
 
         # --- “ZFP” key retained, but it’s now SYNOPSIS only (to avoid 1GB WAVs) ---
         if synopsis_text:
@@ -516,28 +820,28 @@ class CycleBuilder:
                 CycleSegment(
                     key="zfp",
                     title="Synopsis",
-                    text=(
-                        "Taking a look at the weather features affecting our region for the next several days. "
-                        + synopsis_text
-                    ),
+                    text=("This is the weather synopsis for our area. And now for the weather features affecting our area over the next several days. " + synopsis_text),
                 )
             )
 
         # --- Forecast ---
         if fc_lines:
-            forecast_text = "Forecast highlights. " + " ".join(fc_lines)
+            if ctx.mode == "heightened":
+                forecast_text = "This is the summarized forecast section for our area. " + " ".join(fc_lines)
+            else:
+                forecast_text = "This is the overall forecast section for our area from the National Weather Service. " + " ".join(fc_lines)
             segments.append(CycleSegment(key="fcst", title="Forecast", text=forecast_text))
 
         # --- Observations ---
         if obs_lines:
-            obs_text = "Latest observations. " + " ".join(obs_lines)
+            obs_text = "And now for the current observed weather conditions in our area. " + " ".join(obs_lines)
             segments.append(CycleSegment(key="obs", title="Observations", text=obs_text))
 
         segments.append(
             CycleSegment(
                 key="outro",
                 title="Outro",
-                text="This station will return with updated information on the next cycle.",
+                text="This is the end of the current broadcast cycle. Updated information will follow on the next rotation.",
             )
         )
 
