@@ -398,13 +398,28 @@ class CycleBuilder:
         return None
 
     async def _arcgis_get_json(self, url: str, params: Mapping[str, Any], timeout_s: float) -> Optional[Dict[str, Any]]:
+        """
+        ArcGIS REST helper.
+
+        IMPORTANT:
+          - If we pass a polygon geometry, the querystring can be huge; GET requests may be truncated.
+          - Use POST (form-encoded) whenever the request includes a 'geometry' parameter.
+        """
         try:
-            async with httpx.AsyncClient(timeout=timeout_s, headers={"User-Agent": "SeasonalWeather/SeasonalNet"}) as client:
-                r = await client.get(url, params=dict(params))
+            async with httpx.AsyncClient(
+                timeout=timeout_s,
+                headers={"User-Agent": "SeasonalWeather/SeasonalNet"},
+            ) as client:
+                p = dict(params)
+                if "geometry" in p:
+                    r = await client.post(url, data=p)
+                else:
+                    r = await client.get(url, params=p)
                 r.raise_for_status()
                 return r.json()
         except Exception:
             return None
+
 
     async def _arcgis_find_layer_id(self, base_url: str, want_keywords: Iterable[str], timeout_s: float) -> Optional[int]:
         """
@@ -490,6 +505,8 @@ class CycleBuilder:
             if feats:
                 geom = (feats[0] or {}).get("geometry")
                 if isinstance(geom, dict) and ("rings" in geom):
+                    if "spatialReference" not in geom:
+                        geom["spatialReference"] = {"wkid": 4326}
                     self._wfo_geom_cache[wfo] = geom
                     return geom
         return None
@@ -524,36 +541,83 @@ class CycleBuilder:
         """
         Return the maximum categorical risk DN intersecting any WFO CWA.
         Best-effort: returns 0 on failure.
+
+        ArcGIS attribute keys vary in case; NOAA commonly returns:
+          - dn, label, label2
         """
         spc_base = "https://mapservices.weather.noaa.gov/vector/rest/services/outlooks/SPC_wx_outlks/MapServer"
         layer_id = await self._arcgis_find_layer_id(spc_base, [f"day {day}", "categorical"], timeout_s)
         if layer_id is None:
             return 0
 
+        # Map both codes and words to DN
+        code_to_dn = {"TSTM": 2, "MRGL": 3, "SLGT": 4, "ENH": 5, "MDT": 6, "HIGH": 8}
+        word_to_dn = {
+            "GENERAL": 2,
+            "THUNDER": 2,
+            "MARGINAL": 3,
+            "SLIGHT": 4,
+            "ENHANCED": 5,
+            "MODERATE": 6,
+            "HIGH": 8,
+        }
+
+        def get_attr(attrs: dict, *names: str):
+            for n in names:
+                if n in attrs:
+                    return attrs.get(n)
+            for n in names:
+                ln = n.lower()
+                if ln in attrs:
+                    return attrs.get(ln)
+            return None
+
         max_dn = 0
         for wfo in wfos:
             geom = await self._wfo_cwa_geometry(wfo, timeout_s)
             if not geom:
                 continue
-            feats = await self._arcgis_query(spc_base, layer_id, "1=1", geometry=geom, return_geometry=False, timeout_s=timeout_s)
+
+            feats = await self._arcgis_query(
+                spc_base, layer_id, "1=1",
+                geometry=geom, return_geometry=False, timeout_s=timeout_s
+            )
+
             for f in feats:
                 attrs = (f or {}).get("attributes") or {}
-                for k in ("LABEL", "CAT", "CATEGORY", "RISK", "RISK_CAT", "OUTLOOK"):
-                    v = attrs.get(k)
-                    if isinstance(v, str) and v.strip().upper() in {"TSTM", "MRGL", "SLGT", "ENH", "MDT", "HIGH"}:
-                        dn_guess = {"TSTM": 2, "MRGL": 3, "SLGT": 4, "ENH": 5, "MDT": 6, "HIGH": 8}[v.strip().upper()]
-                        max_dn = max(max_dn, dn_guess)
-                        break
-                else:
-                    dn = attrs.get("DN")
-                    if isinstance(dn, (int, float)):
-                        max_dn = max(max_dn, int(dn))
+
+                # Prefer explicit dn if present
+                dn = get_attr(attrs, "DN", "dn")
+                if isinstance(dn, (int, float)):
+                    max_dn = max(max_dn, int(dn))
+                    continue
+
+                # Otherwise parse label/label2
+                lab = get_attr(attrs, "LABEL", "label", "LABEL2", "label2", "CAT", "cat", "CATEGORY", "category", "RISK", "risk")
+                if isinstance(lab, str) and lab.strip():
+                    u = lab.strip().upper()
+
+                    # Try codes first
+                    for code, dnv in code_to_dn.items():
+                        if code in u:
+                            max_dn = max(max_dn, dnv)
+                            break
+                    else:
+                        # Then words (e.g., "Marginal", "Slight", etc.)
+                        for word, dnv in word_to_dn.items():
+                            if word in u:
+                                max_dn = max(max_dn, dnv)
+                                break
+
         return max_dn
+
 
     async def _spc_max_prob(self, day: int, hazard: str, wfos: List[str], timeout_s: float) -> int:
         """
         Max probability (percent) for a hazard (tornado/hail/wind) intersecting any WFO CWA.
         Returns 0 on failure.
+
+        NOAA ArcGIS layers often store the probability in 'dn' (lowercase).
         """
         spc_base = "https://mapservices.weather.noaa.gov/vector/rest/services/outlooks/SPC_wx_outlks/MapServer"
         haz = (hazard or "").strip().lower()
@@ -566,6 +630,16 @@ class CycleBuilder:
         if layer_id is None:
             return 0
 
+        def get_attr(attrs: dict, *names: str):
+            for n in names:
+                if n in attrs:
+                    return attrs.get(n)
+            for n in names:
+                ln = n.lower()
+                if ln in attrs:
+                    return attrs.get(ln)
+            return None
+
         max_p = 0
         for wfo in wfos:
             geom = await self._wfo_cwa_geometry(wfo, timeout_s)
@@ -574,12 +648,11 @@ class CycleBuilder:
             feats = await self._arcgis_query(spc_base, layer_id, "1=1", geometry=geom, return_geometry=False, timeout_s=timeout_s)
             for f in feats:
                 attrs = (f or {}).get("attributes") or {}
-                for k in ("PROB", "PROBABILITY", "PERCENT", "VALUE", "VAL", "DN"):
-                    v = attrs.get(k)
-                    if isinstance(v, (int, float)):
-                        max_p = max(max_p, int(v))
-                        break
+                v = get_attr(attrs, "PROB", "prob", "PROBABILITY", "probability", "PERCENT", "percent", "VALUE", "value", "VAL", "val", "DN", "dn")
+                if isinstance(v, (int, float)):
+                    max_p = max(max_p, int(v))
         return max_p
+
 
     async def _build_spc_outlook_text(self, ctx: CycleContext, now: dt.datetime) -> Optional[str]:
         """
