@@ -271,6 +271,150 @@ class CycleSegment:
 
 
 
+# --- Broadcast text helpers (HWO/OBS formatting) ---
+
+_HWO_ISSUED_RE = re.compile(
+    r"^(?P<hm>\d{3,4})\s*(?P<ampm>AM|PM)\s*(?P<tz>[A-Z]{2,4})\s*"
+    r"(?P<dow>[A-Za-z]{3})\s*(?P<mon>[A-Za-z]{3})\s*(?P<day>\d{1,2})\s*(?P<year>\d{4})$"
+)
+
+_DOW_FULL = {
+    "Mon": "Monday",
+    "Tue": "Tuesday",
+    "Wed": "Wednesday",
+    "Thu": "Thursday",
+    "Fri": "Friday",
+    "Sat": "Saturday",
+    "Sun": "Sunday",
+}
+
+def _parse_kv_env(key: str) -> Dict[str, str]:
+    """
+    Parse simple KEY=VALUE pairs from an env var.
+
+    Accepts:
+      KDCA:Reagan National Airport,KBWI:BWI
+      KDCA=Reagan National Airport; KBWI=BWI
+    """
+    raw = (os.environ.get(key, "") or "").strip()
+    if not raw:
+        return {}
+    out: Dict[str, str] = {}
+    parts = re.split(r"[;,]", raw)
+    for p in parts:
+        s = p.strip()
+        if not s:
+            continue
+        if ":" in s:
+            k, v = s.split(":", 1)
+        elif "=" in s:
+            k, v = s.split("=", 1)
+        else:
+            continue
+        k = k.strip().upper()
+        v = v.strip()
+        if k and v:
+            out[k] = v
+    return out
+
+
+def _hwo_issued_phrase(raw: str) -> Optional[str]:
+    """
+    Pull "Issued at ..." from the product header line like:
+      1002 AM EST Thu Mar 5 2026
+    """
+    txt = (raw or "").replace("\r", "")
+    for ln in txt.splitlines():
+        line = ln.strip()
+        m = _HWO_ISSUED_RE.match(line)
+        if not m:
+            continue
+        hm = m.group("hm")
+        ampm = m.group("ampm")
+        dow = m.group("dow").title()
+
+        # Convert 1002 -> 10:02, 902 -> 9:02
+        if len(hm) == 3:
+            h = int(hm[0])
+            mins = hm[1:]
+        else:
+            h = int(hm[:2])
+            mins = hm[2:]
+        hhmm = f"{h}:{mins.zfill(2)} {ampm}"
+        dow_full = _DOW_FULL.get(dow, dow)
+        return f"Issued at {hhmm} on {dow_full}."
+    return None
+
+
+def _simplify_hwo(raw: str) -> str:
+    """
+    Convert raw HWO product text into something closer to NWR-style phrasing.
+    Keeps Day One / Days Two Through Seven / Spotter lines, deduped.
+    """
+    issued = _hwo_issued_phrase(raw)
+    cleaned = _scrub_nws_product_text(clean_for_tts(raw))
+
+    sections: Dict[str, List[str]] = {"day1": [], "day2to7": [], "spotter": []}
+    cur: Optional[str] = None
+
+    for ln in cleaned.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+
+        low = s.lower()
+
+        # Drop the noisy top banner + repeated area boilerplate
+        if low.startswith("hazardous weather outlook"):
+            continue
+        if low.startswith("national weather service"):
+            continue
+        if _HWO_ISSUED_RE.match(s):
+            continue
+        if low.startswith("this hazardous weather outlook is for"):
+            continue
+
+        if low.startswith("day one"):
+            cur = "day1"
+            continue
+        if low.startswith("days two through seven"):
+            cur = "day2to7"
+            continue
+        if low.startswith("spotter information statement"):
+            cur = "spotter"
+            continue
+
+        if cur:
+            sections[cur].append(s)
+
+    def dedupe(lines: List[str]) -> List[str]:
+        seen: set[str] = set()
+        out: List[str] = []
+        for x in lines:
+            key = x.strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(x.strip())
+        return out
+
+    day1 = dedupe(sections["day1"])
+    day2 = dedupe(sections["day2to7"])
+    spot = dedupe(sections["spotter"])
+
+    parts: List[str] = []
+    if issued:
+        parts.append(issued)
+
+    if day1:
+        parts.append("Day one. " + " ".join(day1))
+    if day2:
+        parts.append("Days two through seven. " + " ".join(day2))
+    if spot:
+        parts.append("Spotter information. " + " ".join(spot))
+
+    return _SPACE_RE.sub(" ", " ".join(parts)).strip()
+
 def _spc_threats_phrase(torn_prob: int, hail_prob: int, wind_prob: int, *, severity_dn: int) -> str:
     """
     Build a short, broadcast-friendly threat phrase from SPC probabilistic layers.
@@ -315,6 +459,10 @@ class CycleBuilder:
         self.points = reference_points
         self.same_fips = set(same_fips_all)
 
+        # Observation station naming
+        self._obs_aliases: Dict[str, str] = _parse_kv_env("SEASONAL_CYCLE_OBS_ALIASES")
+        self._obs_name_cache: Dict[str, str] = {}
+
         # caches for SPC/CWA lookups (best-effort)
         self._wfo_geom_cache: Dict[str, Dict[str, Any]] = {}
         self._arcgis_layer_cache: Dict[str, int] = {}
@@ -324,6 +472,46 @@ class CycleBuilder:
         if not self.alert_areas:
             # fail-safe (should never happen with a real config)
             self.alert_areas = ["MD", "VA", "DC", "WV"]
+
+    async def _fetch_station_name(self, station_id: str) -> Optional[str]:
+        st = (station_id or "").strip().upper()
+        if not st:
+            return None
+        try:
+            url = f"https://api.weather.gov/stations/{st}"
+            async with httpx.AsyncClient(
+                timeout=3.0,
+                headers={"User-Agent": "SeasonalWeather/SeasonalNet"},
+            ) as client:
+                r = await client.get(url)
+                r.raise_for_status()
+                data = r.json() or {}
+            name = ((data.get("properties") or {}).get("name") or "").strip()
+            if not name:
+                return None
+            name = clean_for_tts(name)
+            name = _scrub_nws_product_text(name)
+            return name or None
+        except Exception:
+            return None
+
+    async def _obs_label(self, station_id: str) -> str:
+        st = (station_id or "").strip().upper()
+        if not st:
+            return "Unknown station"
+        if st in self._obs_aliases:
+            return self._obs_aliases[st]
+        if st in self._obs_name_cache:
+            return self._obs_name_cache[st]
+
+        name = await self._fetch_station_name(st)
+        if name:
+            self._obs_name_cache[st] = name
+            return name
+
+        self._obs_name_cache[st] = st
+        return st
+
 
     def _product_max_chars(self, kind: str, mode: str) -> Optional[int]:
         """
@@ -744,11 +932,54 @@ class CycleBuilder:
             if pid:
                 prod = await self.api.get_product(pid)
                 if prod and prod.product_text:
-                    hwo_clean = clean_for_tts(prod.product_text)
-                    hwo_text = _trim_chars(hwo_clean, self._product_max_chars("HWO", ctx.mode))
+                    raw = prod.product_text.replace("\r", "")
+                    issued = _hwo_issued_phrase(raw)
+
+                    lines = raw.splitlines()
+
+                    def norm(s: str) -> str:
+                        return (s or "").lstrip("\ufeff").strip()
+
+                    def is_blank(i: int) -> bool:
+                        return i >= len(lines) or not norm(lines[i])
+
+                    i = 0
+                    while i < len(lines) and is_blank(i):
+                        i += 1
+
+                    # Find the "Hazardous Weather Outlook" banner anywhere (skip WMO/AWIPS junk above it)
+                    j = i
+                    while j < len(lines) and "hazardous weather outlook" not in norm(lines[j]).lower():
+                        j += 1
+                    if j < len(lines):
+                        i = j + 1  # drop banner line itself
+
+                        while i < len(lines) and is_blank(i):
+                            i += 1
+                        if i < len(lines) and norm(lines[i]).lower().startswith("national weather service"):
+                            i += 1
+
+                        while i < len(lines) and is_blank(i):
+                            i += 1
+                        if i < len(lines) and _HWO_ISSUED_RE.match(norm(lines[i])):
+                            i += 1
+
+                        while i < len(lines) and is_blank(i):
+                            i += 1
+
+                    body = "\n".join(lines[i:]).strip()
+                    if issued:
+                        body = f"{issued}\n{body}" if body else issued
+
+                    # Keep normal cleanup only (no content filtering)
+                    body = _scrub_nws_product_text(clean_for_tts(body))
+                    hwo_text = _trim_chars(body, self._product_max_chars("HWO", ctx.mode))
         except Exception:
             hwo_text = None
 
+        # --- Synopsis (NOT full ZFP) ---
+        # --- Synopsis (NOT full ZFP) ---
+        # --- Synopsis (NOT full ZFP) ---
         # --- Synopsis (NOT full ZFP) ---
         synopsis_text = await self._build_synopsis_text(ctx)
 
@@ -756,8 +987,21 @@ class CycleBuilder:
         fc_lines: List[str] = []
         max_points = 1 if ctx.mode == "heightened" else _env_int("SEASONAL_CYCLE_FC_MAX_POINTS_NORMAL", 6)
         field = "shortForecast" if _env_int("SEASONAL_CYCLE_FC_USE_SHORT", 1) else "detailedForecast"
-        max_periods = 1 if ctx.mode == "heightened" else _env_int("SEASONAL_CYCLE_FC_PERIODS_NORMAL", 2)
-        line_max = _env_int("SEASONAL_CYCLE_FC_LINE_MAX_CHARS", 260)
+
+        # 7-day style = ~14 periods (day/night)
+        max_periods = 1 if ctx.mode == "heightened" else _env_int("SEASONAL_CYCLE_FC_PERIODS_NORMAL", 14)
+
+        # If you're reading lots of periods, reduce points automatically
+        if max_periods >= 10:
+            max_points = min(max_points, _env_int("SEASONAL_CYCLE_FC_MAX_POINTS_7DAY", 2))
+        elif max_periods >= 6:
+            max_points = min(max_points, 3)
+
+        # How many periods to speak before inserting a pause/newline
+        per_group = _env_int("SEASONAL_CYCLE_FC_PERIODS_PER_GROUP", 4)
+
+        # Per-point safety trim (keep generous; avoid "Tuesday…" mid-cut)
+        point_max = _env_int("SEASONAL_CYCLE_FC_POINT_MAX_CHARS", _env_int("SEASONAL_CYCLE_FC_LINE_MAX_CHARS", 1600))
 
         pts = list(self.points)
         if pts:
@@ -770,28 +1014,69 @@ class CycleBuilder:
         for lat, lon, label in pts[:max_points]:
             try:
                 periods = await self.api.point_forecast_periods(lat, lon)
-                if periods:
-                    p1 = periods[0]
-                    p2 = periods[1] if len(periods) > 1 else None
+                if not periods:
+                    continue
 
-                    line = f"{label}: {p1.get('name','')} — {p1.get(field,'')}"
-                    if max_periods >= 2 and p2 and p2.get(field):
-                        line += f" {p2.get('name','')} — {p2.get(field,'')}"
-                    line = _scrub_nws_product_text(line)
-                    line = _trim_chars(line, line_max)
-                    if line:
-                        fc_lines.append(line)
+                entries: List[str] = []
+                for p in periods[:max_periods]:
+                    name = (p.get("name") or "").strip()
+                    val = (p.get(field) or "").strip()
+                    if not val:
+                        continue
+
+                    # DECTalk pacing: kill em-dash and collapse odd whitespace
+                    name = name.replace("—", "-")
+                    val = val.replace("—", "-")
+                    name = _SPACE_RE.sub(" ", name).strip()
+                    val = _SPACE_RE.sub(" ", val).strip()
+
+                    if name:
+                        entries.append(f"{name}: {val}")
+                    else:
+                        entries.append(val)
+
+                if not entries:
+                    continue
+
+                groups: List[str] = []
+                for i in range(0, len(entries), max(1, per_group)):
+                    chunk = entries[i:i + max(1, per_group)]
+                    # Sentence-ish pacing
+                    groups.append(". ".join(chunk) + ".")
+
+                # Newlines create audible pauses; keep it compact but not crunched
+                line = f"The forecast for {label}.\n" + "\n".join(groups)
+                line = _scrub_nws_product_text(line)
+                line = _trim_chars(line, point_max)
+
+                if line:
+                    fc_lines.append(line)
             except Exception:
                 continue
 
         # --- Observations ---
         obs_lines: List[str] = []
-        max_obs = 1 if ctx.mode == "heightened" else len(self.obs_stations)
-        for st in self.obs_stations[:max_obs]:
+        max_obs = 1 if ctx.mode == "heightened" else _env_int(
+            "SEASONAL_CYCLE_OBS_MAX_NORMAL",
+            min(8, len(self.obs_stations) or 0),
+        )
+
+        sts = list(self.obs_stations)
+        if sts:
+            rot_period = _env_int("SEASONAL_CYCLE_OBS_ROTATE_PERIOD_S", 300)
+            rot_step = _env_int("SEASONAL_CYCLE_OBS_ROTATE_STEP", max_obs)
+            slot = int(now.timestamp() // max(rot_period, 1))
+            offset = (slot * max(rot_step, 1)) % len(sts)
+            sts = sts[offset:] + sts[:offset]
+
+        for st in sts[:max_obs]:
             try:
                 props = await self.api.latest_observation(st)
                 if not props:
                     continue
+
+                label = await self._obs_label(st)
+
                 desc = props.get("textDescription") or ""
                 temp_c = (props.get("temperature") or {}).get("value")
                 temp_f = None
@@ -802,7 +1087,7 @@ class CycleBuilder:
                 if isinstance(wind_mps, (int, float)):
                     wind_mph = wind_mps * 2.23694
 
-                seg = f"{st}: "
+                seg = f"At {label}, "
                 if temp_f is not None:
                     seg += f"{round(temp_f)} degrees. "
                 if isinstance(desc, str) and desc:
@@ -816,6 +1101,7 @@ class CycleBuilder:
             except Exception:
                 continue
 
+        # --- Station ID ---
         # --- Station ID ---
         if ctx.mode == "heightened":
             station_id = (
