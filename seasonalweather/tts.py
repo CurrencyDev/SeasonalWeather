@@ -12,10 +12,13 @@
 from __future__ import annotations
 
 import re
+import os
 import shutil
+import time
 import subprocess
 import tempfile
 from dataclasses import dataclass
+from contextlib import contextmanager
 from pathlib import Path
 
 _SPACE_RE = re.compile(r"[ \t]+")
@@ -225,6 +228,35 @@ def _clamp_int(val: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, int(val)))
 
 
+@contextmanager
+def _file_lock(lock_path: Path, timeout_s: float = 30.0, poll_s: float = 0.1):
+    """Simple O_EXCL lock to prevent concurrent runs clobbering input/output."""
+    start = time.time()
+    fd = None
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            os.write(fd, str(os.getpid()).encode("ascii", "ignore"))
+            break
+        except FileExistsError:
+            if time.time() - start > timeout_s:
+                raise RuntimeError(f"Timed out waiting for lock {lock_path}")
+            time.sleep(poll_s)
+
+    try:
+        yield
+    finally:
+        try:
+            if fd is not None:
+                os.close(fd)
+        except Exception:
+            pass
+        try:
+            lock_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 @dataclass
 class TTS:
     backend: str
@@ -325,6 +357,35 @@ class TTS:
                 ]
                 subprocess.run(cmd, input=(msg + "\n").encode("utf-8"), check=True)
 
+
+            elif self.backend == "voicetext_paul":
+                from .voicetext_paul_vtml import apply_voicetext_paul_vtml
+                msg = apply_voicetext_paul_vtml(msg)
+
+                # VoiceText Paul via wrapper run as weatheradmin (avoids Wine crashes + perms under seasonalweather).
+                engine_dir = Path("/home/seasonalweather-data/var-lib-seasonalweather/voices/voicetext_paul/WeatherRadioSuite-LIB/binary")
+                exe = engine_dir / "voicetext_paul.exe"
+                if not exe.exists():
+                    raise RuntimeError(f"voicetext_paul backend selected but {exe} not found")
+
+                synth = Path("/usr/local/bin/voicetext_paul_synth")
+                if not synth.exists():
+                    raise RuntimeError(f"voicetext_paul backend selected but wrapper {synth} not found")
+
+                if not shutil.which("sudo"):
+                    raise RuntimeError("voicetext_paul backend selected but sudo not found")
+
+                out_src = engine_dir / "output.wav"
+                out_src.unlink(missing_ok=True)
+
+                cmd = ["sudo", "-n", "-u", "weatheradmin", str(synth)]
+                subprocess.run(cmd, input=(msg + "\n").encode("utf-8"), cwd=str(engine_dir), check=True)
+
+                if not out_src.exists() or out_src.stat().st_size < 2000:
+                    raise RuntimeError("voicetext_paul did not produce a valid output.wav")
+
+                shutil.copyfile(out_src, tmp_wav)
+                out_src.unlink(missing_ok=True)
             else:
                 # default: espeak-ng
                 if not shutil.which("espeak-ng"):
