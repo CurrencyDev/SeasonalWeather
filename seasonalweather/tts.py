@@ -378,11 +378,40 @@ class TTS:
                 out_src = engine_dir / "output.wav"
                 out_src.unlink(missing_ok=True)
 
-                cmd = ["sudo", "-n", "-u", "weatheradmin", str(synth)]
-                subprocess.run(cmd, input=(msg + "\n").encode("utf-8"), cwd=str(engine_dir), check=True)
+                retries = int(os.getenv("VOICETEXT_PAUL_RETRIES", "1") or "1")
+                retry_sleep_ms = int(os.getenv("VOICETEXT_PAUL_RETRY_SLEEP_MS", "150") or "150")
+                reset_every = int(os.getenv("VOICETEXT_PAUL_RESET_EVERY", "0") or "0")
+                kill_before = (os.getenv("VOICETEXT_PAUL_KILL_BEFORE", "0") or "0").strip().lower() in {"1","true","yes","on"}
 
-                if not out_src.exists() or out_src.stat().st_size < 2000:
-                    raise RuntimeError("voicetext_paul did not produce a valid output.wav")
+                calls = getattr(self, "_vt_paul_calls", 0) + 1
+                setattr(self, "_vt_paul_calls", calls)
+
+                def _wineserver_kill() -> None:
+                    subprocess.run([
+                        "sudo", "-n", "-u", "weatheradmin",
+                        "/usr/local/bin/voicetext_paul_wineserver_kill",
+                    ], check=False)
+
+                cmd = ["sudo", "-n", "-u", "weatheradmin", str(synth)]
+
+                if kill_before or (reset_every > 0 and (calls % reset_every) == 0):
+                    _wineserver_kill()
+
+                last_err: Exception | None = None
+                for attempt in range(retries + 1):
+                    out_src.unlink(missing_ok=True)
+                    try:
+                        subprocess.run(cmd, input=(msg + "\n").encode("utf-8"), cwd=str(engine_dir), check=True)
+                        if out_src.exists() and out_src.stat().st_size >= 2000:
+                            break
+                        raise RuntimeError("voicetext_paul did not produce a valid output.wav")
+                    except Exception as e:
+                        last_err = e
+                        _wineserver_kill()
+                        if attempt < retries:
+                            time.sleep(max(0.0, retry_sleep_ms / 1000.0))
+                else:
+                    raise RuntimeError(f"voicetext_paul failed after wineserver reset/retry: {last_err}") from last_err
 
                 shutil.copyfile(out_src, tmp_wav)
                 out_src.unlink(missing_ok=True)
