@@ -3525,6 +3525,10 @@ class Orchestrator:
         vtec = self._cap_vtec_list(ev)
         tracks = self._vtec_tracks(vtec)
 
+        same_code = self._cap_event_to_same_code((ev.event or "").strip())
+        same_locs_raw = list(ev.same_fips) if getattr(ev, "same_fips", None) else []
+        same_locs = self._filter_same_locations_to_service_area(same_locs_raw)
+
         keys: list[str] = []
         for track_id, _act in tracks:
             keys.append(f"TRACKVOICE:{track_id}")
@@ -3583,7 +3587,7 @@ class Orchestrator:
                         kind="VOICE",
                         event_code=same_code2,
                         tracks=tracks,
-                        same_locs=self._filter_same_locations_to_service_area(list(ev.same_fips) if getattr(ev, "same_fips", None) else []),
+                        same_locs=same_locs,
                         script=script,
                     )
                     desc_rb = f"CAP VOICE {ev.event}".strip()
@@ -3591,7 +3595,14 @@ class Orchestrator:
             except Exception:
                 log.exception("Rebroadcast: failed to add CAP VOICE item")
             log.info("CAP ACTION: aired voice-only event=%s id=%s sent=%s audio=%s", ev.event, ev.alert_id, ev.sent, out_wav)
-            _station_feed_note_cap(ev, mode="VOICE", same_locations=[], out_wav=str(out_wav), vtec=vtec)
+            _station_feed_note_cap(
+                ev,
+                mode="VOICE",
+                same_locations=(same_locs if same_locs else same_locs_raw),
+                out_wav=str(out_wav),
+                same_code=same_code,
+                vtec=vtec,
+            )
         except Exception:
             await self._dedupe_release(keys)
             raise
