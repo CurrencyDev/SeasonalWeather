@@ -362,7 +362,7 @@ class TTS:
                 from .voicetext_paul_vtml import apply_voicetext_paul_vtml
                 msg = apply_voicetext_paul_vtml(msg)
 
-                # VoiceText Paul via wrapper run as weatheradmin (avoids Wine crashes + perms under seasonalweather).
+                # VoiceText Paul via wrapper run as voicetext (or VOICETEXT_PAUL_RUN_AS) (avoids Wine crashes + perms under seasonalweather).
                 engine_dir = Path("/home/seasonalweather-data/var-lib-seasonalweather/voices/voicetext_paul/WeatherRadioSuite-LIB/binary")
                 exe = engine_dir / "voicetext_paul.exe"
                 if not exe.exists():
@@ -374,6 +374,9 @@ class TTS:
 
                 if not shutil.which("sudo"):
                     raise RuntimeError("voicetext_paul backend selected but sudo not found")
+                # Run Wine engine as a dedicated low-priv user (default: voicetext)
+                run_as = (os.getenv("VOICETEXT_PAUL_RUN_AS", "voicetext") or "voicetext").strip() or "voicetext"
+
 
                 out_src = engine_dir / "output.wav"
                 out_src.unlink(missing_ok=True)
@@ -388,11 +391,11 @@ class TTS:
 
                 def _wineserver_kill() -> None:
                     subprocess.run([
-                        "sudo", "-n", "-u", "weatheradmin",
+                        "sudo", "-n", "-u", run_as,
                         "/usr/local/bin/voicetext_paul_wineserver_kill",
                     ], check=False)
 
-                cmd = ["sudo", "-n", "-u", "weatheradmin", str(synth)]
+                cmd = ["sudo", "-n", "-u", run_as, str(synth)]
 
                 if kill_before or (reset_every > 0 and (calls % reset_every) == 0):
                     _wineserver_kill()
