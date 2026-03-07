@@ -45,17 +45,27 @@ def _wind_dir_repl(m: re.Match[str]) -> str:
     return f'<vtml_sub alias="{alias}">{tok}</vtml_sub>'
 
 _RULES: list[Rule] = [
-    # --- The big one: “winds” homograph (verb vs plural noun) ---
-    # Force “winds” (weather noun) => /wɪndz/
-    Rule(re.compile(r"\bwinds\b", re.IGNORECASE), _phoneme_x_cmu("W IH1 N D Z")),
-
-    # --- Common wind-direction abbreviations, only in “NW winds …” contexts ---
+    # --- Common wind-direction abbreviations, only in "NW winds ..." contexts ---
     Rule(
         re.compile(
-            r"\b(?P<dir>NNE|ENE|ESE|SSE|SSW|WSW|WNW|NNW|NE|NW|SE|SW|N|S|E|W)\b(?=\s+winds?\b)",
+            r"\b(?P<dir>NNE|ENE|ESE|SSE|SSW|WSW|WNW|NNW|NE|NW|SE|SW|N|S|E|W)\b(?=\s+wind(?:s|['’]s)?\b)",
             re.IGNORECASE,
         ),
         _wind_dir_repl,
+    ),
+
+    # --- The big one: "winds / wind's" homograph (verb vs weather noun) ---
+    # Force weather-noun "winds" and "wind's" => /wɪndz/
+    # Avoid common verb cases like "winds up ..." (except "up to ...") and "winds down" / "winds its ...".
+    Rule(
+        re.compile(
+            r"\b(?:winds|wind['’]s)\b"
+            r"(?!\s+up\b(?!\s+to\b))"
+            r"(?!\s+down\b)"
+            r"(?!\s+(?:its|their|his|her|my|your|our)\b)",
+            re.IGNORECASE,
+        ),
+        _phoneme_x_cmu("W IH1 N D Z"),
     ),
 
     # --- Units (spoken nicely) ---

@@ -2792,7 +2792,7 @@ class Orchestrator:
 
     def _live_time_text(self) -> str:
         now = dt.datetime.now(tz=self._tz)
-        return f"The current time is {_fmt_time(now)}, {_short_tz(now)}."
+        return f"The current time is, {_fmt_time(now)}, {_short_tz(now)}."
 
     def _render_live_time_wav_once(self) -> None:
         out = self._live_time_wav_path()

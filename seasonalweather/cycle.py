@@ -1109,7 +1109,7 @@ class CycleBuilder:
                 f"with station programming and streaming facilities originating from SeasonalNet, "
                 f"providing weather information for {service_area_name}. "
                 f"Due to severe weather affecting the service area, normal broadcasts have been curtailed to bring you the latest severe weather information. "
-                f"The current time is {time_str}, {tz_short}. "
+                f"The current time is, {time_str}, {tz_short}. "
                 f"{disclaimer}"
             )
         else:
@@ -1117,7 +1117,7 @@ class CycleBuilder:
                 f"This is the SeasonalNet I P Weather Radio Station, {station_name}, "
                 f"with station programming and streaming facilities originating from SeasonalNet, "
                 f"providing weather information for {service_area_name}. "
-                f"The current time is {time_str}, {tz_short}. "
+                f"The current time is, {time_str}, {tz_short}. "
                 f"{disclaimer}"
             )
         # --- Status ---
