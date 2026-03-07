@@ -58,6 +58,38 @@ class LiquidsoapTelnet:
         # Resolve symlinks/binds (important for /var/lib -> /home data moves)
         return Path(s).resolve().as_uri()
 
+    _ANN_KEY_SAFE_RE = re.compile(r"[^A-Za-z0-9_]+")
+
+    def _annotate_uri(self, base_uri: str, meta: dict[str, str] | None) -> str:
+        """
+        Build: annotate:k="v",k2="v2":<base_uri>
+
+        NOTE: base_uri is still required (it tells liquidsoap what to play).
+        The *displayed* values come from metadata fields like title/artist/album/song.
+        """
+        if not meta:
+            return base_uri
+
+        def esc(v: str) -> str:
+            return str(v).replace("\\", "\\\\").replace('"', '\\"')
+
+        parts: list[str] = []
+        for k, v in meta.items():
+            if v is None:
+                continue
+            ks = self._ANN_KEY_SAFE_RE.sub("_", str(k).strip())
+            if not ks:
+                continue
+            vs = str(v).strip()
+            if not vs:
+                continue
+            parts.append(f'{ks}="{esc(vs)}"')
+
+        if not parts:
+            return base_uri
+
+        return "annotate:" + ",".join(parts) + ":" + base_uri
+
     def _recv_until_end(self, sock: socket.socket, deadline: float) -> str:
         sock.settimeout(0.5)
         buf = bytearray()
@@ -192,14 +224,16 @@ class LiquidsoapTelnet:
 
     # -------- Public API --------
 
-    def push_alert(self, wav_path: str) -> None:
+    def push_alert(self, wav_path: str, *, meta: dict[str, str] | None = None) -> None:
         self._ensure_discovered()
         uri = self._to_uri(wav_path)
+        uri = self._annotate_uri(uri, meta)
         self._send(f'{self._alert_prefix}.push {uri}')
 
-    def push_cycle(self, wav_path: str) -> None:
+    def push_cycle(self, wav_path: str, *, meta: dict[str, str] | None = None) -> None:
         self._ensure_discovered()
         uri = self._to_uri(wav_path)
+        uri = self._annotate_uri(uri, meta)
         self._send(f'{self._cycle_prefix}.push {uri}')
 
     def flush_cycle(self) -> None:

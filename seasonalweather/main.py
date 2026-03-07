@@ -1220,6 +1220,71 @@ class Orchestrator:
         self._same_name_fail: dict[str, dt.datetime] = {}
         self._same_name_lock = asyncio.Lock()
 
+    # --- Now Playing / IP-RDS helpers (edit phrases freely) ---
+
+    _NP_CYCLE_TITLES = {
+        "id": "Station identification.",
+        "time": "The current time in our service area.",
+        "status": "Overall station status and alerts.",
+        "hwo": "Hazardous weather outlook for the service area.",
+        "hwo-unavailable": "Hazardous weather outlook for the service area.",
+        "spc": "Severe weather outlook for the service area.",
+        "zfp": "Weather synopsis for the area.",
+        "fcst": "The forecast for the service area.",
+        "obs": "Current conditions in our area.",
+        "outro": "End of the current broadcast cycle.",
+        "default": "Weather information for our service area.",
+    }
+
+    _NP_ALERT_TEMPLATES = {
+        "nwws_full": "{event}.",
+        "nwws_update": "Update for a {event}.",
+        "nwws_end": "A {event} has ended.",
+        "cap_full": "{event}.",
+        "cap_update": "Update for a {event}.",
+        "ern": "{event} relay.",
+        "rwt": "Required weekly test.",
+        "rmt": "Required monthly test.",
+        "rebroadcast": "Details of a currently active {event}.",
+        "default": "A weather alert has been issued.",
+    }
+
+    def _np_meta(self, *, title: str, kind: str, extra: dict[str, str] | None = None) -> dict[str, str]:
+        # What players display:
+        #   - title/artist/album/song
+        # Plus internal keying fields prefixed with sw_ (most players ignore them).
+        station = self.cfg.station.name
+        artist = "SeasonalNet"
+        album = "Weather information for Baltimore, Washington DC, and surrounding areas"
+        t = (title or "").strip() or "SeasonalWeather"
+        song = f"{station} — {t}"
+
+        m: dict[str, str] = {
+            "title": t,
+            "artist": artist,
+            "album": album,
+            "song": song,
+            "sw_station": station,
+            "sw_kind": (kind or "").strip(),
+        }
+        if extra:
+            for k, v in extra.items():
+                if v is None:
+                    continue
+                s = str(v).strip()
+                if s:
+                    m[str(k)] = s
+        return m
+
+    def _np_cycle_title(self, key: str) -> str:
+        k = (key or "").strip()
+        return self._NP_CYCLE_TITLES.get(k, self._NP_CYCLE_TITLES["default"])
+
+    def _np_alert_title(self, template_key: str, *, event: str) -> str:
+        tpl = self._NP_ALERT_TEMPLATES.get(template_key, self._NP_ALERT_TEMPLATES["default"])
+        return tpl.format(event=(event or "Alert").strip())
+
+
     def _norm_wfo_set(self, wfos: list[str] | set[str] | tuple[str, ...]) -> set[str]:
         """
         Normalizes allowed WFOs so YAML can use LWX or KLWX interchangeably.
@@ -2634,7 +2699,10 @@ class Orchestrator:
                 self.telnet.flush_cycle()
             except Exception:
                 pass
-            self.telnet.push_alert(str(ap))
+            desc = (getattr(it, "desc", "") or "").strip() or "Earlier message"
+            title = self._np_alert_title("rebroadcast", event=desc)
+            meta = self._np_meta(title=title, kind="rebroadcast", extra={"sw_alert_source": "rebroadcast", "sw_desc": desc})
+            self.telnet.push_alert(str(ap), meta=meta)
 
         async with self._rebroadcast_lock:
             it2 = self._rebroadcast_items.get(getattr(it, "key", ""))
@@ -2937,7 +3005,10 @@ class Orchestrator:
                 self.telnet.flush_cycle()
             except Exception:
                 pass
-            self.telnet.push_alert(str(out_wav))
+            tkey = "rwt" if code == "RWT" else "rmt"
+            title = self._np_alert_title(tkey, event="")
+            meta = self._np_meta(title=title, kind="test", extra={"sw_alert_source": "local", "sw_event_code": code})
+            self.telnet.push_alert(str(out_wav), meta=meta)
 
         # --- Station feed note (radio UI: handled-alerts.json) ---
         try:
@@ -3385,7 +3456,20 @@ class Orchestrator:
                     self.telnet.flush_cycle()
                 except Exception:
                     pass
-                self.telnet.push_alert(str(out_wav))
+                event_label = (ev.event or "").strip() or "Weather alert"
+                title = self._np_alert_title("cap_full", event=event_label)
+                meta = self._np_meta(
+                    title=title,
+                    kind="alert",
+                    extra={
+                        "sw_alert_source": "cap",
+                        "sw_alert_mode": "full",
+                        "sw_event": event_label,
+                        "sw_event_code": (same_code or "").strip().upper(),
+                        "sw_alert_id": str(ev.alert_id or "").strip(),
+                    },
+                )
+                self.telnet.push_alert(str(out_wav), meta=meta)
 
             self._cap_full_last_by_key[key] = now
             self.last_product_desc = f"CAP {ev.event}".strip()
@@ -3468,7 +3552,20 @@ class Orchestrator:
                     self.telnet.flush_cycle()
                 except Exception:
                     pass
-                self.telnet.push_alert(str(out_wav))
+                event_label = (ev.event or "").strip() or "Weather alert"
+                title = self._np_alert_title("cap_update", event=event_label)
+                meta = self._np_meta(
+                    title=title,
+                    kind="alert",
+                    extra={
+                        "sw_alert_source": "cap",
+                        "sw_alert_mode": "voice",
+                        "sw_event": event_label,
+                        "sw_event_code": (same_code or "").strip().upper(),
+                        "sw_alert_id": str(ev.alert_id or "").strip(),
+                    },
+                )
+                self.telnet.push_alert(str(out_wav), meta=meta)
 
             self._cap_voice_last_by_key[key] = now
             self.last_product_desc = f"CAP {ev.event}".strip()
@@ -3696,7 +3793,19 @@ class Orchestrator:
                     self.telnet.flush_cycle()
                 except Exception:
                     pass
-                self.telnet.push_alert(str(out_wav))
+                event_label = _sf_eas_event_label_full(code)
+                title = self._np_alert_title("ern", event=event_label)
+                meta = self._np_meta(
+                    title=title,
+                    kind="alert",
+                    extra={
+                        "sw_alert_source": "ern",
+                        "sw_event_code": code,
+                        "sw_event": event_label,
+                        "sw_sender": (ev.sender or "").strip(),
+                    },
+                )
+                self.telnet.push_alert(str(out_wav), meta=meta)
 
             self._ern_relay_last_any_at = now
             self.last_product_desc = f"ERN {code}".strip()
@@ -3891,7 +4000,27 @@ class Orchestrator:
                     self.telnet.flush_cycle()
                 except Exception:
                     pass
-                self.telnet.push_alert(str(out_wav))
+                event_label = _sf_eas_event_label_full(parsed.product_type)
+                if (not should_full) and (("EXP" in vtec_actions) or ("CAN" in vtec_actions)):
+                    tkey = "nwws_end"
+                elif should_full:
+                    tkey = "nwws_full"
+                else:
+                    tkey = "nwws_update"
+                title = self._np_alert_title(tkey, event=event_label)
+                meta = self._np_meta(
+                    title=title,
+                    kind="alert",
+                    extra={
+                        "sw_alert_source": "nwws",
+                        "sw_alert_mode": ("full" if should_full else "voice"),
+                        "sw_event_code": (parsed.product_type or "").strip().upper(),
+                        "sw_event": event_label,
+                        "sw_wfo": (parsed.wfo or "").strip(),
+                        "sw_awips": (parsed.awips_id or "").strip(),
+                    },
+                )
+                self.telnet.push_alert(str(out_wav), meta=meta)
 
             now = dt.datetime.now(tz=self._tz)
 
@@ -4106,7 +4235,7 @@ class Orchestrator:
                     except Exception:
                         log.exception("Failed to ensure live time WAV exists")
 
-                wavs: list[Path] = []
+                cycle_items: list[tuple[Path, str]] = []
                 durs: list[float] = []
 
                 for seg in segs:
@@ -4114,13 +4243,13 @@ class Orchestrator:
                         stripped = _TIME_SENTENCE_RE.sub("", seg.text).strip()
                         seg2 = CycleSegment(key=seg.key, title=seg.title, text=stripped)
                         w = await self._render_cycle_segment_audio(seg2)
-                        wavs.append(w)
-                        wavs.append(self._live_time_wav_path())
+                        cycle_items.append((w, "id"))
+                        cycle_items.append((self._live_time_wav_path(), "time"))
                     else:
                         w = await self._render_cycle_segment_audio(seg)
-                        wavs.append(w)
+                        cycle_items.append((w, seg.key))
 
-                for w in wavs:
+                for w, _k in cycle_items:
                     try:
                         durs.append(wav_duration_seconds(w))
                     except Exception:
@@ -4140,8 +4269,13 @@ class Orchestrator:
                 repeats = max(1, min(repeats, 20))
 
                 for _ in range(repeats):
-                    for w in wavs:
-                        self.telnet.push_cycle(str(w))
+                    for w, k in cycle_items:
+                        meta = self._np_meta(
+                            title=self._np_cycle_title(k),
+                            kind="cycle",
+                            extra={"sw_cycle_key": k, "sw_mode": self.mode},
+                        )
+                        self.telnet.push_cycle(str(w), meta=meta)
 
                 log.info(
                     "Queued segmented %s cycle (%ss, segs=%d, seq_dur=%.1fs, repeats=%d, reason=%s)",
