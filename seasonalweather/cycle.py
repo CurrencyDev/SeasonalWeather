@@ -18,8 +18,34 @@ def _fmt_time(now: dt.datetime) -> str:
     return now.strftime("%-I:%M %p")
 
 
+_TZ_NAME_MAP = {
+    "EST": "Eastern Standard Time",
+    "EDT": "Eastern Daylight Time",
+    "CST": "Central Standard Time",
+    "CDT": "Central Daylight Time",
+    "MST": "Mountain Standard Time",
+    "MDT": "Mountain Daylight Time",
+    "PST": "Pacific Standard Time",
+    "PDT": "Pacific Daylight Time",
+    "AKST": "Alaska Standard Time",
+    "AKDT": "Alaska Daylight Time",
+    "HST": "Hawaii Standard Time",
+    "AST": "Atlantic Standard Time",
+    "ADT": "Atlantic Daylight Time",
+    "UTC": "Coordinated Universal Time",
+    "GMT": "Greenwich Mean Time",
+}
+
+
+def _expand_tz_token(token: str) -> str:
+    tok = (token or "").strip()
+    if not tok:
+        return "local"
+    return _TZ_NAME_MAP.get(tok.upper(), tok)
+
+
 def _short_tz(now: dt.datetime) -> str:
-    return now.tzname() or "local"
+    return _expand_tz_token(now.tzname() or "local")
 
 
 def _env_int(key: str, default: int) -> int:
