@@ -25,6 +25,7 @@ import time
 import re
 import sys
 import uuid
+import wave
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -4465,6 +4466,351 @@ class Orchestrator:
 
         concat_wavs(out, parts)
         return out
+
+    def _assert_station_wav_format(self, wav_path: Path) -> None:
+        try:
+            with wave.open(str(wav_path), "rb") as wf:
+                channels = int(wf.getnchannels())
+                sample_width = int(wf.getsampwidth())
+                sample_rate = int(wf.getframerate())
+        except wave.Error as exc:
+            raise ValueError(f"Input WAV is not readable: {exc}") from exc
+
+        expected_rate = int(self.cfg.audio.sample_rate)
+        if channels != 2 or sample_width != 2 or sample_rate != expected_rate:
+            raise ValueError(
+                f"Input WAV must be stereo 16-bit PCM at {expected_rate} Hz; got channels={channels}, sample_width={sample_width}, sample_rate={sample_rate}"
+            )
+
+    async def _render_pre_recorded_alert_audio(
+        self,
+        *,
+        event_code: str,
+        source_wav: Path,
+        same_locations: list[str] | None = None,
+    ) -> Path:
+        self._assert_station_wav_format(source_wav)
+        _, audio_dir, _, _ = self._paths()
+        ts = dt.datetime.now(tz=self._tz).strftime("%Y%m%d-%H%M%S")
+
+        tone = audio_dir / f"api_audio_alert_{ts}_tone.wav"
+        gap = audio_dir / f"api_audio_alert_{ts}_gap.wav"
+        eom = audio_dir / f"api_audio_alert_{ts}_eom.wav"
+        post = audio_dir / f"api_audio_alert_{ts}_post.wav"
+        out = audio_dir / f"api_audio_alert_{ts}.wav"
+
+        same_hdr_all: Path | None = None
+        same_eom_wav: Path | None = None
+
+        if self._same_enabled() and SameHeader is not None:
+            try:
+                if same_locations is not None and len(same_locations) == 0:
+                    log.info("SAME targeting disabled for this prerecorded alert (no locations computed)")
+                else:
+                    if same_locations is not None:
+                        locs = list(same_locations)
+                    else:
+                        locs = list(self.cfg.service_area.same_fips_all)
+
+                    if not locs:
+                        locs = ["000000"]
+
+                    chunks = chunk_locations(locs) if chunk_locations is not None else [[]]
+                    issued = dt.datetime.now(tz=dt.timezone.utc)
+
+                    hdr_wavs: list[Path] = []
+                    for i, loc_chunk in enumerate(chunks):
+                        hdr_msg = SameHeader(
+                            org="WXR",
+                            event=_safe_event_code(event_code),
+                            locations=tuple(loc_chunk) if loc_chunk else tuple(["000000"]),
+                            duration_minutes=self._same_duration_minutes(),
+                            sender=self._same_sender(),
+                            issued_utc=issued,
+                        ).as_ascii()
+
+                        hw = audio_dir / f"api_audio_alert_{ts}_samehdr_{i}.wav"
+                        render_same_bursts_wav(
+                            hw,
+                            hdr_msg,
+                            sample_rate=self.cfg.audio.sample_rate,
+                            amplitude=self._same_amplitude(),
+                        )
+                        hdr_wavs.append(hw)
+
+                    if len(hdr_wavs) == 1:
+                        same_hdr_all = hdr_wavs[0]
+                    elif len(hdr_wavs) > 1:
+                        msg_gap = audio_dir / f"api_audio_alert_{ts}_samehdr_msg_gap.wav"
+                        write_silence_wav(msg_gap, 1.0, self.cfg.audio.sample_rate)
+                        same_hdr_all = audio_dir / f"api_audio_alert_{ts}_samehdr_all.wav"
+                        parts2: list[Path] = []
+                        for i, hw in enumerate(hdr_wavs):
+                            parts2.append(hw)
+                            if i != len(hdr_wavs) - 1:
+                                parts2.append(msg_gap)
+                        concat_wavs(same_hdr_all, parts2)
+
+                    same_eom_wav = audio_dir / f"api_audio_alert_{ts}_sameeom.wav"
+                    render_same_eom_wav(
+                        same_eom_wav,
+                        sample_rate=self.cfg.audio.sample_rate,
+                        amplitude=self._same_amplitude(),
+                    )
+            except Exception:
+                same_hdr_all = None
+                same_eom_wav = None
+                log.exception("SAME generation failed; continuing without SAME for prerecorded manual alert")
+
+        write_sine_wav(tone, self.cfg.audio.attention_tone_hz, self.cfg.audio.attention_tone_seconds, self.cfg.audio.sample_rate)
+        write_silence_wav(gap, self.cfg.audio.inter_segment_silence_seconds, self.cfg.audio.sample_rate)
+        write_silence_wav(post, self.cfg.audio.post_alert_silence_seconds, self.cfg.audio.sample_rate)
+
+        parts: list[Path] = []
+        if same_hdr_all:
+            parts.extend([same_hdr_all, gap])
+        parts.extend([tone, gap, source_wav])
+        if same_eom_wav:
+            parts.extend([gap, same_eom_wav])
+        else:
+            write_sine_wav(eom, self.cfg.audio.eom_beep_hz, self.cfg.audio.eom_beep_seconds, self.cfg.audio.sample_rate, amplitude=0.18)
+            parts.extend([gap, eom])
+        parts.append(post)
+
+        concat_wavs(out, parts)
+        return out
+
+    def _manual_full_eas_should_heighten(self) -> bool:
+        return _env_bool("SEASONAL_MANUAL_FULL_EAS_HEIGHTENS", default=True)
+
+    async def _note_manual_station_feed(
+        self,
+        *,
+        event_code: str,
+        headline: str,
+        voice_mode: str,
+        same_locations: list[str] | None,
+        out_wav: str,
+        sender: str | None = None,
+        expires_in_minutes: int | None = None,
+        actor: str | None = None,
+    ) -> None:
+        if not _sf_enabled() or StationFeedAlert is None:
+            return
+
+        try:
+            same_codes = [str(x).strip() for x in (same_locations or []) if str(x).strip()]
+            event_text = _sf_eas_event_label_full(event_code)
+            now_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+            expires_at = now_utc + dt.timedelta(minutes=max(1, int(expires_in_minutes or 30)))
+
+            area_text = ""
+            if same_codes:
+                try:
+                    area_text = await self._sf_area_text_from_same_codes(same_codes)
+                except Exception:
+                    area_text = ""
+            if not area_text:
+                area_text = str(self.cfg.station.service_area_name or "Unknown area").strip() or "Unknown area"
+
+            sender_name = (sender or self.cfg.station.name or "SeasonalWeather").strip()
+            if voice_mode == "full_eas":
+                sf_headline = _sf_make_eas_headline(
+                    org="WXR",
+                    event_text=event_text,
+                    area_text=area_text,
+                    start_utc=now_utc,
+                    end_utc=expires_at,
+                    sender=sender_name,
+                )
+            else:
+                sf_headline = (headline or event_text or "Manual message").strip()
+
+            links = {
+                "mode": ("FULL" if voice_mode == "full_eas" else "VOICE"),
+                "wav": str(out_wav),
+                "via": "local-api",
+            }
+            if actor:
+                links["actor"] = str(actor).strip()[:64]
+
+            alert = StationFeedAlert(
+                id=_sf_sha1_12(f"api:{event_code}:{headline}:{out_wav}:{now_utc.isoformat()}"),
+                event=str(event_text),
+                headline=str(sf_headline),
+                severity="Unknown",
+                urgency="Unknown",
+                certainty="Observed",
+                area=str(area_text),
+                effective=_sf_iso(now_utc),
+                ends=_sf_iso(expires_at),
+                expires=_sf_iso(expires_at),
+                sent=_sf_iso(now_utc),
+                sameCodes=same_codes,
+                from_=(FeedSender(name=sender_name, kind="origin") if FeedSender else None),
+                links=links,
+            )
+            _sf_emit(alert, expires_at=expires_at)
+        except Exception:
+            log.exception("Station feed: failed to note manual origination")
+
+    async def _push_manual_originated_audio(
+        self,
+        *,
+        wav_path: Path,
+        headline: str,
+        event_code: str,
+        voice_mode: str,
+        sender: str | None = None,
+        actor: str | None = None,
+        interrupt_policy: str = "interrupt_then_refill",
+        same_locations: list[str] | None = None,
+        expires_in_minutes: int | None = None,
+    ) -> dict[str, object]:
+        policy = (interrupt_policy or "interrupt_then_refill").strip().lower()
+        if policy != "interrupt_then_refill":
+            raise ValueError(f"Unsupported interrupt policy: {interrupt_policy}")
+
+        mode = (voice_mode or "voice_only").strip().lower()
+        if mode not in {"voice_only", "full_eas"}:
+            raise ValueError(f"Unsupported voice mode: {voice_mode}")
+
+        same_codes = self._filter_same_locations_to_service_area(same_locations)
+
+        async with self._cycle_lock:
+            try:
+                self.telnet.flush_cycle()
+            except Exception:
+                pass
+
+            title = (headline or "Manual message").strip() or "Manual message"
+            meta = self._np_meta(
+                title=title,
+                kind="alert",
+                extra={
+                    "sw_alert_source": "api",
+                    "sw_alert_mode": ("full" if mode == "full_eas" else "voice"),
+                    "sw_event_code": _safe_event_code(event_code),
+                    "sw_event": title,
+                    "sw_sender": (sender or "").strip(),
+                    "sw_actor": (actor or "").strip(),
+                },
+            )
+            self.telnet.push_alert(str(wav_path), meta=meta)
+
+        now = dt.datetime.now(tz=self._tz)
+        self.last_product_desc = title[:200]
+        if mode == "full_eas":
+            self.last_toneout_at = now
+            if self._manual_full_eas_should_heighten():
+                self.last_heightened_at = now
+                self.heightened_until = now + dt.timedelta(seconds=self.cfg.cycle.min_heightened_seconds)
+                self._update_mode()
+
+        self._schedule_cycle_refill("post-api-origination")
+        await self._note_manual_station_feed(
+            event_code=event_code,
+            headline=headline,
+            voice_mode=mode,
+            same_locations=same_codes,
+            out_wav=str(wav_path),
+            sender=sender,
+            expires_in_minutes=expires_in_minutes,
+            actor=actor,
+        )
+
+        return {
+            "ok": True,
+            "headline": title,
+            "event_code": _safe_event_code(event_code),
+            "voice_mode": mode,
+            "audio_path": str(wav_path),
+            "same_codes": same_codes,
+            "actor": (actor or "").strip(),
+        }
+
+    async def originate_manual_text(
+        self,
+        *,
+        event_code: str,
+        headline: str,
+        script_text: str,
+        voice_mode: str = "voice_only",
+        same_locations: list[str] | None = None,
+        sender: str | None = None,
+        actor: str | None = None,
+        interrupt_policy: str = "interrupt_then_refill",
+        expires_in_minutes: int | None = None,
+    ) -> dict[str, object]:
+        code = _safe_event_code(event_code)
+        mode = (voice_mode or "voice_only").strip().lower()
+        if mode == "full_eas":
+            filtered_same = self._filter_same_locations_to_service_area(same_locations)
+            dummy = SimpleNamespace(product_type=code, awips_id=None, wfo="LOCAL", raw_text="")
+            wav_path = await self._render_alert_audio(dummy, script_text, same_locations=filtered_same)
+        else:
+            filtered_same = []
+            wav_path = await self._render_voice_only_audio(script_text, prefix="api_text")
+
+        result = await self._push_manual_originated_audio(
+            wav_path=wav_path,
+            headline=headline,
+            event_code=code,
+            voice_mode=mode,
+            sender=sender,
+            actor=actor,
+            interrupt_policy=interrupt_policy,
+            same_locations=filtered_same,
+            expires_in_minutes=expires_in_minutes,
+        )
+        result["script_text"] = script_text
+        return result
+
+    async def originate_manual_audio(
+        self,
+        *,
+        event_code: str,
+        headline: str,
+        wav_path: str | Path,
+        voice_mode: str = "voice_only",
+        same_locations: list[str] | None = None,
+        sender: str | None = None,
+        actor: str | None = None,
+        interrupt_policy: str = "interrupt_then_refill",
+        expires_in_minutes: int | None = None,
+    ) -> dict[str, object]:
+        code = _safe_event_code(event_code)
+        mode = (voice_mode or "voice_only").strip().lower()
+
+        path = Path(str(wav_path))
+        if not path.exists():
+            raise FileNotFoundError(str(path))
+        self._assert_station_wav_format(path)
+
+        if mode == "full_eas":
+            filtered_same = self._filter_same_locations_to_service_area(same_locations)
+            out_wav = await self._render_pre_recorded_alert_audio(
+                event_code=code,
+                source_wav=path,
+                same_locations=filtered_same,
+            )
+        elif mode == "voice_only":
+            filtered_same = []
+            out_wav = path
+        else:
+            raise ValueError(f"Unsupported voice mode: {voice_mode}")
+
+        return await self._push_manual_originated_audio(
+            wav_path=out_wav,
+            headline=headline,
+            event_code=code,
+            voice_mode=mode,
+            sender=sender,
+            actor=actor,
+            interrupt_policy=interrupt_policy,
+            same_locations=filtered_same,
+            expires_in_minutes=expires_in_minutes,
+        )
 
     async def _render_cycle_segment_audio(self, seg: CycleSegment) -> Path:
         _, audio_dir, _, _ = self._paths()

@@ -13,4 +13,4 @@ python-dateutil
 slixmpp
 SQLAlchemy
 uvicorn
-
+python-multipart
