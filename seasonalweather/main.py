@@ -42,6 +42,9 @@ from .audio import write_sine_wav, write_silence_wav, concat_wavs, wav_duration_
 from .liquidsoap_telnet import LiquidsoapTelnet
 from .cycle import CycleBuilder, CycleContext, CycleSegment
 
+# Active alert tracker (persistent cycle state across restarts)
+from .active_alerts import ActiveAlert, AlertTracker, _vtec_track_id
+
 # RWT/RMT scheduler
 from .rwt_rmt import RwtRmtSchedule, RwtRmtScheduler
 
@@ -1247,6 +1250,11 @@ class Orchestrator:
         self._same_name_fail: dict[str, dt.datetime] = {}
         self._same_name_lock = asyncio.Lock()
 
+        # --- Persistent active alert tracker ---
+        # Survives restarts: active watches/warnings are re-queued as cycle segments.
+        _tracker_path = Path(cfg.paths.work_dir) / "alert_state.json"
+        self.alert_tracker = AlertTracker(_tracker_path)
+
     # --- Now Playing / IP-RDS helpers (edit phrases freely) ---
 
     _NP_CYCLE_TITLES = {
@@ -1365,7 +1373,9 @@ class Orchestrator:
         return f"{hrs} hours" if rem == 0 else f"{hrs} hours and {rem} minutes"
 
     def _cycle_interval_seconds(self) -> int:
-        return self.cfg.cycle.heightened_interval_seconds if self.mode == "heightened" else self.cfg.cycle.normal_interval_seconds
+        if self.mode == "heightened" or self.alert_tracker.has_active():
+            return self.cfg.cycle.heightened_interval_seconds
+        return self.cfg.cycle.normal_interval_seconds
 
     def _schedule_cycle_refill(self, reason: str) -> None:
         """
@@ -3088,6 +3098,17 @@ class Orchestrator:
 
         await self._wait_for_liquidsoap()
 
+        # --- Persistent alert state: restore from disk, drop expired ---
+        try:
+            _loaded = self.alert_tracker.load()
+            _purged = self.alert_tracker.purge_expired()
+            log.info(
+                "AlertTracker: loaded %d entries, purged %d expired on startup",
+                _loaded, _purged,
+            )
+        except Exception:
+            log.exception("AlertTracker: startup load/purge failed")
+
         tasks: list[asyncio.Task] = []
 
         if self.live_time_enabled:
@@ -3247,6 +3268,55 @@ class Orchestrator:
             if toneout:
                 await self._handle_toneout(parsed)
 
+            # PNS cycle injection — SEVERE WEATHER SAFETY RULES bulletins go into
+            # the broadcast cycle as a voice-only segment (no cut-in, no tones).
+            elif (parsed.product_type or "").strip().upper() == "PNS":
+                try:
+                    official_pns = parsed.raw_text
+                    try:
+                        pid_pns = await self.api.latest_product_id("PNS", parsed.wfo[1:] if parsed.wfo.startswith("K") else parsed.wfo)
+                        if pid_pns:
+                            prod_pns = await self.api.get_product(pid_pns)
+                            if prod_pns and prod_pns.product_text:
+                                official_pns = prod_pns.product_text
+                    except Exception:
+                        pass
+
+                    if self._is_safety_rules_pns(official_pns):
+                        pns_script = self._build_pns_safety_script(official_pns)
+                        if pns_script.strip():
+                            pns_key = f"PNS_SAFETY:{(parsed.wfo or '').strip()}:{self._sha1_12(official_pns[:800])}"
+                            ok_pns, _ = await self._dedupe_reserve([pns_key])
+                            if ok_pns:
+                                try:
+                                    pns_exp_utc = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=4)
+                                    pns_ae = ActiveAlert(
+                                        id=pns_key,
+                                        source="PNS_CYCLE",
+                                        event="Severe Weather Safety Rules",
+                                        code="SPS",
+                                        vtec=[],
+                                        headline="Severe Weather Safety Rules",
+                                        script_text=pns_script,
+                                        audio_path=None,
+                                        expires=pns_exp_utc.isoformat(),
+                                        issued=dt.datetime.now(dt.timezone.utc).isoformat(),
+                                        same_locs=list(self.cfg.service_area.same_fips_all or []),
+                                        cycle_only=True,
+                                    )
+                                    self.alert_tracker.add_or_update(pns_ae)
+                                    self._schedule_cycle_refill("pns-safety-rules")
+                                    log.info(
+                                        "PNS SAFETY RULES queued for cycle id=%s wfo=%s awips=%s",
+                                        pns_key, parsed.wfo, parsed.awips_id or "",
+                                    )
+                                except Exception:
+                                    log.exception("PNS safety rules cycle inject failed")
+                            else:
+                                log.info("PNS safety rules skipped (dedupe) wfo=%s", parsed.wfo)
+                except Exception:
+                    log.exception("PNS safety rules handler error wfo=%s", parsed.wfo)
+
     def _cap_is_actionable(self, ev: "CapAlertEvent") -> bool:  # type: ignore[name-defined]
         try:
             if str(ev.status or "").strip().lower() != "actual":
@@ -3362,6 +3432,27 @@ class Orchestrator:
             return False
         return True
 
+    def _cap_should_update(self, ev: "CapAlertEvent") -> bool:  # type: ignore[name-defined]
+        """
+        True for CAP messageType=Update with CON/EXT/CAN/EXP actions on events we
+        already watch-and-warn on.  These get voice-only narration (no SAME tones).
+        """
+        if not self._cap_full_enabled():
+            return False
+        if not self._cap_is_actionable(ev):
+            return False
+        mt = str(ev.message_type or "").strip().lower()
+        if mt != "update":
+            return False
+        event = (ev.event or "").strip()
+        if event not in self._cap_full_events():
+            return False
+        vtec = self._cap_vtec_list(ev)
+        tracks = self._vtec_tracks(vtec)
+        update_actions = {"CON", "EXT", "CAN", "EXP"}
+        vtec_actions = {act for (_t, act) in tracks} if tracks else set()
+        return bool(vtec_actions & update_actions)
+
     async def _consume_cap(self) -> None:
         while True:
             ev = await self.cap_queue.get()
@@ -3384,6 +3475,15 @@ class Orchestrator:
                         tracks=tracks,
                         reason=f"cap:{mt}:{','.join(sorted(vtec_actions & {'CAN','EXP'}))}",
                     )
+                    # Also remove from AlertTracker (if not already handled by _air_cap_update)
+                    try:
+                        _can_track_ids = {_vtec_track_id(v) for v in vtec if _vtec_track_id(v)}
+                        self.alert_tracker.remove_by_vtec_tracks(
+                            _can_track_ids,  # type: ignore[arg-type]
+                            reason=f"cap-consume:{mt}:{','.join(sorted(vtec_actions & {'CAN','EXP'}))}",
+                        )
+                    except Exception:
+                        log.exception("AlertTracker: removal failed in _consume_cap CAN/EXP block")
                 else:
                     await self._rebroadcast_touch_expiry_by_tracks(
                         tracks=tracks,
@@ -3421,6 +3521,11 @@ class Orchestrator:
                 await self._air_cap_full(ev)
                 continue
 
+            # CON/EXT/CAN/EXP for watched/warned events → voice-only update narration
+            if self._cap_should_update(ev):
+                await self._air_cap_update(ev)
+                continue
+
             if self._cap_should_voice(ev):
                 await self._air_cap_voice(ev)
 
@@ -3433,14 +3538,55 @@ class Orchestrator:
             log.info("CAP full: cooldown active; skipping id=%s sent=%s event=%s", ev.alert_id, ev.sent, ev.event)
             return
 
-        script = self._build_cap_full_script(ev)
+        vtec = self._cap_vtec_list(ev)
+        tracks = self._vtec_tracks(vtec)
+        vtec_actions = {act for (_t, act) in tracks} if tracks else set()
+
+        ev_event = (ev.event or "").strip()
+        _WATCH_EVENTS = {"Tornado Watch", "Severe Thunderstorm Watch"}
+        is_watch = ev_event in _WATCH_EVENTS
+
+        # ---- Determine watch number and kind for TOA/SVA ----
+        watch_number: int | None = None
+        watch_kind = "tornado"
+        if is_watch:
+            for v in vtec:
+                m = _VTEC_PARSE_RE.search(v)
+                if not m:
+                    continue
+                phen = (m.group("phen") or "").upper()
+                sig = (m.group("sig") or "").upper()
+                if sig != "A":
+                    continue
+                if phen == "TO":
+                    watch_kind = "tornado"
+                elif phen == "SV":
+                    watch_kind = "severe"
+                else:
+                    continue
+                try:
+                    watch_number = int(m.group("etn"))
+                except Exception:
+                    pass
+                break
+
+        # ---- Route to appropriate script builder ----
+        if is_watch:
+            if vtec_actions & {"EXA", "EXB"}:
+                # Watch expansion: full announcement with SAME for added counties
+                script = self._build_watch_expansion_script(ev)
+            else:
+                # NEW or UPG watch
+                script = self._build_cap_watch_script(ev, mode="full")
+            if not script.strip():
+                script = self._build_cap_full_script(ev)
+        else:
+            script = self._build_cap_full_script(ev)
+
         if not script.strip():
             return
 
-        vtec = self._cap_vtec_list(ev)
-        tracks = self._vtec_tracks(vtec)
-
-        same_code = self._cap_event_to_same_code((ev.event or "").strip())
+        same_code = self._cap_event_to_same_code(ev_event)
         same_locs_raw = list(ev.same_fips) if getattr(ev, "same_fips", None) else []
         same_locs = self._filter_same_locations_to_service_area(same_locs_raw)
 
@@ -3532,6 +3678,42 @@ class Orchestrator:
                 log.exception("Rebroadcast: failed to add CAP FULL item")
             log.info("CAP ACTION: aired FULL event=%s code=%s id=%s sent=%s vtec=%s audio=%s", ev.event, same_code, ev.alert_id, ev.sent, ",".join(vtec[:2]) if vtec else "", out_wav)
             _station_feed_note_cap(ev, mode="FULL", same_locations=(same_locs if same_locs else same_locs_raw), out_wav=str(out_wav), same_code=same_code, vtec=vtec)
+
+            # ---- Register to AlertTracker for restart-safe rebroadcast ----
+            try:
+                tracker_id = self._alert_tracker_id_for_cap(ev, same_code)
+                expires_iso = self._alert_expires_from_cap(ev, vtec)
+                _is_watch = (ev.event or "").strip() in {"Tornado Watch", "Severe Thunderstorm Watch"}
+                _watch_num: int | None = None
+                if _is_watch:
+                    for _v in vtec:
+                        _m = _VTEC_PARSE_RE.search(_v)
+                        if _m and (_m.group("sig") or "").upper() == "A":
+                            try:
+                                _watch_num = int(_m.group("etn"))
+                            except Exception:
+                                pass
+                            break
+                alert_entry = ActiveAlert(
+                    id=tracker_id,
+                    source="CAP",
+                    event=str(ev.event or ""),
+                    code=same_code,
+                    vtec=vtec,
+                    headline=str(ev.headline or ""),
+                    script_text=script,
+                    audio_path=str(out_wav),
+                    expires=expires_iso,
+                    issued=str(ev.sent or dt.datetime.now(dt.timezone.utc).isoformat()),
+                    same_locs=same_locs,
+                    cycle_only=False,
+                    watch_number=_watch_num,
+                )
+                self.alert_tracker.add_or_update(alert_entry)
+                self.alert_tracker.mark_aired(tracker_id)
+                log.info("AlertTracker: registered CAP FULL id=%s event=%s expires=%s", tracker_id, ev.event, expires_iso)
+            except Exception:
+                log.exception("AlertTracker: failed to register CAP FULL event=%s", ev.event)
         except Exception:
             await self._dedupe_release(keys)
             raise
@@ -3622,6 +3804,30 @@ class Orchestrator:
             except Exception:
                 log.exception("Rebroadcast: failed to add CAP VOICE item")
             log.info("CAP ACTION: aired voice-only event=%s id=%s sent=%s audio=%s", ev.event, ev.alert_id, ev.sent, out_wav)
+
+            # Register to AlertTracker (cycle_only → no SAME retone on cycle replay)
+            try:
+                vtec_v = self._cap_vtec_list(ev)
+                tracker_id_v = self._alert_tracker_id_for_cap(ev, same_code)
+                expires_iso_v = self._alert_expires_from_cap(ev, vtec_v)
+                _ae = ActiveAlert(
+                    id=tracker_id_v,
+                    source="CAP",
+                    event=str(ev.event or ""),
+                    code=same_code,
+                    vtec=vtec_v,
+                    headline=str(ev.headline or ""),
+                    script_text=script,
+                    audio_path=str(out_wav),
+                    expires=expires_iso_v,
+                    issued=str(ev.sent or dt.datetime.now(dt.timezone.utc).isoformat()),
+                    same_locs=same_locs,
+                    cycle_only=True,
+                )
+                self.alert_tracker.add_or_update(_ae)
+                self.alert_tracker.mark_aired(tracker_id_v)
+            except Exception:
+                log.exception("AlertTracker: failed to register CAP VOICE event=%s", ev.event)
             _station_feed_note_cap(
                 ev,
                 mode="VOICE",
@@ -3630,6 +3836,119 @@ class Orchestrator:
                 same_code=same_code,
                 vtec=vtec,
             )
+        except Exception:
+            await self._dedupe_release(keys)
+            raise
+
+
+    async def _air_cap_update(self, ev: "CapAlertEvent") -> None:  # type: ignore[name-defined]
+        """
+        Voice-only narration for VTEC CON/EXT/CAN/EXP on already-aired events.
+        No SAME tones.  Removes entry from AlertTracker on CAN/EXP.
+        """
+        now = dt.datetime.now(tz=self._tz)
+        vtec = self._cap_vtec_list(ev)
+        tracks = self._vtec_tracks(vtec)
+        vtec_actions = {act for (_t, act) in tracks} if tracks else set()
+
+        ev_event = (ev.event or "").strip()
+        _WATCH_EVENTS = {"Tornado Watch", "Severe Thunderstorm Watch"}
+        is_watch = ev_event in _WATCH_EVENTS
+
+        # Determine watch number/kind for watches
+        watch_number: int | None = None
+        watch_kind = "tornado"
+        if is_watch:
+            for v in vtec:
+                m = _VTEC_PARSE_RE.search(v)
+                if not m:
+                    continue
+                phen = (m.group("phen") or "").upper()
+                sig = (m.group("sig") or "").upper()
+                if sig != "A":
+                    continue
+                watch_kind = "tornado" if phen == "TO" else "severe"
+                try:
+                    watch_number = int(m.group("etn"))
+                except Exception:
+                    pass
+                break
+
+        if is_watch:
+            script = self._build_watch_vtec_action_script(ev, vtec_actions, tracks, watch_number, watch_kind)
+        else:
+            script = self._build_warning_vtec_action_script(ev, vtec_actions, tracks)
+
+        if not script.strip():
+            log.info("CAP update: empty script, skipping event=%s vtec_actions=%s", ev_event, vtec_actions)
+            return
+
+        same_code = self._cap_event_to_same_code(ev_event)
+        same_locs_raw = list(ev.same_fips) if getattr(ev, "same_fips", None) else []
+        same_locs = self._filter_same_locations_to_service_area(same_locs_raw)
+
+        key_str = f"CAPUPDATE:{(ev.alert_id or '').strip()}:{(ev.sent or '').strip()}"
+        keys = [key_str]
+        for track_id, _ in tracks:
+            keys.append(f"TRACKVOICE:{track_id}")
+
+        ok, hit = await self._dedupe_reserve(keys)
+        if not ok:
+            log.info("CAP update skipped (dedupe hit=%s) event=%s vtec_actions=%s", hit, ev_event, vtec_actions)
+            return
+
+        try:
+            out_wav = await self._render_voice_only_audio(script, prefix="capupdate")
+            async with self._cycle_lock:
+                try:
+                    self.telnet.flush_cycle()
+                except Exception:
+                    pass
+                event_label = ev_event or "Weather alert"
+                title = self._np_alert_title("cap_update", event=event_label)
+                meta = self._np_meta(
+                    title=title,
+                    kind="alert",
+                    extra={
+                        "sw_alert_source": "cap",
+                        "sw_alert_mode": "update",
+                        "sw_event": event_label,
+                        "sw_event_code": (same_code or "").strip().upper(),
+                        "sw_alert_id": str(ev.alert_id or "").strip(),
+                    },
+                )
+                self.telnet.push_alert(str(out_wav), meta=meta)
+
+            self.last_product_desc = f"CAP {ev_event}".strip()
+            self._schedule_cycle_refill("post-cap-update")
+
+            # Update or remove from AlertTracker
+            try:
+                tracker_id = self._alert_tracker_id_for_cap(ev, same_code)
+                if vtec_actions & {"CAN", "EXP"}:
+                    removed = self.alert_tracker.remove(tracker_id)
+                    if not removed:
+                        # Try by VTEC track
+                        track_ids = {_vtec_track_id(v) for v in vtec if _vtec_track_id(v)}
+                        self.alert_tracker.remove_by_vtec_tracks(
+                            track_ids,  # type: ignore[arg-type]
+                            reason=f"cap-update:{','.join(sorted(vtec_actions))}",
+                        )
+                    log.info("AlertTracker: removed id=%s event=%s action=%s", tracker_id, ev_event, vtec_actions)
+                else:
+                    # CON/EXT/EXA: update the stored script to latest narration
+                    existing = self.alert_tracker.find_by_vtec_track(tracker_id.replace("CAP:", "")) or self.alert_tracker._alerts.get(tracker_id)
+                    if existing:
+                        self.alert_tracker.update_script(existing.id, script)
+                        self.alert_tracker.mark_aired(existing.id)
+                    log.info("AlertTracker: updated id=%s event=%s action=%s", tracker_id, ev_event, vtec_actions)
+            except Exception:
+                log.exception("AlertTracker: failed to update/remove on CAP update event=%s", ev_event)
+
+            log.info("CAP ACTION: aired UPDATE event=%s code=%s id=%s vtec_actions=%s audio=%s",
+                     ev_event, same_code, ev.alert_id, vtec_actions, out_wav)
+            _station_feed_note_cap(ev, mode="VOICE", same_locations=(same_locs if same_locs else same_locs_raw),
+                                   out_wav=str(out_wav), same_code=same_code, vtec=vtec)
         except Exception:
             await self._dedupe_release(keys)
             raise
@@ -3683,7 +4002,7 @@ class Orchestrator:
         def _parse_vtec_z(tok: str):
             # tok like YYYYMMDDT0000Z or YYMMDDT0000Z
             s = (tok or "").strip().upper()
-            mm = re.fullmatch(r"(\\d{8}|\\d{6})T(\\d{4})Z", s)
+            mm = re.fullmatch(r"(\d{8}|\d{6})T(\d{4})Z", s)
             if not mm:
                 return None
             d = mm.group(1)
@@ -3794,7 +4113,7 @@ class Orchestrator:
         order: list[str] = []
         misc: list[str] = []
 
-        for raw in re.split(r";\\s*", area_desc):
+        for raw in re.split(r";\s*", area_desc):
             s = (raw or "").strip().strip(".")
             if not s:
                 continue
@@ -3875,7 +4194,354 @@ class Orchestrator:
             lines.append("End of message.")
 
         # Double-newlines => better pacing
-        return "\\n\\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
+        return "\n\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
+
+
+    # ------------------------------------------------------------------ #
+    #  VTEC-action script builders (NWR-style update/cancel narration)    #
+    # ------------------------------------------------------------------ #
+
+    _STATE_NAME_FULL: dict[str, str] = {
+        "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
+        "CA": "California", "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware",
+        "DC": "the District of Columbia", "FL": "Florida", "GA": "Georgia",
+        "HI": "Hawaii", "ID": "Idaho", "IL": "Illinois", "IN": "Indiana",
+        "IA": "Iowa", "KS": "Kansas", "KY": "Kentucky", "LA": "Louisiana",
+        "ME": "Maine", "MD": "Maryland", "MA": "Massachusetts", "MI": "Michigan",
+        "MN": "Minnesota", "MS": "Mississippi", "MO": "Missouri", "MT": "Montana",
+        "NE": "Nebraska", "NV": "Nevada", "NH": "New Hampshire", "NJ": "New Jersey",
+        "NM": "New Mexico", "NY": "New York", "NC": "North Carolina",
+        "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma", "OR": "Oregon",
+        "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina",
+        "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah",
+        "VT": "Vermont", "VA": "Virginia", "WA": "Washington",
+        "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming",
+    }
+
+    def _parse_cap_area_by_state(self, area_desc: str) -> tuple[dict[str, list[str]], list[str], list[str]]:
+        """
+        Parse CAP areaDesc (semicolon-separated "County, ST" items).
+        Returns (groups_by_state, state_order, misc_items).
+        """
+        groups: dict[str, list[str]] = {}
+        order: list[str] = []
+        misc: list[str] = []
+        for raw in re.split(r";\s*", area_desc or ""):
+            s = (raw or "").strip().strip(".")
+            if not s:
+                continue
+            if "," in s:
+                name, st = s.rsplit(",", 1)
+                name = name.strip()
+                st = st.strip().upper()
+                if st not in groups:
+                    groups[st] = []
+                    order.append(st)
+                groups[st].append(name)
+            else:
+                misc.append(s)
+        return groups, order, misc
+
+    def _join_oxford(self, items: list[str]) -> str:
+        xs = [x.strip() for x in items if x and x.strip()]
+        if not xs:
+            return ""
+        if len(xs) == 1:
+            return xs[0]
+        if len(xs) == 2:
+            return f"{xs[0]} and {xs[1]}"
+        return ", ".join(xs[:-1]) + f", and {xs[-1]}"
+
+    def _fmt_local_from_utc_iso(self, iso_str: str) -> str:
+        """
+        Parse an ISO-8601 UTC string and return a human-friendly local time phrase.
+        Returns "" on failure.
+        """
+        s = (iso_str or "").strip()
+        if not s:
+            return ""
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            utc_dt = dt.datetime.fromisoformat(s)
+            local_dt = utc_dt.astimezone(self._tz)
+            hour12 = local_dt.hour % 12 or 12
+            ampm = "AM" if local_dt.hour < 12 else "PM"
+            tz_name = _expand_tz_token(local_dt.strftime("%Z"))
+            if local_dt.minute == 0:
+                return f"{hour12} {ampm} {tz_name}"
+            return f"{hour12}:{local_dt.minute:02d} {ampm} {tz_name}"
+        except Exception:
+            return ""
+
+    def _alert_tracker_id_for_cap(self, ev: "CapAlertEvent", same_code: str) -> str:  # type: ignore[name-defined]
+        """
+        Return a stable AlertTracker ID for a CAP event.
+        Prefers the first VTEC track id so updates slot into the same entry.
+        """
+        vtec = self._cap_vtec_list(ev)
+        for v in vtec:
+            tid = _vtec_track_id(v)
+            if tid:
+                return f"CAP:{tid}"
+        return f"CAP:{(ev.alert_id or '').strip()}"
+
+    def _alert_expires_from_cap(self, ev: "CapAlertEvent", vtec: list[str]) -> str:  # type: ignore[name-defined]
+        """Best-effort expiry ISO string from VTEC end time or CAP expires field."""
+        exp_utc = self._best_expiry_from_vtec(vtec)
+        if exp_utc:
+            return exp_utc.isoformat()
+        raw = getattr(ev, "expires", None) or getattr(ev, "ends", None)
+        if raw:
+            return str(raw).strip()
+        # Fallback: 6 hours from now
+        return (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=6)).isoformat()
+
+    def _build_warning_vtec_action_script(
+        self,
+        ev: "CapAlertEvent",  # type: ignore[name-defined]
+        vtec_actions: set[str],
+        tracks: list[tuple[str, str]],
+    ) -> str:
+        """
+        NWR-style voice script for VTEC update actions on warnings (non-watch).
+
+        CON/EXT  →  "…remains in effect until …"
+        CAN      →  "…has been cancelled"
+        EXP      →  "…has been allowed to expire"
+        EXA/EXB  →  "…has been expanded to include …"
+        UPG      →  handled by _build_cap_full_script (new warning issued)
+        """
+        event = self._clean_cap_text(ev.event or "", limit=120)
+        area_desc = self._clean_cap_text(getattr(ev, "area_desc", "") or "", limit=400)
+        headline = self._clean_cap_text(ev.headline or "", limit=280)
+        desc = self._clean_cap_text(getattr(ev, "description", "") or "", limit=800)
+        instr = self._clean_cap_text(getattr(ev, "instruction", "") or "", limit=400)
+
+        vtec = self._cap_vtec_list(ev)
+        exp_utc = self._best_expiry_from_vtec(vtec)
+        exp_phrase = ""
+        if exp_utc:
+            exp_phrase = self._fmt_local_from_utc_iso(exp_utc.isoformat())
+        if not exp_phrase:
+            raw_exp = getattr(ev, "expires", None)
+            if raw_exp:
+                exp_phrase = self._fmt_local_from_utc_iso(str(raw_exp))
+
+        lines: list[str] = []
+
+        if vtec_actions & {"CAN"}:
+            lines.append(f"The {event} for the following areas has been cancelled.")
+            if area_desc:
+                lines.append(f"Areas: {area_desc}.")
+            if headline:
+                lines.append(headline if headline.endswith((".", "!", "?")) else headline + ".")
+
+        elif vtec_actions & {"EXP"}:
+            lines.append(f"The {event} for the following areas has been allowed to expire.")
+            if area_desc:
+                lines.append(f"Areas: {area_desc}.")
+
+        elif vtec_actions & {"EXA", "EXB"}:
+            lines.append(f"The {event} has been expanded.")
+            if area_desc:
+                lines.append(f"This now includes: {area_desc}.")
+            if exp_phrase:
+                lines.append(f"This warning remains in effect until {exp_phrase}.")
+            if desc:
+                lines.append(desc)
+            if instr:
+                lines.append(instr)
+
+        elif vtec_actions & {"EXT"}:
+            lines.append(f"The {event} has been extended.")
+            if area_desc:
+                lines.append(f"For the following areas: {area_desc}.")
+            if exp_phrase:
+                lines.append(f"This warning is now in effect until {exp_phrase}.")
+            if desc:
+                lines.append(desc)
+            if instr:
+                lines.append(instr)
+
+        else:  # CON (continuation) and anything else
+            if headline:
+                lines.append(headline if headline.endswith((".", "!", "?")) else headline + ".")
+            elif event:
+                lead = f"A {event} remains in effect"
+                if exp_phrase:
+                    lead += f" until {exp_phrase}"
+                lead += "."
+                lines.append(lead)
+            if area_desc:
+                lines.append(f"For the following areas: {area_desc}.")
+            if desc:
+                lines.append(desc)
+            if instr:
+                lines.append(instr)
+
+        if not lines:
+            return self._build_cap_full_script(ev)
+
+        lines.append("End of message.")
+        return "\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
+
+    def _build_watch_vtec_action_script(
+        self,
+        ev: "CapAlertEvent",  # type: ignore[name-defined]
+        vtec_actions: set[str],
+        tracks: list[tuple[str, str]],
+        watch_number: int | None,
+        kind: str,  # "tornado" or "severe"
+    ) -> str:
+        """
+        NWR-style voice script for VTEC update/cancel actions on watches (TOA/SVA).
+
+        CON      → "Watch Number N remains in effect until …"
+        EXA      → "Watch Number N remains in effect until … and now includes …"
+        CAN      → "Watch Number N has been cancelled for … in …"
+        EXP      → "Watch Number N has been allowed to expire for … in …"
+        """
+        watch_label = "Tornado Watch" if kind == "tornado" else "Severe Thunderstorm Watch"
+        num_phrase = f"Number {watch_number}" if watch_number is not None else ""
+        label_with_num = f"{watch_label} {num_phrase}".strip()
+
+        area_desc = (getattr(ev, "area_desc", "") or "").strip()
+        groups, order, misc = self._parse_cap_area_by_state(area_desc)
+
+        vtec = self._cap_vtec_list(ev)
+        exp_utc = self._best_expiry_from_vtec(vtec)
+        exp_phrase = ""
+        if exp_utc:
+            exp_phrase = self._fmt_local_from_utc_iso(exp_utc.isoformat())
+        if not exp_phrase:
+            raw_exp = getattr(ev, "expires", None)
+            if raw_exp:
+                exp_phrase = self._fmt_local_from_utc_iso(str(raw_exp))
+
+        def _county_segs() -> str:
+            """Build 'in Maryland: Allegany, Garrett' style phrase."""
+            if not groups:
+                return area_desc or "the affected areas"
+            parts: list[str] = []
+            for st in order:
+                st_full = self._STATE_NAME_FULL.get(st, st)
+                county_list = self._join_oxford(groups[st])
+                if county_list:
+                    parts.append(f"in {st_full}: {county_list}")
+            if parts:
+                return "; ".join(parts)
+            return area_desc or "the affected areas"
+
+        lines: list[str] = []
+
+        if vtec_actions & {"CAN"}:
+            lines.append(f"{label_with_num} has been cancelled for the following areas.")
+            lines.append(_county_segs() + ".")
+
+        elif vtec_actions & {"EXP"}:
+            lines.append(f"{label_with_num} has been allowed to expire for the following areas.")
+            lines.append(_county_segs() + ".")
+
+        elif vtec_actions & {"EXA", "EXB"}:
+            # Watch expansion — also used when area grows mid-event
+            lines.append(f"{label_with_num} remains in effect" + (f" until {exp_phrase}" if exp_phrase else "") + ".")
+            lines.append("This watch now includes the following additional areas.")
+            lines.append(_county_segs() + ".")
+
+        else:  # CON / EXT
+            lines.append(f"{label_with_num} remains in effect" + (f" until {exp_phrase}" if exp_phrase else "") + ".")
+            lines.append(f"This watch includes the following areas: {_county_segs()}.")
+
+        if not lines:
+            return self._build_cap_watch_script(ev, mode="full")
+
+        lines.append("Stay tuned to NOAA Weather Radio, commercial radio, and television outlets for the latest severe weather information.")
+        lines.append("End of message.")
+        return "\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
+
+    def _build_watch_expansion_script(self, ev: "CapAlertEvent") -> str:  # type: ignore[name-defined]
+        """
+        Full NWR-style script for watch EXA/EXB: new SAME tones, full county listing.
+        Expansion is treated as a new issuance for the added counties.
+        """
+        # Determine kind + watch number from VTEC
+        kind = "tornado"
+        watch_number: int | None = None
+        for v in self._cap_vtec_list(ev):
+            m = _VTEC_PARSE_RE.search(v)
+            if not m:
+                continue
+            phen = (m.group("phen") or "").upper()
+            sig = (m.group("sig") or "").upper()
+            if sig != "A":
+                continue
+            if phen == "TO":
+                kind = "tornado"
+            elif phen == "SV":
+                kind = "severe"
+            else:
+                continue
+            try:
+                watch_number = int(m.group("etn"))
+            except Exception:
+                pass
+            break
+
+        tracks = self._vtec_tracks(self._cap_vtec_list(ev))
+        return self._build_watch_vtec_action_script(
+            ev,
+            vtec_actions={"EXA"},
+            tracks=tracks,
+            watch_number=watch_number,
+            kind=kind,
+        )
+
+    def _is_safety_rules_pns(self, text: str) -> bool:
+        """Return True if this is an NWR-style SEVERE WEATHER SAFETY RULES PNS."""
+        t = (text or "").upper()
+        return "...SEVERE WEATHER SAFETY RULES..." in t
+
+    def _build_pns_safety_script(self, official_text: str) -> str:
+        """
+        Extract clean broadcast text from a SEVERE WEATHER SAFETY RULES PNS.
+        Uses the existing alert_builder strip-and-parse pipeline.
+        """
+        from .alert_builder import strip_nws_product_headers, _unwrap_soft_wrap, _collapse_blank_lines, _clean_line
+        from .tts import clean_for_tts
+        import re as _re
+
+        text = strip_nws_product_headers(official_text or "")
+        lines_raw = [ln.rstrip() for ln in text.splitlines()]
+        lines = _unwrap_soft_wrap(lines_raw)
+
+        body: list[str] = []
+        in_body = False
+        for ln in lines:
+            s = (ln or "").strip()
+            if not in_body:
+                # Start reading at the headline marker or "National Weather Service" line
+                if s.startswith("...") or "national weather service" in s.lower():
+                    in_body = True
+                else:
+                    continue
+            if s.startswith(("&&", "$$")):
+                break
+            if not s:
+                body.append("")
+                continue
+            cleaned = _clean_line(s)
+            if cleaned:
+                body.append(cleaned)
+
+        body = _collapse_blank_lines(body)
+        script_raw = "\n".join(body)
+
+        intro = "The National Weather Service has issued the following public information statement."
+        script = clean_for_tts(script_raw)
+        if not script.strip():
+            return ""
+        return intro + "\n\n" + script
 
     def _build_cap_full_script(self, ev: "CapAlertEvent") -> str:  # type: ignore[name-defined]
         event = self._clean_cap_text(ev.event or "", limit=120)
@@ -4328,6 +4994,52 @@ class Orchestrator:
             )
 
             self._schedule_cycle_refill("post-alert")
+
+            # Register / update / remove from AlertTracker
+            try:
+                _nw_vtec = vtec
+                _nw_tracks = tracks
+                _nw_vtec_actions = vtec_actions
+                _nw_exp_utc = self._best_expiry_from_vtec(_nw_vtec)
+                _nw_expires_iso = _nw_exp_utc.isoformat() if _nw_exp_utc else (
+                    dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=6)).isoformat()
+                _nw_same_code = _safe_event_code(parsed.product_type)
+                _nw_same_locs = list(in_area_same) if in_area_same else []
+                _nw_track_ids = {_vtec_track_id(v) for v in _nw_vtec if _vtec_track_id(v)}
+                if _nw_vtec_actions & {"CAN", "EXP"} and not should_full:
+                    # Cancellation/expiry voice-only: remove from tracker
+                    removed_n = self.alert_tracker.remove_by_vtec_tracks(
+                        _nw_track_ids,  # type: ignore[arg-type]
+                        reason=f"nwws:{parsed.product_type}:{','.join(sorted(_nw_vtec_actions & {'CAN','EXP'}))}",
+                    )
+                    log.info("AlertTracker: removed %d entries for NWWS CAN/EXP type=%s awips=%s",
+                             removed_n, parsed.product_type, parsed.awips_id or "")
+                else:
+                    # New issuance, update, or continuation
+                    _nw_tid_str = next(iter(_nw_track_ids), None)
+                    _nw_tracker_id = f"NWWS:{_nw_tid_str}" if _nw_tid_str else (
+                        f"NWWS:{parsed.product_type}:{parsed.wfo}:{(parsed.awips_id or '').strip()}")
+                    _nw_is_cycle_only = not should_full
+                    _ae_nw = ActiveAlert(
+                        id=_nw_tracker_id,
+                        source="NWWS",
+                        event=_sf_eas_event_label_full(parsed.product_type),
+                        code=_nw_same_code,
+                        vtec=_nw_vtec,
+                        headline=str(parsed.awips_id or ""),
+                        script_text=spoken.script,
+                        audio_path=str(out_wav),
+                        expires=_nw_expires_iso,
+                        issued=dt.datetime.now(dt.timezone.utc).isoformat(),
+                        same_locs=_nw_same_locs,
+                        cycle_only=_nw_is_cycle_only,
+                    )
+                    self.alert_tracker.add_or_update(_ae_nw)
+                    self.alert_tracker.mark_aired(_nw_tracker_id)
+                    log.info("AlertTracker: registered NWWS id=%s type=%s should_full=%s expires=%s",
+                             _nw_tracker_id, parsed.product_type, should_full, _nw_expires_iso)
+            except Exception:
+                log.exception("AlertTracker: failed to register NWWS type=%s", parsed.product_type)
 
             # Rebroadcast rotation (no re-tone)
             try:
@@ -4853,6 +5565,29 @@ class Orchestrator:
                     except Exception:
                         log.exception("Failed to ensure live time WAV exists")
 
+                # Prepend active-alert voice segments (NWR rebroadcast style)
+                # These are cycle_only (no SAME retone) and play in alert order.
+                try:
+                    _active = self.alert_tracker.get_cycle_alerts()
+                    if _active:
+                        _alert_segs: list[CycleSegment] = []
+                        for _ae in _active:
+                            if _ae.script_text.strip():
+                                _alert_segs.append(CycleSegment(
+                                    key=f"alert_{_ae.code}",
+                                    title=_ae.event or _ae.code or "Alert",
+                                    text=_ae.script_text,
+                                ))
+                        if _alert_segs:
+                            segs = _alert_segs + list(segs)
+                            log.debug(
+                                "Cycle: prepended %d active alert segment(s) (%s)",
+                                len(_alert_segs),
+                                ", ".join(a.event for a in _active),
+                            )
+                except Exception:
+                    log.exception("Cycle: alert segment injection failed")
+
                 cycle_items: list[tuple[Path, str]] = []
                 durs: list[float] = []
 
@@ -4913,6 +5648,13 @@ class Orchestrator:
             self._update_mode()
             interval = self._cycle_interval_seconds()
             await self._queue_cycle_once(reason="scheduled")
+            # Housekeeping: drop expired alerts from tracker once per cycle
+            try:
+                n = self.alert_tracker.purge_expired()
+                if n:
+                    log.info("AlertTracker: purged %d expired entry/entries", n)
+            except Exception:
+                pass
             await asyncio.sleep(max(30, interval))
 
 
