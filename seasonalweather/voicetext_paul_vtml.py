@@ -68,6 +68,19 @@ _RULES: list[Rule] = [
         _phoneme_x_cmu("W IH1 N D Z"),
     ),
 
+   # Bare singular "wind" (noun) => /wɪnd/
+   # Mirror the same exclusions as the winds/wind's rule below.
+    Rule(
+        re.compile(
+            r"\bwind\b"
+            r"(?!\s+up\b(?!\s+to\b))"
+            r"(?!\s+down\b)"
+            r"(?!\s+(?:its|their|his|her|my|your|our)\b)",
+            re.IGNORECASE,
+        ),
+        _phoneme_x_cmu("W IH1 N D"),
+    ),
+
     # --- Units (spoken nicely) ---
     Rule(re.compile(r"\bmph\b", re.IGNORECASE), _sub_alias("miles per hour")),
     Rule(re.compile(r"\bkts\b", re.IGNORECASE), _sub_alias("knots")),
