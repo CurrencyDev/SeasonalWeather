@@ -633,6 +633,77 @@ def _sf_station_feed_hk_start():
 # Start once at import time if station feed is enabled.
 _sf_station_feed_hk_start()
 
+
+def _sf_seed_memory_from_payload_file() -> int:
+    """
+    Restore handled-alerts.json into the in-memory station-feed cache without
+    rewriting from an empty cache first. This prevents restart-time wipes when
+    the next alert arrives before StationFeed memory has been repopulated.
+    """
+    if not _sf_enabled() or StationFeedAlert is None:
+        return 0
+
+    try:
+        _station_id, path, _source, max_items, ttl_s, _min_write_s = _sf_cfg()
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except FileNotFoundError:
+        return 0
+    except Exception:
+        log.exception("Station feed: failed loading existing handled-alerts.json into memory")
+        return 0
+
+    alerts = payload.get("alerts") if isinstance(payload, dict) else None
+    if not isinstance(alerts, list):
+        return 0
+
+    now_ts = time.time()
+    restored = 0
+
+    for item in alerts:
+        if not isinstance(item, dict):
+            continue
+
+        exp_ts = _sf_hk_alert_expiry_ts(item)
+        if exp_ts is None:
+            exp_ts = now_ts + ttl_s
+        if exp_ts <= now_ts:
+            continue
+
+        try:
+            sender_raw = item.get("from") or {}
+            sender = None
+            if FeedSender is not None:
+                sender = FeedSender(
+                    name=str((sender_raw.get("name") if isinstance(sender_raw, dict) else "") or "SeasonalWeather"),
+                    kind=str((sender_raw.get("kind") if isinstance(sender_raw, dict) else "") or "unknown"),
+                )
+
+            alert = StationFeedAlert(
+                id=str(item.get("id") or _sf_sha1_12(json.dumps(item, sort_keys=True))),
+                event=str(item.get("event") or "Alert"),
+                headline=str(item.get("headline") or item.get("event") or "Alert"),
+                severity=str(item.get("severity") or "Unknown"),
+                urgency=str(item.get("urgency") or "Unknown"),
+                certainty=str(item.get("certainty") or "Unknown"),
+                area=str(item.get("area") or ""),
+                effective=_sf_iso(item.get("effective")),
+                ends=_sf_iso(item.get("ends")),
+                expires=_sf_iso(item.get("expires")),
+                sent=_sf_iso(item.get("sent")),
+                sameCodes=[str(x) for x in (item.get("sameCodes") or [])],
+                from_=sender,
+                links=dict(item.get("links") or {}),
+            )
+            _STATION_FEED_STATE[str(alert.id)] = (alert, float(exp_ts))
+            restored += 1
+        except Exception:
+            log.exception("Station feed: failed restoring one handled-alerts.json entry into memory")
+
+    if restored:
+        _sf_prune(now_ts, max_items=max_items)
+    return restored
+
 def _station_feed_note_cap(ev, *, mode: str, same_locations, out_wav: str, same_code=None, vtec=None) -> None:
     if not _sf_enabled():
         return
@@ -1240,7 +1311,7 @@ class Orchestrator:
         self._zonecounty_map: dict[str, list[str]] = {}
 
 
-        # --- Marine areas crosswalk (marine zone -> coastal county FIPS -> SAME) ---
+        # --- Marine areas .txt crosswalk (marine zone -> coastal county FIPS -> SAME) ---
         self._mareas_lock = asyncio.Lock()
         self._mareas_loaded = False
         self._mareas_map: dict[str, list[str]] = {}
@@ -1254,6 +1325,133 @@ class Orchestrator:
         # Survives restarts: active watches/warnings are re-queued as cycle segments.
         _tracker_path = Path(cfg.paths.work_dir) / "alert_state.json"
         self.alert_tracker = AlertTracker(_tracker_path)
+
+    def _station_feed_seed_from_alert_tracker(self) -> int:
+        """
+        Restore active alerts from alert_state.json into the in-memory station-feed
+        cache on startup. This makes StationFeed survive restarts even when the
+        next write comes from a totally different source.
+        """
+        if not _sf_enabled() or StationFeedAlert is None:
+            return 0
+
+        tracker_path = Path(self.cfg.paths.work_dir) / "alert_state.json"
+        try:
+            payload = json.loads(tracker_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return 0
+        except Exception:
+            log.exception("Station feed: failed loading AlertTracker state for startup seed")
+            return 0
+
+        items = payload.get("active_alerts") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            return 0
+
+        now_ts = time.time()
+        existing_ids = set(_STATION_FEED_STATE.keys())
+        existing_wavs: set[str] = set()
+        for _alert_obj, _exp_ts in _STATION_FEED_STATE.values():
+            try:
+                _links = getattr(_alert_obj, "links", {}) or {}
+                _wav = str(_links.get("wav") or "").strip()
+                if _wav:
+                    existing_wavs.add(_wav)
+            except Exception:
+                continue
+
+        seeded = 0
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            expires_raw = item.get("expires")
+            exp_dt = _sf_parse_dt(expires_raw)
+            if exp_dt is None:
+                continue
+            try:
+                exp_ts = float(exp_dt.timestamp())
+            except Exception:
+                continue
+            if exp_ts <= now_ts:
+                continue
+
+            audio_path = str(item.get("audio_path") or "").strip()
+            tracker_id = str(item.get("id") or "").strip()
+            if tracker_id and tracker_id in existing_ids:
+                continue
+            if audio_path and audio_path in existing_wavs:
+                continue
+
+            source = str(item.get("source") or "").strip().upper()
+            if source == "CAP":
+                sender_name, sender_kind = "CAP restore", "relay"
+            elif source == "NWWS":
+                sender_name, sender_kind = "NWWS-OI", "relay"
+            elif source in {"PNS_CYCLE", "LOCAL", "SEASONALWEATHER"}:
+                sender_name, sender_kind = "SeasonalWeather", "origin"
+            else:
+                sender_name, sender_kind = source or "SeasonalWeather", "unknown"
+
+            sender = FeedSender(name=sender_name, kind=sender_kind) if FeedSender else None
+
+            vtec_list = item.get("vtec") or []
+            if not isinstance(vtec_list, list):
+                vtec_list = [vtec_list] if vtec_list else []
+            vtec_list = [str(x) for x in vtec_list if str(x).strip()]
+
+            area = ""
+            for _raw_vtec in vtec_list:
+                _m = _VTEC_PARSE_RE.search(str(_raw_vtec))
+                if _m:
+                    area = str(_m.group("office") or "").strip()
+                    if area:
+                        break
+
+            event = str(item.get("event") or item.get("code") or "Alert")
+            headline = str(item.get("headline") or event)
+            issued_raw = item.get("issued")
+            cycle_only = bool(item.get("cycle_only", False))
+            same_locs = [str(x) for x in (item.get("same_locs") or []) if str(x).strip()]
+            code = str(item.get("code") or "").strip()
+
+            links = {"mode": "VOICE" if cycle_only else "FULL"}
+            if audio_path:
+                links["wav"] = audio_path
+            if vtec_list:
+                links["vtec"] = vtec_list
+            if code:
+                links["same"] = f"same:{code}"
+
+            try:
+                alert = StationFeedAlert(
+                    id=tracker_id or _sf_sha1_12(f"tracker:{source}:{headline}:{audio_path}"),
+                    event=event,
+                    headline=headline,
+                    severity="Unknown",
+                    urgency="Unknown",
+                    certainty="Unknown",
+                    area=area,
+                    effective=_sf_iso(issued_raw),
+                    ends=_sf_iso(expires_raw),
+                    expires=_sf_iso(expires_raw),
+                    sent=_sf_iso(issued_raw),
+                    sameCodes=same_locs,
+                    from_=sender,
+                    links=links,
+                )
+                _STATION_FEED_STATE[str(alert.id)] = (alert, exp_ts)
+                existing_ids.add(str(alert.id))
+                if audio_path:
+                    existing_wavs.add(audio_path)
+                seeded += 1
+            except Exception:
+                log.exception("Station feed: failed seeding one AlertTracker entry into StationFeed")
+
+        if seeded:
+            _station_id, _path, _source, max_items, _ttl_s, _min_write_s = _sf_cfg()
+            _sf_prune(now_ts, max_items=max_items)
+        return seeded
 
     # --- Now Playing / IP-RDS helpers (edit phrases freely) ---
 
@@ -2106,15 +2304,43 @@ class Orchestrator:
 
     def _parse_mareas_txt(self, path: Path) -> dict[str, list[str]]:
         """
-        Forgiving parser: finds a marine zone token like ANZ530 and any 5-digit FIPS or 6-digit SAME codes on the line.
-        Outputs SAME codes (6 digits, leading 0 for county FIPS).
+        Parse official NWS mareas*.txt files and a legacy fallback format.
+
+        Supported inputs:
+
+          1) Official NWS format:
+               AN|73535|Tidal Potomac from Key Bridge to Indian Head MD|38.7406|-77.0712
+             -> zone ANZ535, SAME 073535
+
+          2) Legacy/free-form lines already containing ANZ535 plus 5-digit or 6-digit codes.
+
+        Returns:
+          dict like { "ANZ535": ["073535"], ... }
         """
+        import re
+
+        pipe_alpha_re = re.compile(r"^[A-Z]{2}$")
+        pipe_num_re = re.compile(r"^\d{5}$")
+
         zone_re = re.compile(r"\b([A-Z]{3}\d{3})\b")
         fips5_re = re.compile(r"\b(\d{5})\b")
         same6_re = re.compile(r"\b(\d{6})\b")
 
-        m: dict[str, list[str]] = {}
+        out: dict[str, list[str]] = {}
         seen: dict[str, set[str]] = {}
+
+        def add(zone: str, same_code: str) -> None:
+            z = "".join(ch for ch in str(zone).upper() if ch.isalnum())
+            s = "".join(ch for ch in str(same_code) if ch.isdigit()).zfill(6)
+            if len(z) != 6 or len(s) != 6:
+                return
+            if z not in out:
+                out[z] = []
+                seen[z] = set()
+            if s in seen[z]:
+                return
+            seen[z].add(s)
+            out[z].append(s)
 
         with path.open("r", encoding="utf-8", errors="ignore") as f:
             for ln in f:
@@ -2122,6 +2348,18 @@ class Orchestrator:
                 if not s0 or s0.startswith("#"):
                     continue
 
+                # Official NWS mareas*.txt pipe format:
+                #   SSALPHA|SSNUM|ZONENAME|LON|LAT
+                parts = [p.strip() for p in s0.split("|")]
+                if len(parts) >= 2 and pipe_alpha_re.fullmatch(parts[0].upper()) and pipe_num_re.fullmatch(parts[1]):
+                    ssalpha = parts[0].upper()        # e.g. AN
+                    ssnum = parts[1]                  # e.g. 73535
+                    zone = f"{ssalpha}Z{ssnum[-3:]}"  # -> ANZ535
+                    same = f"0{ssnum}"                # -> 073535
+                    add(zone, same)
+                    continue
+
+                # Legacy/free-form fallback
                 s = s0.upper()
                 zm = zone_re.search(s)
                 if not zm:
@@ -2140,23 +2378,10 @@ class Orchestrator:
                     if len(d) == 5:
                         codes.append("0" + d)
 
-                if not codes:
-                    continue
-
-                if zone not in m:
-                    m[zone] = []
-                    seen[zone] = set()
-
                 for c in codes:
-                    c2 = "".join(ch for ch in c if ch.isdigit()).zfill(6)
-                    if len(c2) != 6:
-                        continue
-                    if c2 in seen[zone]:
-                        continue
-                    seen[zone].add(c2)
-                    m[zone].append(c2)
+                    add(zone, c)
 
-        return m
+        return out
 
     async def _ensure_mareas_loaded(self) -> None:
         if self._mareas_loaded:
@@ -2194,14 +2419,14 @@ class Orchestrator:
                         tmp = path.with_suffix(".tmp")
                         tmp.write_bytes(r.content)
                         tmp.replace(path)
-                        log.info("Marine areas crosswalk refreshed: %s (%d bytes)", path, len(r.content))
+                        log.info("Marine areas .txt database refreshed: %s (%d bytes)", path, len(r.content))
                     else:
-                        log.warning("Marine areas crosswalk fetch failed (status=%s). Using cache if present.", r.status_code)
+                        log.warning("Marine areas .txt database fetch failed (status=%s). Using cache if present.", r.status_code)
                 except Exception:
-                    log.exception("Marine areas crosswalk download failed; using cache if present")
+                    log.exception("Marine areas .txt database download failed; using cache if present")
 
             if not path.exists():
-                log.info("Marine areas crosswalk not available (no cache file). Marine zone->SAME mapping unavailable.")
+                log.info("Marine areas .txt database not available (no cache file). Marine zone->SAME mapping unavailable.")
                 self._mareas_loaded = True
                 self._mareas_map = {}
                 return
@@ -3108,6 +3333,18 @@ class Orchestrator:
             )
         except Exception:
             log.exception("AlertTracker: startup load/purge failed")
+
+        try:
+            _sf_restored_file = _sf_seed_memory_from_payload_file()
+            _sf_restored_tracker = self._station_feed_seed_from_alert_tracker()
+            if (_sf_restored_file or _sf_restored_tracker) and _sf_enabled():
+                _sf_write(time.time())
+                log.info(
+                    "Station feed: restored %d alerts from handled-alerts.json and %d from AlertTracker on startup",
+                    _sf_restored_file, _sf_restored_tracker,
+                )
+        except Exception:
+            log.exception("Station feed: startup restore from disk/tracker failed")
 
         tasks: list[asyncio.Task] = []
 
