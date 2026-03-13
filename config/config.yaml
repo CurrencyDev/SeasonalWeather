@@ -1,8 +1,8 @@
 station:
   name: "SeasonalWeather"
-  service_area_name: "Baltimore/Washington DC"
+  service_area_name: "The Baltimore and Washington, D.C. region, and surrounding counties across Maryland, Virginia, West Virginia, and Pennsylvania"
   timezone: "America/New_York"
-  disclaimer: "This is an automated I P weather broadcast for the DC, Maryland, lower portions of Pennsylvania, and West Virginia areas by an independent hobbyist. It is not no ah Weather Radio and is not endorsed by the National Weather Service. For critical information, use no ah Weather Radio and weather.gov."
+  disclaimer: "Please note, SeasonalWeather is not noah Weather Radio and is not endorsed by the National Weather Service. For critical information, you should use noah Weather Radio, and weather.gov."
 
 stream:
   icecast_host: "127.0.0.1"
@@ -22,9 +22,29 @@ cycle:
     - [39.4015, -77.4144, "Frederick"]
     - [39.6360, -78.7601, "Cumberland"]
 
+    # Maryland (coverage spread: bay → metro → north/east → south)
+    - [38.9784, -76.4922, "Annapolis"]
+    - [39.2037, -76.8610, "Columbia"]
+    - [39.4015, -76.6019, "Towson"]
+    - [39.5359, -76.3483, "Bel Air"]
+    - [39.5754, -76.9958, "Westminster"]
+    - [39.0840, -77.1528, "Rockville"]
+    - [38.9428, -76.7303, "Bowie"]
+    - [38.6246, -76.9391, "Waldorf"]
+    - [38.2912, -76.6358, "Leonardtown"]
+    - [39.2090, -76.0666, "Chestertown"]
+    - [39.0451, -76.0660, "Centreville"]
+
+    # Virginia / WV / PA edges in your transmitter union
+    - [39.1157, -77.5636, "Leesburg"]
+    - [38.7509, -77.4753, "Manassas"]
+    - [39.1857, -78.1633, "Winchester"]
+    - [39.4562, -77.9639, "Martinsburg"]
+    - [39.8309, -77.2311, "Gettysburg"]
+
 # Observations station IDs for api.weather.gov/stations/<id>/observations/latest
 observations:
-  stations: ["KDCA", "KBWI", "KIAD", "KMRB", "KCHO"]
+  stations: ["KDCA", "KBWI", "KIAD", "KMRB", "KCHO", "KHGR", "KFDK", "KMTN", "KFME", "KGAI", "KJYO", "KHEF", "KADW", "KTHV"]
 
 # NWWS-OI listener
 nwws:
@@ -180,7 +200,7 @@ service_area:
 
 
 tts:
-  backend: "dectalk"  # espeak-ng | piper | festival | dectalk
+  backend: "voicetext_paul"  # espeak-ng | piper | festival | dectalk
   voice: "9"        # backend voice switcher (dectalk, piper, and festival support this)
   rate_wpm: 165
   volume: 1.0
