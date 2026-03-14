@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SeasonalWeather bootstrap script
+# Run as root from the repo root: sudo bash scripts/00-bootstrap.sh
 set -euo pipefail
 
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
@@ -6,9 +8,9 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 1
 fi
 
-SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}]")/.." && pwd)"
 
-log() { echo "[+] $*"; }
+log()  { echo "[+] $*"; }
 warn() { echo "[!] $*" >&2; }
 
 export DEBIAN_FRONTEND=noninteractive
@@ -41,7 +43,7 @@ install -d -o seasonalweather -g seasonalweather /var/lib/seasonalweather
 install -d -o seasonalweather -g seasonalweather /var/lib/seasonalweather/audio
 install -d -o seasonalweather -g seasonalweather /var/lib/seasonalweather/cache
 install -d -o seasonalweather -g seasonalweather /var/log/seasonalweather
-install -d -o root -g root /etc/seasonalweather
+install -d -o root            -g root            /etc/seasonalweather
 
 log "Syncing app to /opt/seasonalweather/app"
 install -d -o root -g root /opt/seasonalweather
@@ -55,17 +57,30 @@ fi
 /opt/seasonalweather/venv/bin/python -m pip install --upgrade pip wheel
 /opt/seasonalweather/venv/bin/pip install -r /opt/seasonalweather/app/requirements.txt
 
+# -----------------------------------------------------------------------------------------
+# Config files — never overwrite existing operator-edited files
+# -----------------------------------------------------------------------------------------
 log "Installing default config (won't overwrite existing)"
+
 if [[ ! -f /etc/seasonalweather/config.yaml ]]; then
   cp /opt/seasonalweather/app/config/config.yaml /etc/seasonalweather/config.yaml
+  warn "Installed default config.yaml — edit it before starting the service!"
+  warn "  nano /etc/seasonalweather/config.yaml"
+else
+  log "config.yaml already exists — not overwriting"
 fi
+
 if [[ ! -f /etc/seasonalweather/radio.liq ]]; then
   cp /opt/seasonalweather/app/liquidsoap/radio.liq /etc/seasonalweather/radio.liq
 fi
+
 if [[ ! -f /etc/seasonalweather/seasonalweather.env ]]; then
   cp /opt/seasonalweather/app/config/example.env /etc/seasonalweather/seasonalweather.env
   chmod 600 /etc/seasonalweather/seasonalweather.env
-  echo "!!! Edit /etc/seasonalweather/seasonalweather.env and set NWWS creds"
+  warn "Installed example seasonalweather.env — fill in credentials before starting!"
+  warn "  nano /etc/seasonalweather/seasonalweather.env"
+else
+  log "seasonalweather.env already exists — not overwriting"
 fi
 
 # -----------------------------------------------------------------------------------------
@@ -101,7 +116,6 @@ else
 fi
 
 log "Ensuring DECtalk wrapper scripts exist"
-# Prefer repo-tracked wrappers if you add them; otherwise generate minimal ones ONCE.
 if [[ -f "/opt/seasonalweather/app/scripts/dectalk-env" ]]; then
   install -m 755 /opt/seasonalweather/app/scripts/dectalk-env /usr/local/bin/dectalk-env
 elif [[ ! -x /usr/local/bin/dectalk-env ]]; then
@@ -124,17 +138,9 @@ elif [[ ! -x /usr/local/bin/dectalk-text2wav ]]; then
 #!/usr/bin/env bash
 set -euo pipefail
 
-# A small, forgiving wrapper.
-# Supports:
-#   dectalk-text2wav --out /path/file.wav --voice 9 --rate 165 "text..."
-# Also tolerates:
-#   dectalk-text2wav /path/file.wav "text..."
-#   dectalk-text2wav "text..." /path/file.wav
-
 OUT=""
 VOICE="${DECTALK_VOICE:-9}"
 RATE="${DECTALK_RATE_WPM:-165}"
-
 TEXT_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -147,70 +153,46 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Heuristics: if OUT wasn't set, see if first/last arg looks like a wav path.
 if [[ -z "${OUT}" && ${#TEXT_ARGS[@]} -ge 2 ]]; then
   if [[ "${TEXT_ARGS[0]}" == *.wav ]]; then
-    OUT="${TEXT_ARGS[0]}"
-    TEXT_ARGS=("${TEXT_ARGS[@]:1}")
+    OUT="${TEXT_ARGS[0]}"; TEXT_ARGS=("${TEXT_ARGS[@]:1}")
   elif [[ "${TEXT_ARGS[-1]}" == *.wav ]]; then
-    OUT="${TEXT_ARGS[-1]}"
-    unset 'TEXT_ARGS[-1]'
+    OUT="${TEXT_ARGS[-1]}"; unset 'TEXT_ARGS[-1]'
   fi
 fi
 
 if [[ -z "${OUT}" ]]; then
-  echo "ERR: output wav path not provided. Use --out /path/file.wav" >&2
-  exit 2
+  echo "ERR: output wav path not provided. Use --out /path/file.wav" >&2; exit 2
 fi
 
 TEXT="${TEXT_ARGS[*]:-}"
-if [[ -z "${TEXT}" ]]; then
-  # Read stdin if no text args
-  TEXT="$(cat)"
-fi
+if [[ -z "${TEXT}" ]]; then TEXT="$(cat)"; fi
 
 SAY_BIN="${DECTALK_SAY_BIN:-/opt/dectalk/dectalk/dist/say}"
-if [[ ! -x "${SAY_BIN}" ]]; then
-  SAY_BIN="$(command -v say || true)"
-fi
+if [[ ! -x "${SAY_BIN}" ]]; then SAY_BIN="$(command -v say || true)"; fi
 if [[ -z "${SAY_BIN}" || ! -x "${SAY_BIN}" ]]; then
-  echo "ERR: DECtalk say binary not found. Expected /opt/dectalk/dectalk/dist/say" >&2
-  exit 3
+  echo "ERR: DECtalk say binary not found." >&2; exit 3
 fi
 
 HELP="$("${SAY_BIN}" --help 2>&1 || true)"
 
-# Detect output flag
 OUTFLAG=""
-if grep -qE '(^|[[:space:]])-fo([[:space:]]|$)' <<<"${HELP}"; then
-  OUTFLAG="-fo"
-elif grep -qE '(^|[[:space:]])-o([[:space:]]|$)' <<<"${HELP}"; then
-  OUTFLAG="-o"
-elif grep -qiE '(^|[[:space:]])--output([[:space:]]|$)' <<<"${HELP}"; then
-  OUTFLAG="--output"
+if grep -qE '(^|[[:space:]])-fo([[:space:]]|$)' <<<"${HELP}"; then OUTFLAG="-fo"
+elif grep -qE '(^|[[:space:]])-o([[:space:]]|$)' <<<"${HELP}"; then OUTFLAG="-o"
+elif grep -qiE '(^|[[:space:]])--output([[:space:]]|$)' <<<"${HELP}"; then OUTFLAG="--output"
 fi
-
-if [[ -z "${OUTFLAG}" ]]; then
-  echo "ERR: couldn't detect file-output flag from say --help" >&2
-  exit 4
-fi
+if [[ -z "${OUTFLAG}" ]]; then echo "ERR: couldn't detect file-output flag." >&2; exit 4; fi
 
 VOICE_ARGS=()
-if grep -qE '(^|[[:space:]])-v([[:space:]]|$)' <<<"${HELP}"; then
-  VOICE_ARGS=(-v "${VOICE}")
-elif grep -qiE '(^|[[:space:]])--voice([[:space:]]|$)' <<<"${HELP}"; then
-  VOICE_ARGS=(--voice "${VOICE}")
+if grep -qE '(^|[[:space:]])-v([[:space:]]|$)' <<<"${HELP}"; then VOICE_ARGS=(-v "${VOICE}")
+elif grep -qiE '(^|[[:space:]])--voice([[:space:]]|$)' <<<"${HELP}"; then VOICE_ARGS=(--voice "${VOICE}")
 fi
 
 RATE_ARGS=()
-if grep -qE '(^|[[:space:]])-r([[:space:]]|$)' <<<"${HELP}"; then
-  RATE_ARGS=(-r "${RATE}")
-elif grep -qiE '(^|[[:space:]])--rate([[:space:]]|$)' <<<"${HELP}"; then
-  RATE_ARGS=(--rate "${RATE}")
+if grep -qE '(^|[[:space:]])-r([[:space:]]|$)' <<<"${HELP}"; then RATE_ARGS=(-r "${RATE}")
+elif grep -qiE '(^|[[:space:]])--rate([[:space:]]|$)' <<<"${HELP}"; then RATE_ARGS=(--rate "${RATE}")
 fi
 
-# Run with env wrapper to ensure libs are visible.
-# shellcheck disable=SC2086
 /usr/local/bin/dectalk-env "${SAY_BIN}" "${VOICE_ARGS[@]}" "${RATE_ARGS[@]}" "${OUTFLAG}" "${OUT}" "${TEXT}"
 EOF
   chmod 755 /usr/local/bin/dectalk-text2wav
@@ -225,7 +207,6 @@ if [[ -f /etc/default/icecast2 ]]; then
   grep -q '^ENABLE=true' /etc/default/icecast2 || echo 'ENABLE=true' >> /etc/default/icecast2
 fi
 
-# Default passwords (you may override in /etc/seasonalweather/seasonalweather.env later)
 ICECAST_SOURCE_PASSWORD="$(grep -E '^ICECAST_SOURCE_PASSWORD=' /etc/seasonalweather/seasonalweather.env 2>/dev/null | head -n1 | cut -d= -f2- || true)"
 ICECAST_SOURCE_PASSWORD="${ICECAST_SOURCE_PASSWORD:-seasonal-source}"
 ICECAST_ADMIN_PASSWORD="seasonal-admin"
@@ -237,18 +218,19 @@ if [[ -f /etc/icecast2/icecast.xml ]]; then
   sed -i "s#<relay-password>.*</relay-password>#<relay-password>${ICECAST_RELAY_PASSWORD}</relay-password>#g" /etc/icecast2/icecast.xml || true
 fi
 
-# Keep Liquidsoap in sync with source password
 if [[ -f /etc/seasonalweather/radio.liq ]]; then
   sed -i "s#password=\"[^\"]*\"#password=\"${ICECAST_SOURCE_PASSWORD}\"#g" /etc/seasonalweather/radio.liq || true
 fi
 
+# -----------------------------------------------------------------------------------------
+# systemd
+# -----------------------------------------------------------------------------------------
 log "Installing systemd units"
 cp /opt/seasonalweather/app/systemd/seasonalweather.service /etc/systemd/system/seasonalweather.service
 cp /opt/seasonalweather/app/systemd/seasonalweather-liquidsoap.service /etc/systemd/system/seasonalweather-liquidsoap.service
 systemctl daemon-reload
 
 log "Installing helper scripts (if present in repo)"
-# These are optional: bootstrap won’t fail if they’re not in the repo.
 for f in seasonalweather-preflight.sh seasonalweather-audio-prune.sh seasonalweather-prune-audio.sh; do
   if [[ -f "/opt/seasonalweather/app/scripts/${f}" ]]; then
     install -m 755 "/opt/seasonalweather/app/scripts/${f}" "/usr/local/sbin/${f}"
@@ -265,11 +247,31 @@ chown -R seasonalweather:seasonalweather /var/lib/seasonalweather /var/log/seaso
 chmod 755 /var/lib/seasonalweather /var/lib/seasonalweather/audio /var/lib/seasonalweather/cache /var/log/seasonalweather
 
 echo
-echo "Next steps:"
-echo "  1) sudo nano /etc/seasonalweather/seasonalweather.env   # set NWWS creds"
-echo "  2) sudo systemctl enable --now icecast2"
-echo "  3) sudo systemctl enable --now seasonalweather-liquidsoap"
-echo "  4) sudo systemctl enable --now seasonalweather"
+echo "======================================================="
+echo " SeasonalWeather bootstrap complete"
+echo "======================================================="
 echo
-echo "Listen:"
-echo "  http://<vm-ip>:8000/seasonalweather.ogg"
+echo " Configuration:"
+echo "   Behaviour  →  /etc/seasonalweather/config.yaml"
+echo "   Secrets    →  /etc/seasonalweather/seasonalweather.env"
+echo
+echo " Next steps:"
+echo "   1) Edit config.yaml for your service area, TTS backend,"
+echo "      schedule, and all behaviour knobs."
+echo "      nano /etc/seasonalweather/config.yaml"
+echo
+echo "   2) Fill in credentials in seasonalweather.env:"
+echo "      NWWS_JID, NWWS_PASSWORD, ICECAST_SOURCE_PASSWORD"
+echo "      nano /etc/seasonalweather/seasonalweather.env"
+echo
+echo "   3) Enable and start services:"
+echo "      sudo systemctl enable --now icecast2"
+echo "      sudo systemctl enable --now seasonalweather-liquidsoap"
+echo "      sudo systemctl enable --now seasonalweather"
+echo
+echo "   4) Check logs:"
+echo "      journalctl -u seasonalweather -f"
+echo
+echo " Listen:"
+echo "   http://<your-ip>:8000/seasonalweather.ogg"
+echo "======================================================="

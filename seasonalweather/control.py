@@ -89,32 +89,16 @@ class OrchestratorControl:
             return None
 
     def _station_feed_path(self) -> Path:
-        raw = os.getenv("SEASONAL_STATION_FEED_PATH", "/srv/seasonalweather/api/station/handled-alerts.json").strip()
-        return Path(raw or "/srv/seasonalweather/api/station/handled-alerts.json")
+        return Path(self.orch.cfg.station_feed.path)
 
     def _asset_expiry_seconds(self) -> int:
-        raw = os.getenv("SEASONAL_API_AUDIO_TTL_SECONDS", "86400").strip()
-        try:
-            val = int(raw)
-        except Exception:
-            val = 86400
-        return max(300, min(val, 7 * 86400))
+        return max(300, min(self.orch.cfg.api.audio_ttl_seconds, 7 * 86400))
 
     def _asset_max_size_bytes(self) -> int:
-        raw = os.getenv("SEASONAL_API_AUDIO_MAX_BYTES", "20971520").strip()
-        try:
-            val = int(raw)
-        except Exception:
-            val = 20 * 1024 * 1024
-        return max(1024, val)
+        return max(1024, self.orch.cfg.api.audio_max_bytes)
 
     def _asset_max_duration_seconds(self) -> float:
-        raw = os.getenv("SEASONAL_API_AUDIO_MAX_SECONDS", "180").strip()
-        try:
-            val = float(raw)
-        except Exception:
-            val = 180.0
-        return max(1.0, min(val, 3600.0))
+        return max(1.0, min(float(self.orch.cfg.api.audio_max_seconds), 3600.0))
 
 
     def _station_sample_rate(self) -> int:
@@ -124,8 +108,7 @@ class OrchestratorControl:
             return 16000
 
     def _ffmpeg_bin(self) -> str:
-        raw = os.getenv("SEASONAL_API_FFMPEG_BIN", "ffmpeg").strip()
-        return raw or "ffmpeg"
+        return self.orch.cfg.api.ffmpeg_bin or "ffmpeg"
 
     def _require_ffmpeg(self) -> str:
         ffmpeg = self._ffmpeg_bin()
@@ -244,8 +227,7 @@ class OrchestratorControl:
             )
 
     def _manual_full_eas_should_heighten(self) -> bool:
-        raw = os.getenv("SEASONAL_API_FULL_EAS_HEIGHTENED", "").strip().lower()
-        return raw in {"1", "true", "yes", "on"}
+        return self.orch.cfg.api.full_eas_heightened
 
     async def get_health(self) -> dict[str, Any]:
         try:
@@ -339,7 +321,7 @@ class OrchestratorControl:
                 "transmitter_count": len(cfg.service_area.transmitters),
             },
             "features": {
-                "station_feed_enabled": bool(os.getenv("SEASONAL_STATION_FEED_ENABLED", "").strip()),
+                "station_feed_enabled": self.orch.cfg.station_feed.enabled,
                 "live_time_enabled": bool(getattr(self.orch, "live_time_enabled", False)),
                 "rebroadcast_enabled": bool(getattr(self.orch, "rebroadcast_enabled", False)),
             },

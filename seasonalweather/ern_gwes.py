@@ -40,7 +40,42 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def _same_listen_module_cmd(url: str, *, sr: int, dedupe: float, trigger_ratio: float, tail: float) -> list[str]:
+def _cfg_samedec_args() -> tuple[str, float, float]:
+    """
+    Read samedec subprocess settings from the already-loaded AppConfig.
+
+    Late-import main._APP_CFG to avoid circular imports at module import time.
+    Falls back to sane defaults if the app config is not available.
+    """
+    try:
+        from .main import _APP_CFG  # late import to avoid circular dependency
+    except Exception:
+        _APP_CFG = None
+
+    if _APP_CFG is None:
+        return "/usr/local/bin/samedec", 0.85, 1.4
+
+    cfg = getattr(_APP_CFG, "samedec", None)
+    if cfg is None:
+        return "/usr/local/bin/samedec", 0.85, 1.4
+
+    bin_path = str(getattr(cfg, "bin", "/usr/local/bin/samedec") or "/usr/local/bin/samedec").strip()
+    confidence = float(getattr(cfg, "confidence", 0.85) or 0.85)
+    start_delay_s = float(getattr(cfg, "start_delay_s", 1.4) or 1.4)
+    return bin_path, confidence, start_delay_s
+
+
+def _same_listen_module_cmd(
+    url: str,
+    *,
+    sr: int,
+    dedupe: float,
+    trigger_ratio: float,
+    tail: float,
+    samedec_bin: str,
+    samedec_confidence: float,
+    samedec_start_delay_s: float,
+) -> list[str]:
     return [
         sys.executable,
         "-m",
@@ -55,38 +90,19 @@ def _same_listen_module_cmd(url: str, *, sr: int, dedupe: float, trigger_ratio: 
         str(float(trigger_ratio)),
         "--tail",
         str(float(tail)),
+        "--samedec-bin",
+        str(samedec_bin),
+        "--confidence",
+        str(float(samedec_confidence)),
+        "--start-delay-s",
+        str(float(samedec_start_delay_s)),
         "--jsonl",
     ]
 
 
-def _env_float(name: str, default: float) -> float:
-    v = os.environ.get(name)
-    if not v:
-        return default
-    try:
-        return float(v)
-    except Exception:
-        return default
-
-
-def _env_int(name: str, default: int) -> int:
-    v = os.environ.get(name)
-    if not v:
-        return default
-    try:
-        return int(v)
-    except Exception:
-        return default
-
-
-def _env_str(name: str, default: str) -> str:
-    v = os.environ.get(name)
-    return v if v else default
-
-
 class ErnGwesMonitor:
     """
-    Spawns same_listen.py as a module, reads JSONL decoded SAME messages,
+    Spawns same_listen_samedec.py as a module, reads JSONL decoded SAME messages,
     filters to service area SAME/FIPS, and emits ErnSameEvent into an asyncio queue.
 
     This is a "Level 3" source: we do not try to fetch or synthesize official text.
@@ -175,12 +191,17 @@ class ErnGwesMonitor:
         env["PYTHONUNBUFFERED"] = "1"
         env["PYTHONPATH"] = str(root)
 
+        samedec_bin, samedec_confidence, samedec_start_delay_s = _cfg_samedec_args()
+
         cmd = _same_listen_module_cmd(
             self.url,
             sr=self.sample_rate,
             dedupe=self.dedupe_seconds,
             trigger_ratio=self.trigger_ratio,
             tail=self.tail_seconds,
+            samedec_bin=samedec_bin,
+            samedec_confidence=samedec_confidence,
+            samedec_start_delay_s=samedec_start_delay_s,
         )
 
         log.info("ERN monitor starting (%s): %s", self.name, " ".join(cmd))
@@ -224,7 +245,7 @@ class ErnGwesMonitor:
                     if not ev:
                         continue
 
-                    # Confidence gate (keep it low; ERN audio quality can be… “heritage”)
+                    # Confidence gate (keep it low; ERN audio quality can be… "heritage")
                     if ev.confidence < self.confidence_min:
                         continue
 
@@ -261,18 +282,3 @@ class ErnGwesMonitor:
             # Restart backoff
             log.warning("ERN monitor exited; restarting in 2s (%s)", self.name)
             await asyncio.sleep(2.0)
-
-
-def defaults_from_env() -> dict:
-    """
-    Optional helper if you want to construct this from env vars.
-    (main.py can also manage env itself; this is just convenience.)
-    """
-    return dict(
-        sample_rate=_env_int("SEASONAL_ERN_SR", 48000),
-        dedupe_seconds=_env_float("SEASONAL_ERN_DEDUPE_SECONDS", 20.0),
-        trigger_ratio=_env_float("SEASONAL_ERN_TRIGGER_RATIO", 8.0),
-        tail_seconds=_env_float("SEASONAL_ERN_TAIL_SECONDS", 10.0),
-        confidence_min=_env_float("SEASONAL_ERN_CONFIDENCE_MIN", 0.25),
-        name=_env_str("SEASONAL_ERN_NAME", "ERN/JON"),
-    )

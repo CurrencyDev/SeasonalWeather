@@ -54,7 +54,11 @@ def _is_loopback(host: str | None) -> bool:
 
 
 def _load_token_map() -> dict[str, dict[str, Any]]:
-    raw_json = os.getenv("SEASONAL_API_TOKENS_JSON", "").strip()
+    from .main import _APP_CFG  # late import to avoid circular dependency
+    secrets = _APP_CFG.secrets if _APP_CFG else None
+
+    raw_json = (secrets.api_tokens_json if secrets else "") or ""
+    raw_json = raw_json.strip()
     if raw_json:
         try:
             obj = json.loads(raw_json)
@@ -76,15 +80,17 @@ def _load_token_map() -> dict[str, dict[str, Any]]:
             out[token] = {"subject": subject, "scopes": scopes}
         return out
 
-    single = os.getenv("SEASONAL_API_TOKEN", "").strip()
+    single = (secrets.api_token if secrets else "") or ""
+    single = single.strip()
     if not single:
         raise RuntimeError(
-            "No API token configured. Set SEASONAL_API_TOKEN or SEASONAL_API_TOKENS_JSON before starting the API server."
+            "No API token configured. Set SEASONAL_API_TOKEN or SEASONAL_API_TOKENS_JSON in seasonalweather.env."
         )
 
-    scopes_raw = os.getenv("SEASONAL_API_SCOPES", "")
+    api_cfg = _APP_CFG.api if _APP_CFG else None
+    scopes_raw = (api_cfg.scopes if api_cfg else "") or ""
     scopes = [s.strip() for s in scopes_raw.split(",") if s.strip()] if scopes_raw else sorted(_DEFAULT_ADMIN_SCOPES)
-    subject = os.getenv("SEASONAL_API_SUBJECT", "local-admin").strip() or "local-admin"
+    subject = (api_cfg.subject if api_cfg else "local-admin") or "local-admin"
     return {single: {"subject": subject, "scopes": scopes}}
 
 
@@ -100,7 +106,8 @@ async def get_api_principal(
     request: Request,
     authorization: str | None = Header(default=None),
 ) -> ApiPrincipal:
-    allow_remote = os.getenv("SEASONAL_API_ALLOW_REMOTE", "").strip().lower() in {"1", "true", "yes", "on"}
+    from .main import _APP_CFG  # late import to avoid circular dependency
+    allow_remote = (_APP_CFG.api.allow_remote if _APP_CFG else False)
     client_host = request.client.host if request.client else None
     if not allow_remote and not _is_loopback(client_host):
         raise HTTPException(

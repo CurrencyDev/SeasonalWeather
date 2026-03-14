@@ -48,14 +48,7 @@ def _short_tz(now: dt.datetime) -> str:
     return _expand_tz_token(now.tzname() or "local")
 
 
-def _env_int(key: str, default: int) -> int:
-    v = os.environ.get(key, "").strip()
-    if not v:
-        return default
-    try:
-        return int(v)
-    except Exception:
-        return default
+# _env_int removed — cycle tuning now flows through CycleBuilder constructor.
 
 
 _URL_RE = re.compile(r"(https?://\S+|www\.\S+)", re.IGNORECASE)
@@ -73,7 +66,7 @@ _WFO_ALLOW = {"KLWX", "KCTP", "KPHI"}
 _WFO_RE = re.compile(r"\bK[A-Z]{3}\b")
 
 
-def _last_product_status_line(desc: str) -> str:
+def _last_product_status_line(desc: str, max_chars: int = 260) -> str:
     s = (desc or "").strip()
     if not s:
         return ""
@@ -81,7 +74,7 @@ def _last_product_status_line(desc: str) -> str:
     # Keep this line sane for TTS/logs (avoid giant/ugly strings)
     s = clean_for_tts(s)
     s = _scrub_nws_product_text(s)
-    s = _trim_chars(s, _env_int("SEASONAL_CYCLE_LAST_PRODUCT_MAX_CHARS", 260))
+    s = _trim_chars(s, max_chars)
     if not s:
         return ""
 
@@ -314,14 +307,10 @@ _DOW_FULL = {
     "Sun": "Sunday",
 }
 
-def _parse_kv_env(key: str) -> Dict[str, str]:
-    """
-    Parse simple KEY=VALUE pairs from an env var.
+# _parse_kv_env removed — obs aliases now come from CycleBuilder constructor.
 
-    Accepts:
-      KDCA:Reagan National Airport,KBWI:BWI
-      KDCA=Reagan National Airport; KBWI=BWI
-    """
+def _parse_kv_env(key: str) -> Dict[str, str]:
+    """Legacy shim — kept so any callers outside CycleBuilder still compile."""
     raw = (os.environ.get(key, "") or "").strip()
     if not raw:
         return {}
@@ -478,15 +467,17 @@ class CycleBuilder:
         obs_stations: List[str],
         reference_points: List[Tuple[float, float, str]],
         same_fips_all: List[str],
+        cycle_cfg=None,
     ) -> None:
         self.api = api
         self.tz = ZoneInfo(tz_name)
         self.obs_stations = obs_stations
         self.points = reference_points
         self.same_fips = set(same_fips_all)
+        self._cycle_cfg = cycle_cfg  # CycleConfig | None — None falls back to hardcoded defaults
 
         # Observation station naming
-        self._obs_aliases: Dict[str, str] = _parse_kv_env("SEASONAL_CYCLE_OBS_ALIASES")
+        self._obs_aliases: Dict[str, str] = dict(cycle_cfg.obs.aliases) if cycle_cfg else {}
         self._obs_name_cache: Dict[str, str] = {}
 
         # caches for SPC/CWA lookups (best-effort)
@@ -555,18 +546,18 @@ class CycleBuilder:
 
         if k == "HWO":
             if m == "heightened":
-                return _env_int("SEASONAL_CYCLE_HWO_MAX_CHARS_HEIGHTENED", 1200)
-            return _env_int("SEASONAL_CYCLE_HWO_MAX_CHARS_NORMAL", 0)
+                return self._cycle_cfg.hwo.max_chars_heightened if self._cycle_cfg else 1200
+            return self._cycle_cfg.hwo.max_chars_normal if self._cycle_cfg else 0
 
         if k == "AFD":
             if m == "heightened":
-                return _env_int("SEASONAL_CYCLE_AFD_MAX_CHARS_HEIGHTENED", 1000)
-            return _env_int("SEASONAL_CYCLE_AFD_MAX_CHARS_NORMAL", 0)
+                return self._cycle_cfg.afd.max_chars_heightened if self._cycle_cfg else 1000
+            return self._cycle_cfg.afd.max_chars_normal if self._cycle_cfg else 0
 
         if k in {"SYN", "SYNOPSIS"}:
             if m == "heightened":
-                return _env_int("SEASONAL_CYCLE_SYN_MAX_CHARS_HEIGHTENED", 900)
-            return _env_int("SEASONAL_CYCLE_SYN_MAX_CHARS_NORMAL", 1500)
+                return self._cycle_cfg.syn.max_chars_heightened if self._cycle_cfg else 900
+            return self._cycle_cfg.syn.max_chars_normal if self._cycle_cfg else 1500
 
         return None
 
@@ -878,17 +869,17 @@ class CycleBuilder:
           SEASONAL_CYCLE_SPC_MIN_DN=3  (3=MRGL)
           SEASONAL_CYCLE_SPC_DAYS=3    (1..3)
         """
-        if _env_int("SEASONAL_CYCLE_SPC_ENABLE", 0) != 1:
+        if not (self._cycle_cfg.spc.enabled if self._cycle_cfg else False):
             return None
 
-        wfos = [x.strip().upper() for x in os.environ.get("SEASONAL_CYCLE_SPC_WFOS", "LWX").split(",") if x.strip()]
+        wfos = list(self._cycle_cfg.spc.wfos) if self._cycle_cfg else ["LWX"]
         if not wfos:
             wfos = ["LWX"]
 
-        days = 1 if ctx.mode == "heightened" else max(1, min(3, _env_int("SEASONAL_CYCLE_SPC_DAYS", 3)))
-        min_dn = _env_int("SEASONAL_CYCLE_SPC_MIN_DN", 3)
+        days = 1 if ctx.mode == "heightened" else max(1, min(3, self._cycle_cfg.spc.days if self._cycle_cfg else 3))
+        min_dn = self._cycle_cfg.spc.min_dn if self._cycle_cfg else 3
         try:
-            timeout_s = float(os.environ.get("SEASONAL_CYCLE_SPC_TIMEOUT_S", "6.0") or "6.0")
+            timeout_s = float(self._cycle_cfg.spc.timeout_s if self._cycle_cfg else 6.0)
         except Exception:
             timeout_s = 6.0
 
@@ -1011,28 +1002,28 @@ class CycleBuilder:
 
         # --- Forecast snippets (gridpoint) ---
         fc_lines: List[str] = []
-        max_points = 1 if ctx.mode == "heightened" else _env_int("SEASONAL_CYCLE_FC_MAX_POINTS_NORMAL", 6)
-        field = "shortForecast" if _env_int("SEASONAL_CYCLE_FC_USE_SHORT", 1) else "detailedForecast"
+        max_points = 1 if ctx.mode == "heightened" else (self._cycle_cfg.fc.max_points_normal if self._cycle_cfg else 6)
+        field = "shortForecast" if (self._cycle_cfg.fc.use_short if self._cycle_cfg else True) else "detailedForecast"
 
         # 7-day style = ~14 periods (day/night)
-        max_periods = 1 if ctx.mode == "heightened" else _env_int("SEASONAL_CYCLE_FC_PERIODS_NORMAL", 14)
+        max_periods = 1 if ctx.mode == "heightened" else (self._cycle_cfg.fc.periods_normal if self._cycle_cfg else 14)
 
         # If you're reading lots of periods, reduce points automatically
         if max_periods >= 10:
-            max_points = min(max_points, _env_int("SEASONAL_CYCLE_FC_MAX_POINTS_7DAY", 2))
+            max_points = min(max_points, self._cycle_cfg.fc.max_points_7day if self._cycle_cfg else 2)
         elif max_periods >= 6:
             max_points = min(max_points, 3)
 
         # How many periods to speak before inserting a pause/newline
-        per_group = _env_int("SEASONAL_CYCLE_FC_PERIODS_PER_GROUP", 4)
+        per_group = self._cycle_cfg.fc.periods_per_group if self._cycle_cfg else 4
 
         # Per-point safety trim (keep generous; avoid "Tuesday…" mid-cut)
-        point_max = _env_int("SEASONAL_CYCLE_FC_POINT_MAX_CHARS", _env_int("SEASONAL_CYCLE_FC_LINE_MAX_CHARS", 1600))
+        point_max = (self._cycle_cfg.fc.point_max_chars if self._cycle_cfg else 1600)
 
         pts = list(self.points)
         if pts:
-            rot_period = _env_int("SEASONAL_CYCLE_FC_ROTATE_PERIOD_S", 300)
-            rot_step = _env_int("SEASONAL_CYCLE_FC_ROTATE_STEP", max_points)
+            rot_period = self._cycle_cfg.fc.rotate_period_s if self._cycle_cfg else 300
+            rot_step = (self._cycle_cfg.fc.rotate_step or max_points) if self._cycle_cfg else max_points
             slot = int(now.timestamp() // max(rot_period, 1))
             offset = (slot * max(rot_step, 1)) % len(pts)
             pts = pts[offset:] + pts[:offset]
@@ -1082,15 +1073,13 @@ class CycleBuilder:
 
         # --- Observations ---
         obs_lines: List[str] = []
-        max_obs = 1 if ctx.mode == "heightened" else _env_int(
-            "SEASONAL_CYCLE_OBS_MAX_NORMAL",
-            min(8, len(self.obs_stations) or 0),
-        )
+        _obs_max_normal = (self._cycle_cfg.obs.max_normal if self._cycle_cfg else 0) or min(8, len(self.obs_stations) or 0)
+        max_obs = 1 if ctx.mode == "heightened" else _obs_max_normal
 
         sts = list(self.obs_stations)
         if sts:
-            rot_period = _env_int("SEASONAL_CYCLE_OBS_ROTATE_PERIOD_S", 300)
-            rot_step = _env_int("SEASONAL_CYCLE_OBS_ROTATE_STEP", max_obs)
+            rot_period = self._cycle_cfg.obs.rotate_period_s if self._cycle_cfg else 300
+            rot_step = (self._cycle_cfg.obs.rotate_step or max_obs) if self._cycle_cfg else max_obs
             slot = int(now.timestamp() // max(rot_period, 1))
             offset = (slot * max(rot_step, 1)) % len(sts)
             sts = sts[offset:] + sts[:offset]
@@ -1152,7 +1141,7 @@ class CycleBuilder:
         if ctx.last_heightened_ago:
             status_bits.append(f"The most recent, heightened broadcast cycle mode activation was {ctx.last_heightened_ago} ago.")
         if ctx.last_product_desc:
-            line = _last_product_status_line(ctx.last_product_desc)
+            line = _last_product_status_line(ctx.last_product_desc, max_chars=self._cycle_cfg.last_product_max_chars if self._cycle_cfg else 260)
             if line:
                 status_bits.append(line)
         if active_titles:
@@ -1177,7 +1166,7 @@ class CycleBuilder:
                 )
             )
         else:
-            if _env_int("SEASONAL_CYCLE_HWO_SPEAK_UNAVAILABLE", 1) == 1:
+            if (self._cycle_cfg.hwo.speak_unavailable if self._cycle_cfg else True):
                 segments.append(
                     CycleSegment(
                         key="hwo-unavailable",

@@ -15,11 +15,11 @@ from .same_decode import HEADER_RE, SAME_MAX_LOCS
 # ffmpeg emits s16le; samedec expects i16 native-endian. On x86/x64 (little-endian), this matches.
 BYTES_PER_SAMPLE = 2  # int16 mono
 
-# samedec doesn't provide a confidence score; we provide a stable synthetic one for compatibility
-DEFAULT_CONFIDENCE = float(os.getenv("SEASONAL_SAMEDEC_CONFIDENCE", "0.85") or "0.85")
-
-# Rough "message likely started a bit before we printed it" fudge
-DEFAULT_START_DELAY_S = float(os.getenv("SEASONAL_SAMEDEC_START_DELAY_S", "1.4") or "1.4")
+# Runtime defaults. The actual values should normally be passed in from ern_gwes.py
+# based on config.yaml's samedec: block.
+DEFAULT_CONFIDENCE = 0.85
+DEFAULT_START_DELAY_S = 1.4
+DEFAULT_SAMEDEC_BIN = "/usr/local/bin/samedec"
 
 
 def _force_line_buffered_stdout() -> None:
@@ -97,14 +97,13 @@ def _spawn_ffmpeg(url: str, sr: int, debug: bool = False) -> subprocess.Popen:
     )
 
 
-def _spawn_samedec(sr: int, debug: bool = False) -> subprocess.Popen:
+def _spawn_samedec(bin_path: str, sr: int, debug: bool = False) -> subprocess.Popen:
     """
     Spawn samedec. We keep stdout as a byte stream and parse lines ourselves (non-blocking).
     """
-    bin_path = os.getenv("SEASONAL_SAMEDEC_BIN", "/usr/local/bin/samedec").strip() or "/usr/local/bin/samedec"
     stderr = None if debug else subprocess.DEVNULL
     return subprocess.Popen(
-        [bin_path, "-r", str(int(sr))],
+        [str(bin_path), "-r", str(int(sr))],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=stderr,
@@ -208,6 +207,7 @@ def _drain_samedec_stdout(
     url: str,
     total_samples: int,
     start_delay_s: float,
+    confidence: float,
     dedupe_seconds: float,
     last_emit_at: dict[tuple[str, str], float],
     jsonl: bool,
@@ -257,7 +257,7 @@ def _drain_samedec_stdout(
 
         msg.update(
             {
-                "confidence": float(DEFAULT_CONFIDENCE),
+                "confidence": float(confidence),
                 "start_seconds": float(approx_t),
                 "url": url,
                 "sr": int(sr),
@@ -291,6 +291,8 @@ def listen_stream(
     once: bool = False,
     exit_on_eof: Optional[bool] = None,
     start_delay_s: float = DEFAULT_START_DELAY_S,
+    confidence: float = DEFAULT_CONFIDENCE,
+    samedec_bin: str = DEFAULT_SAMEDEC_BIN,
 ) -> None:
     """
     Stream listener that decodes SAME using Rust samedec.
@@ -316,7 +318,7 @@ def listen_stream(
         sd: subprocess.Popen | None = None
         try:
             ff = _spawn_ffmpeg(url, sr, debug=debug)
-            sd = _spawn_samedec(sr, debug=debug)
+            sd = _spawn_samedec(samedec_bin, sr, debug=debug)
 
             assert ff is not None and sd is not None
             assert sd.stdin is not None
@@ -353,6 +355,7 @@ def listen_stream(
                     url=url,
                     total_samples=total_samples,
                     start_delay_s=start_delay_s,
+                    confidence=confidence,
                     dedupe_seconds=dedupe_seconds,
                     last_emit_at=last_emit_at,
                     jsonl=jsonl,
@@ -384,6 +387,7 @@ def listen_stream(
                     url=url,
                     total_samples=total_samples,
                     start_delay_s=start_delay_s,
+                    confidence=confidence,
                     dedupe_seconds=dedupe_seconds,
                     last_emit_at=last_emit_at,
                     jsonl=jsonl,
@@ -434,6 +438,9 @@ def main() -> None:
     ap.add_argument("--jsonl", action="store_true", help="Emit JSON lines (one per decode)")
     ap.add_argument("--debug", action="store_true", help="More stderr logging")
     ap.add_argument("--idle-bytes", type=float, default=45.0, help="Restart if no PCM bytes arrive for this many seconds")
+    ap.add_argument("--confidence", type=float, default=DEFAULT_CONFIDENCE, help="Synthetic confidence to attach to decoded SAME events")
+    ap.add_argument("--start-delay-s", type=float, default=DEFAULT_START_DELAY_S, help="Backdate the decoded header start time by this many seconds")
+    ap.add_argument("--samedec-bin", default=DEFAULT_SAMEDEC_BIN, help="Path to the samedec binary")
 
     # Extra test helpers (not used by ern_gwes.py)
     ap.add_argument("--once", action="store_true", help="Exit after first decoded message (testing)")
@@ -456,6 +463,9 @@ def main() -> None:
         idle_bytes_seconds=args.idle_bytes,
         once=bool(args.once),
         exit_on_eof=(True if args.exit_on_eof else None),
+        start_delay_s=args.start_delay_s,
+        confidence=args.confidence,
+        samedec_bin=args.samedec_bin,
     )
 
 

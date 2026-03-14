@@ -2,7 +2,7 @@ station:
   name: "SeasonalWeather"
   service_area_name: "The Baltimore and Washington, D.C. region, and surrounding counties across Maryland, Virginia, West Virginia, and Pennsylvania"
   timezone: "America/New_York"
-  disclaimer: "Please note, SeasonalWeather is not noah Weather Radio and is not endorsed by the National Weather Service. For critical information, you should use noah Weather Radio, and weather.gov."
+  disclaimer: "Please note, SeasonalWeather is not NOAA Weather Radio and is not endorsed by the National Weather Service. For critical information, you should use NOAA Weather Radio, and weather.gov."
 
 stream:
   icecast_host: "127.0.0.1"
@@ -42,6 +42,52 @@ cycle:
     - [39.4562, -77.9639, "Martinsburg"]
     - [39.8309, -77.2311, "Gettysburg"]
 
+  # Trim older product text to this many chars before TTS
+  last_product_max_chars: 260
+
+  # SPC outlook integration (off by default)
+  spc:
+    enabled: false
+    wfos: ["LWX"]     # WFOs to include in SPC check
+    days: 3            # how many outlook days to consider (1..3)
+    min_dn: 3          # minimum danger number to speak (3=MRGL, 4=SLGT, 5=ENH, 6=MDT, 8=HIGH)
+    timeout_s: 6.0
+
+  # Forecast product tuning
+  fc:
+    use_short: true         # use shortForecast vs detailedForecast
+    periods_normal: 14      # max forecast periods to consider
+    periods_per_group: 4    # how many periods per read group
+    max_points_normal: 6    # how many reference points to cover in normal mode
+    max_points_7day: 2      # how many points in the extended 7-day portion
+    point_max_chars: 1600   # max chars per forecast point
+    line_max_chars: 1600    # fallback line length cap (same as point_max_chars by default)
+    rotate_period_s: 300    # how often (seconds) to rotate to the next point group
+    rotate_step: 0          # step size per rotation (0 = use max_points_normal)
+
+  # Observation tuning
+  obs:
+    max_normal: 0           # max obs stations in normal mode (0 = auto: min(8, len(stations)))
+    rotate_period_s: 300
+    rotate_step: 0          # 0 = use max_normal
+    aliases: {}             # map station ID → display name, e.g. { "KDCA": "Reagan National" }
+
+  # Hazardous Weather Outlook (HWO) tuning
+  hwo:
+    max_chars_normal: 0       # 0 = unlimited in normal mode
+    max_chars_heightened: 1200
+    speak_unavailable: true   # read "no hazardous weather outlook available" if missing
+
+  # Area Forecast Discussion (AFD) tuning
+  afd:
+    max_chars_normal: 0       # 0 = unlimited
+    max_chars_heightened: 1000
+
+  # Synopsis (SYN) tuning
+  syn:
+    max_chars_normal: 1500
+    max_chars_heightened: 900
+
 # Observations station IDs for api.weather.gov/stations/<id>/observations/latest
 observations:
   stations: ["KDCA", "KBWI", "KIAD", "KMRB", "KCHO", "KHGR", "KFDK", "KMTN", "KFME", "KGAI", "KJYO", "KHEF", "KADW", "KTHV"]
@@ -50,7 +96,22 @@ observations:
 nwws:
   server: "nwws-oi.weather.gov"
   port: 5222
+  room: "NWWS@conference.nwws-oi.weather.gov"
+  nick: "SeasonalWeather"
   allowed_wfos: ["KLWX", "KCTP", "KPHI"]
+  resiliency:
+    stall_seconds: 60           # seconds without a message before declaring stall
+    muc_confirm_seconds: 30     # seconds to wait for MUC join confirmation
+    start_wait_seconds: 25      # seconds to wait for stream start
+    join_wait_seconds: 35       # seconds to wait for room join
+    backoff_max_seconds: 90     # max reconnect backoff cap
+    rx_log_first_n: 20          # log first N received messages verbosely
+    decision_log_first_n: 20    # log first N routing decisions verbosely
+    decision_log_every: 0       # log every Nth decision after that (0 = off)
+
+# NWS API user-agent (used for all api.weather.gov calls; set to something identifying)
+nws:
+  user_agent: ""   # leave empty to use the built-in default
 
 # KLWX tone-out product types (matches the NWR tone table)
 policy:
@@ -87,8 +148,222 @@ policy:
     - "TOE"  # 911 Telephone Outage Emergency
     - "RWT"  # Required Weekly Test
 
-  # Minimum gap between consecutive tone-outs (prevents “tone spam” when back-to-back products drop)
+  # Minimum gap between consecutive tone-outs (prevents "tone spam" when back-to-back products drop)
   min_tone_gap_seconds: 2.0
+
+# SAME / EAS encoding
+same:
+  enabled: true
+  sender: "SEASNWXR"          # 8-char SAME sender ID
+  duration_minutes: 60         # default event duration hint
+  amplitude: 0.35              # SAME burst amplitude (0.0–1.0)
+
+# CAP ingest via NWS alerts API
+cap:
+  enabled: true
+  dryrun: false
+  poll_seconds: 60
+  user_agent: "SeasonalWeather (CAP monitor)"
+  url: ""                      # leave empty to use default NWS alerts endpoint
+  ledger_path: "/var/lib/seasonalweather/cap_ledger.json"
+  ledger_max_age_days: 14
+  full:
+    enabled: true
+    severities: ["Severe", "Extreme"]
+    events: []                 # empty = match all events of qualifying severity
+    cooldown_seconds: 180
+  voice:
+    enabled: true              # voice-only interruption (no SAME/tone/EOM) for low-severity
+    events: ["Special Weather Statement"]
+    cooldown_seconds: 600
+
+# ERN/JON GWES-ERN Level-3 source monitoring
+ern:
+  enabled: true
+  dryrun: false
+  url: "http://radio.wjonip.org/WJONTV"
+  name: "ERN/JON"
+  sample_rate: 48000
+  tail_seconds: 10.0
+  trigger_ratio: 8.0
+  dedupe_seconds: 20.0
+  confidence_min: 0.25          # minimum confidence to even consider a decoded SAME burst
+  relay:
+    enabled: true
+    events:
+      - ADR
+      - AVA
+      - AVW
+      - BLU
+      - BZW
+      - CAE
+      - CDW
+      - CEM
+      - CFA
+      - CFW
+      - DMO
+      - DSW
+      - EQW
+      - EVI
+      - EWW
+      - FFA
+      - FFS
+      - FFW
+      - FLA
+      - FLS
+      - FLW
+      - FRW
+      - HLS
+      - HMW
+      - HUA
+      - HUW
+      - HWA
+      - HWW
+      - LAE
+      - LEW
+      - NUW
+      - RHW
+      - RMT
+      - RWT
+      - SMW
+      - SPS
+      - SQW
+      - SSA
+      - SSW
+      - SVA
+      - SVR
+      - SVS
+      - TOA
+      - TOE
+      - TOR
+      - TRA
+      - TRW
+      - TSA
+      - TSW
+      - VOA
+      - VOW
+      - WSA
+      - WSW
+    min_confidence: 0.79
+    cooldown_seconds: 300
+    senders: []                 # empty = accept any sender; e.g. ["WJON", "WJONIP"]
+
+# samedec decoder subprocess settings (used by ern_gwes when samedec backend is active)
+samedec:
+  bin: "/usr/local/bin/samedec"
+  confidence: 0.85
+  start_delay_s: 1.4
+
+# RWT/RMT test scheduling
+tests:
+  enabled: true
+  postpone_minutes: 15         # delay test if active alert in progress
+  max_postpone_hours: 6        # give up postponing after this long
+  jitter_seconds: 60           # random jitter around scheduled time
+  toneout_cooldown_seconds: 1800  # don't tone again this soon after a test (matches min_heightened_seconds)
+  cap_block_seconds: 3600      # block CAP full cut-ins for this long after a test
+  ern_block_seconds: 3600      # block ERN relays for this long after a test
+  rwt:
+    weekday: 3                 # 0=Mon … 6=Sun
+    hour: 11
+    minute: 0
+  rmt:
+    nth: 1                     # which occurrence of weekday in month (1 = first)
+    weekday: 3
+    hour: 11
+    minute: 0
+
+# NWS UGC → SAME FIPS crosswalk (zone-to-county mapping)
+zonecounty:
+  enabled: true
+  dbx_url: "https://www.weather.gov/source/gis/Shapefiles/County/bp03mr26.dbx"
+  cache_days: 30
+  index_url: "https://www.weather.gov/gis/ZoneCounty"
+  base_url: "https://www.weather.gov/source/gis/Shapefiles/County/"
+
+# Marine zone → coastal county FIPS crosswalk
+mareas:
+  enabled: true
+  url: "https://www.weather.gov/source/gis/Shapefiles/WSOM/mareas18mr25.txt"
+  cache_days: 30
+
+# Station feed (JSON alert log written to disk for external consumption)
+station_feed:
+  enabled: true
+  path: "/srv/seasonalweather/api/station/handled-alerts.json"
+  station_id: "seasonalweather"
+  source: "seasonalweather"
+  max_items: 24
+  ttl_seconds: 7200
+  min_write_seconds: 0.5
+  fetch_nws: false             # attempt to fetch NWS alert detail on write
+  debug: false
+  ern_area_names: true         # include area name strings from ERN decoded alerts
+  housekeeping:
+    enabled: true
+    interval_sec: 60
+    grace_sec: 5
+    keep_unparseable: true     # keep entries that failed to parse rather than discarding
+    housekeep_seconds: 30
+
+# Alert rebroadcast (re-issue active alerts on the cycle)
+rebroadcast:
+  enabled: false
+  interval_seconds: 300
+  min_gap_seconds: 300
+  ttl_seconds: 3600
+  max_items: 6
+  include_voice: false
+
+# HTTP API server settings
+api:
+  allow_remote: false           # bind to 0.0.0.0 if true; localhost-only if false
+  audio_max_bytes: 20971520     # 20 MiB — max upload size for audio inject endpoint
+  audio_max_seconds: 180        # max audio clip duration accepted
+  audio_ttl_seconds: 86400      # how long injected audio files are kept on disk
+  ffmpeg_bin: "ffmpeg"
+  full_eas_heightened: false    # entering heightened mode on full EAS cut-ins
+  scopes: ""                    # space-separated scopes for SEASONAL_API_TOKEN if used
+  subject: "local-admin"        # subject name for the implicit local token
+  manual_full_eas_heightens: true
+
+# Live time announcement
+live_time:
+  enabled: true
+  interval_seconds: 45
+
+# Cross-source alert deduplication window
+dedupe:
+  ttl_seconds: 900              # 15 minutes
+
+tts:
+  backend: "voicetext_paul"  # espeak-ng | piper | festival | dectalk | voicetext_paul
+  voice: "9"                 # backend voice switcher
+  rate_wpm: 165
+  volume: 1.0
+  voicetext_paul:
+    run_as: "voicetext"        # sudo target user for the synth binary
+    retries: 1
+    retry_sleep_ms: 150
+    reset_every: 0             # reset process every N calls (0 = never)
+    kill_before: false         # SIGKILL old process before each run
+    vtml_lexicon: true         # apply the built-in VTML lexicon substitutions
+
+audio:
+  sample_rate: 48000
+  attention_tone_hz: 1050
+  attention_tone_seconds: 8.0
+  eom_beep_hz: 1000
+  eom_beep_seconds: 0.6
+  inter_segment_silence_seconds: 0.35
+  post_alert_silence_seconds: 1.2
+
+paths:
+  work_dir: "/var/lib/seasonalweather"
+  audio_dir: "/var/lib/seasonalweather/audio"
+  cache_dir: "/var/lib/seasonalweather/cache"
+  config_dir: "/etc/seasonalweather"
+  log_dir: "/var/log/seasonalweather"
 
 # Service area = union of these 4 KLWX transmitters
 # Source: https://www.weather.gov/lwx/nwrtables (transmitter county SAME/FIPS lists)
@@ -197,26 +472,3 @@ service_area:
       - { name: "Hardy WV", same_fips: "054031" }
       - { name: "Mineral WV", same_fips: "054057" }
       - { name: "Morgan WV", same_fips: "054065" }
-
-
-tts:
-  backend: "voicetext_paul"  # espeak-ng | piper | festival | dectalk
-  voice: "9"        # backend voice switcher (dectalk, piper, and festival support this)
-  rate_wpm: 165
-  volume: 1.0
-
-audio:
-  sample_rate: 48000
-  attention_tone_hz: 1050
-  attention_tone_seconds: 8.0
-  eom_beep_hz: 1000
-  eom_beep_seconds: 0.6
-  inter_segment_silence_seconds: 0.35
-  post_alert_silence_seconds: 1.2
-
-paths:
-  work_dir: "/var/lib/seasonalweather"
-  audio_dir: "/var/lib/seasonalweather/audio"
-  cache_dir: "/var/lib/seasonalweather/cache"
-  config_dir: "/etc/seasonalweather"
-  log_dir: "/var/log/seasonalweather"

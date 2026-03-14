@@ -33,6 +33,9 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from .config import load_config, AppConfig
+
+# Module-level config reference — set once at startup before Orchestrator is created.
+_APP_CFG: "AppConfig | None" = None
 from .nws_api import NWSApi
 from .nwws_client import NWWSClient
 from .product import parse_product_text, ParsedProduct
@@ -76,7 +79,7 @@ except Exception:
 
 # Optional ERN/GWES SAME monitor (Level 3 source)
 try:
-    from .ern_gwes import ErnGwesMonitor, ErnSameEvent, defaults_from_env
+    from .ern_gwes import ErnGwesMonitor, ErnSameEvent
 except Exception:  # pragma: no cover
     ErnGwesMonitor = None  # type: ignore
     ErnSameEvent = None  # type: ignore
@@ -135,20 +138,16 @@ def _sf_sha1_12(s: str) -> str:
 def _sf_enabled() -> bool:
     if StationFeedAlert is None or atomic_write_json is None or build_station_feed_payload is None:
         return False
-    v = os.getenv("SEASONAL_STATION_FEED_ENABLED", "").strip().lower()
-    if v in ("1", "true", "yes", "on"):
-        return True
-    return bool(os.getenv("SEASONAL_STATION_FEED_PATH", "").strip())
+    if _APP_CFG is None:
+        return False
+    return _APP_CFG.station_feed.enabled
 
 
 def _sf_cfg():
-    station_id = os.getenv("SEASONAL_STATION_FEED_STATION_ID", "seasonalweather").strip() or "seasonalweather"
-    path = os.getenv("SEASONAL_STATION_FEED_PATH", "/srv/seasonalweather/api/station/handled-alerts.json").strip() or "/srv/seasonalweather/api/station/handled-alerts.json"
-    source = os.getenv("SEASONAL_STATION_FEED_SOURCE", "seasonalweather").strip() or "seasonalweather"
-    max_items = int(os.getenv("SEASONAL_STATION_FEED_MAX_ITEMS", "24") or 24)
-    ttl_s = int(os.getenv("SEASONAL_STATION_FEED_TTL_SECONDS", "7200") or 7200)
-    min_write_s = float(os.getenv("SEASONAL_STATION_FEED_MIN_WRITE_SECONDS", "0.5") or 0.5)
-    return station_id, path, source, max_items, ttl_s, min_write_s
+    if _APP_CFG is None:
+        return "seasonalweather", "/srv/seasonalweather/api/station/handled-alerts.json", "seasonalweather", 24, 7200, 0.5
+    sf = _APP_CFG.station_feed
+    return sf.station_id, sf.path, sf.source, sf.max_items, sf.ttl_seconds, sf.min_write_seconds
 
 
 def _sf_prune(now_ts: float, *, max_items: int) -> None:
@@ -440,27 +439,20 @@ _sf_patch_eas_label_helpers()
 
 
 # Safe station-feed housekeeping helpers (startup-safe JSON prune)
-def _sf_hk_truthy_env(name: str, default: str = "1") -> bool:
-    v = str(os.getenv(name, default) or default).strip().lower()
-    return v in {"1", "true", "yes", "on", "y"}
-
-def _sf_hk_int_env(name: str, default: int) -> int:
-    try:
-        return int(str(os.getenv(name, str(default)) or str(default)).strip())
-    except Exception:
-        return int(default)
-
 def _sf_hk_interval_s() -> int:
-    # How often the housekeeping thread checks handled-alerts.json
-    return max(5, _sf_hk_int_env("SEASONAL_STATION_FEED_HK_INTERVAL_SEC", 60))
+    if _APP_CFG is None:
+        return 60
+    return max(5, _APP_CFG.station_feed.housekeeping.interval_sec)
 
 def _sf_hk_grace_s() -> int:
-    # Small grace so clock skew / second rounding doesn't prune too aggressively
-    return max(0, _sf_hk_int_env("SEASONAL_STATION_FEED_HK_GRACE_SEC", 5))
+    if _APP_CFG is None:
+        return 5
+    return max(0, _APP_CFG.station_feed.housekeeping.grace_sec)
 
 def _sf_hk_keep_unparseable() -> bool:
-    # If an alert has no parseable ends/expires, keep it by default (safer than deleting)
-    return _sf_hk_truthy_env("SEASONAL_STATION_FEED_HK_KEEP_UNPARSEABLE", "1")
+    if _APP_CFG is None:
+        return True
+    return _APP_CFG.station_feed.housekeeping.keep_unparseable
 
 def _sf_hk_alert_expiry_ts(alert_obj):
     """
@@ -492,7 +484,7 @@ def _sf_hk_prune_json_file(now_ts: float) -> bool:
     if not _sf_enabled():
         return False
 
-    if not _sf_hk_truthy_env("SEASONAL_STATION_FEED_HOUSEKEEPING_ENABLED", "1"):
+    if _APP_CFG is not None and not _APP_CFG.station_feed.housekeeping.enabled:
         return False
 
     _station_id, path, _source, _max_items, _ttl_s, _min_write_s = _sf_cfg()
@@ -576,7 +568,7 @@ def _sf_station_feed_housekeeping_once():
     """
     if not _sf_enabled():
         return
-    if not _sf_hk_truthy_env("SEASONAL_STATION_FEED_HOUSEKEEPING_ENABLED", "1"):
+    if _APP_CFG is not None and not _APP_CFG.station_feed.housekeeping.enabled:
         return
 
     try:
@@ -620,7 +612,7 @@ def _sf_station_feed_hk_start():
         try:
             log.info(
                 "Station feed housekeeping enabled (interval=%ss)",
-                os.getenv("SEASONAL_STATION_FEED_HOUSEKEEP_SECONDS", "30"),
+                _sf_hk_interval_s(),
             )
         except Exception:
             pass
@@ -630,8 +622,7 @@ def _sf_station_feed_hk_start():
         except Exception:
             pass
 
-# Start once at import time if station feed is enabled.
-_sf_station_feed_hk_start()
+# Housekeeping is started by Orchestrator.__init__ after cfg is loaded.
 
 
 def _sf_seed_memory_from_payload_file() -> int:
@@ -722,10 +713,6 @@ def _station_feed_note_cap(ev, *, mode: str, same_locations, out_wav: str, same_
         expires_raw = getattr(ev, "expires", None)
         sent_raw = getattr(ev, "sent", None)
 
-        def _sf_truthy_env(name: str) -> bool:
-            v = (os.getenv(name, "") or "").strip().lower()
-            return v in ("1", "true", "yes", "on")
-
         def _sf_best_end_from_vtec(vtec_list):
             # Pull the END token after '-' if present: ...-YYYYMMDDThhmmZ/
             try:
@@ -775,7 +762,7 @@ def _station_feed_note_cap(ev, *, mode: str, same_locations, out_wav: str, same_
             effective_raw = effective_raw or sent_raw  # best-effort
 
         # Optional: backfill from NWS alert detail endpoint (handles urn:oid IDs)
-        if _sf_truthy_env("SEASONAL_STATION_FEED_FETCH_NWS") and isinstance(alert_id, str) and alert_id.strip():
+        if (_APP_CFG.station_feed.fetch_nws if _APP_CFG else False) and isinstance(alert_id, str) and alert_id.strip():
             try:
                 import requests  # type: ignore
                 url = f"https://api.weather.gov/alerts/{alert_id}"
@@ -814,7 +801,7 @@ def _station_feed_note_cap(ev, *, mode: str, same_locations, out_wav: str, same_
 
         expires_at = expires_raw or ends_raw
 
-        if _sf_truthy_env("SEASONAL_STATION_FEED_DEBUG"):
+        if (_APP_CFG.station_feed.debug if _APP_CFG else False):
             try:
                 keys = sorted(getattr(ev, "__dict__", {}).keys())
             except Exception:
@@ -1114,44 +1101,8 @@ def _setup_logging() -> None:
     )
 
 
-def _env_required(key: str) -> str:
-    v = os.environ.get(key)
-    if not v:
-        raise RuntimeError(f"Missing required env var: {key} (set in /etc/seasonalweather/seasonalweather.env)")
-    return v
-
-
-def _env_int(key: str, default: int) -> int:
-    v = os.environ.get(key)
-    if not v:
-        return default
-    try:
-        return int(v)
-    except Exception:
-        return default
-
-
-def _env_float(key: str, default: float) -> float:
-    v = os.environ.get(key)
-    if not v:
-        return default
-    try:
-        return float(v)
-    except Exception:
-        return default
-
-
-def _env_str(key: str, default: str) -> str:
-    v = os.environ.get(key)
-    return v if v else default
-
-
-def _env_bool(key: str, default: bool = False) -> bool:
-    v = os.environ.get(key)
-    if v is None:
-        return default
-    s = str(v).strip().lower()
-    return s in {"1", "true", "yes", "y", "on"}
+# _env_* helpers removed — all configuration now flows through AppConfig.
+# Credentials are accessed via cfg.secrets.* (set once in load_config()).
 
 
 def _safe_event_code(raw: str | None) -> str:
@@ -1198,21 +1149,23 @@ def _short_tz(now: dt.datetime) -> str:
 
 class Orchestrator:
     def __init__(self, cfg: AppConfig) -> None:
+        global _APP_CFG
+        _APP_CFG = cfg
         self.cfg = cfg
         self.api = NWSApi()
         self.telnet = LiquidsoapTelnet(
-            host=_env_str("LIQUIDSOAP_TELNET_HOST", "127.0.0.1"),
-            port=_env_int("LIQUIDSOAP_TELNET_PORT", 1234),
+            host=cfg.secrets.liquidsoap_host,
+            port=cfg.secrets.liquidsoap_port,
         )
 
         self._tz = ZoneInfo(cfg.station.timezone)
         self.local_tz = self._tz  # alias for newer code paths (rebroadcast, etc.)
 
         # NWWS-OI
-        self.jid = _env_required("NWWS_JID")
-        self.password = _env_required("NWWS_PASSWORD")
-        self.nwws_server = _env_str("NWWS_SERVER", cfg.nwws.server)
-        self.nwws_port = _env_int("NWWS_PORT", cfg.nwws.port)
+        self.jid = cfg.secrets.nwws_jid
+        self.password = cfg.secrets.nwws_password
+        self.nwws_server = cfg.nwws.server
+        self.nwws_port = cfg.nwws.port
 
         # TTS
         self.tts = TTS(
@@ -1221,6 +1174,7 @@ class Orchestrator:
             rate_wpm=cfg.tts.rate_wpm,
             volume=cfg.tts.volume,
             sample_rate=cfg.audio.sample_rate,
+            vtp_cfg=cfg.tts.voicetext_paul,
         )
 
         self.mode = "normal"
@@ -1239,6 +1193,7 @@ class Orchestrator:
             obs_stations=cfg.observations.stations,
             reference_points=cfg.cycle.reference_points,
             same_fips_all=cfg.service_area.same_fips_all,
+            cycle_cfg=cfg.cycle,
         )
 
         # Fast membership checks for "in-area" targeting
@@ -1247,9 +1202,9 @@ class Orchestrator:
         # --- NWWS flood-gate controls ---
         self._nwws_logger = logging.getLogger("seasonalweather.nwws")
         self._nwws_raw_seen = 0
-        self._nwws_rx_log_first_n = _env_int("SEASONAL_NWWS_RX_LOG_FIRST_N", 20)
-        self._nwws_decision_log_first_n = _env_int("SEASONAL_NWWS_DECISION_LOG_FIRST_N", 20)
-        self._nwws_decision_log_every = _env_int("SEASONAL_NWWS_DECISION_LOG_EVERY", 0)
+        self._nwws_rx_log_first_n = cfg.nwws.resiliency.rx_log_first_n
+        self._nwws_decision_log_first_n = cfg.nwws.resiliency.decision_log_first_n
+        self._nwws_decision_log_every = cfg.nwws.resiliency.decision_log_every
         self._nwws_allowed_wfos = self._norm_wfo_set(getattr(cfg.nwws, "allowed_wfos", []))
 
         self.nwws_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=200)
@@ -1272,11 +1227,11 @@ class Orchestrator:
         self._cycle_refill_task: asyncio.Task | None = None
 
         # Live time WAV (drift killer)
-        self.live_time_enabled = _env_bool("SEASONAL_LIVE_TIME_ENABLED", default=True)
-        self.live_time_interval_seconds = _env_int("SEASONAL_LIVE_TIME_INTERVAL_SECONDS", 45)
+        self.live_time_enabled = cfg.live_time.enabled
+        self.live_time_interval_seconds = cfg.live_time.interval_seconds
 
         # --- Cross-source dedupe (NWWS vs CAP) ---
-        self._dedupe_ttl_seconds = _env_int("SEASONAL_DEDUPE_TTL_SECONDS", 900)  # 15m default
+        self._dedupe_ttl_seconds = cfg.dedupe.ttl_seconds
         self._dedupe_lock = asyncio.Lock()
         self._recent_air_keys: dict[str, dt.datetime] = {}
 
@@ -1284,12 +1239,12 @@ class Orchestrator:
         # --- Periodic rebroadcast rotation (no re-tone) ---
         # Replays voice-only copies of recently-aired products so info isn't heard only once.
         # Disabled by default; enable via SEASONAL_REBROADCAST_ENABLED=1.
-        self.rebroadcast_enabled = _env_bool("SEASONAL_REBROADCAST_ENABLED", default=False)
-        self.rebroadcast_interval_seconds = _env_int("SEASONAL_REBROADCAST_INTERVAL_SECONDS", 300)  # min spacing baseline
-        self.rebroadcast_min_gap_seconds = _env_int("SEASONAL_REBROADCAST_MIN_GAP_SECONDS", 300)    # don't spam cut-ins
-        self.rebroadcast_ttl_seconds = _env_int("SEASONAL_REBROADCAST_TTL_SECONDS", 3600)           # safety cap if no VTEC
-        self.rebroadcast_max_items = _env_int("SEASONAL_REBROADCAST_MAX_ITEMS", 6)
-        self.rebroadcast_include_voice = _env_bool("SEASONAL_REBROADCAST_INCLUDE_VOICE", default=False)
+        self.rebroadcast_enabled = cfg.rebroadcast.enabled
+        self.rebroadcast_interval_seconds = cfg.rebroadcast.interval_seconds
+        self.rebroadcast_min_gap_seconds = cfg.rebroadcast.min_gap_seconds
+        self.rebroadcast_ttl_seconds = cfg.rebroadcast.ttl_seconds
+        self.rebroadcast_max_items = cfg.rebroadcast.max_items
+        self.rebroadcast_include_voice = cfg.rebroadcast.include_voice
 
         self._rebroadcast_lock = asyncio.Lock()
         self._rebroadcast_items: dict[str, SimpleNamespace] = {}
@@ -1298,6 +1253,9 @@ class Orchestrator:
         # --- NWWS decision visibility counters ---
         self._nwws_seen = 0
         self._nwws_acted = 0
+
+        # Start station-feed housekeeping now that cfg is available
+        _sf_station_feed_hk_start()
 
         # --- NWS zone lookup (for NWWS UGC->SAME targeting) ---
         self._zone_client: httpx.AsyncClient | None = None
@@ -1940,7 +1898,9 @@ class Orchestrator:
 
     async def _sf_area_text_from_same_codes(self, same_codes: list[str]) -> str:
         """Resolve SAME codes to a '; '-joined area label string for station feed ERN items."""
-        if not _env_bool("SEASONAL_STATION_FEED_ERN_AREA_NAMES", default=True):
+        if _APP_CFG is not None and not _APP_CFG.station_feed.ern_area_names:
+            return ""
+        if _APP_CFG is None:
             return ""
         codes = [str(x).strip() for x in (same_codes or []) if str(x).strip()]
         if not codes:
@@ -2085,13 +2045,13 @@ class Orchestrator:
 
     # ---- ZoneCounty crosswalk (NOAA/NWS recommended: zone -> county FIPS -> SAME) ----
     def _zonecounty_enabled(self) -> bool:
-        return _env_bool("SEASONAL_ZONECOUNTY_ENABLED", default=True)
+        return self.cfg.zonecounty.enabled
 
     def _zonecounty_dbx_url(self) -> str:
-        return _env_str("SEASONAL_ZONECOUNTY_DBX_URL", "").strip()
+        return self.cfg.zonecounty.dbx_url.strip()
 
     def _zonecounty_cache_days(self) -> int:
-        return _env_int("SEASONAL_ZONECOUNTY_CACHE_DAYS", 30)
+        return self.cfg.zonecounty.cache_days
 
     def _zonecounty_dbx_path(self) -> Path:
         _, _audio, cache_dir, _logs = self._paths()
@@ -2229,8 +2189,8 @@ class Orchestrator:
 
             if updated_map is None:
                 # Discovery: scrape https://www.weather.gov/gis/ZoneCounty for bp*.dbx tokens.
-                index_url = (os.getenv("SEASONAL_ZONECOUNTY_INDEX_URL", "https://www.weather.gov/gis/ZoneCounty") or "").strip()
-                base_url = (os.getenv("SEASONAL_ZONECOUNTY_BASE_URL", "https://www.weather.gov/source/gis/Shapefiles/County/") or "").strip()
+                index_url = (self.cfg.zonecounty.index_url or "").strip()
+                base_url = (self.cfg.zonecounty.base_url or "").strip()
                 if base_url and not base_url.endswith("/"):
                     base_url += "/"
 
@@ -2289,14 +2249,14 @@ class Orchestrator:
             self._zonecounty_loaded = True
 
     def _mareas_enabled(self) -> bool:
-        return _env_bool("SEASONAL_MAREAS_ENABLED", default=True)
+        return self.cfg.mareas.enabled
 
     def _mareas_url(self) -> str:
         """Optional URL for a mareas*.txt style crosswalk."""
-        return _env_str("SEASONAL_MAREAS_URL", "").strip()
+        return self.cfg.mareas.url.strip()
 
     def _mareas_cache_days(self) -> int:
-        return _env_int("SEASONAL_MAREAS_CACHE_DAYS", 30)
+        return self.cfg.mareas.cache_days
 
     def _mareas_path(self) -> Path:
         _, _audio, cache_dir, _logs = self._paths()
@@ -2444,9 +2404,9 @@ class Orchestrator:
             return self._zone_client
 
         # Use an explicit UA for NWS (required by their policy).
-        ua = _env_str("SEASONAL_NWS_USER_AGENT", "").strip()
+        ua = (self.cfg.nws.user_agent or "").strip()
         if not ua:
-            ua = _env_str("SEASONAL_CAP_USER_AGENT", "SeasonalWeather (NWS zone mapper)").strip()
+            ua = (self.cfg.cap.user_agent or "").strip()
         if not ua:
             ua = "SeasonalWeather (NWS zone mapper)"
 
@@ -3004,32 +2964,31 @@ class Orchestrator:
 
     # ---- CAP toggles ----
     def _cap_enabled(self) -> bool:
-        return _env_bool("SEASONAL_CAP_ENABLED", default=False)
+        return self.cfg.cap.enabled
 
     def _cap_dryrun(self) -> bool:
-        return _env_bool("SEASONAL_CAP_DRYRUN", default=True)
+        return self.cfg.cap.dryrun
 
     def _cap_poll_seconds(self) -> int:
-        return _env_int("SEASONAL_CAP_POLL_SECONDS", 60)
+        return self.cfg.cap.poll_seconds
 
     def _cap_user_agent(self) -> str:
-        return _env_str("SEASONAL_CAP_USER_AGENT", "SeasonalWeather (CAP monitor)")
+        return self.cfg.cap.user_agent
 
     def _cap_url(self) -> str:
-        return _env_str("SEASONAL_CAP_URL", "")
+        return self.cfg.cap.url
 
     def _cap_full_enabled(self) -> bool:
-        return _env_bool("SEASONAL_CAP_FULL_ENABLED", default=True)
+        return self.cfg.cap.full.enabled
 
     def _cap_full_severities(self) -> set[str]:
-        raw = _env_str("SEASONAL_CAP_FULL_SEVERITIES", "Severe,Extreme")
-        return {s.strip().lower() for s in raw.split(",") if s.strip()}
+        return {s.strip().lower() for s in self.cfg.cap.full.severities if s.strip()}
 
     def _cap_full_events(self) -> set[str]:
-        raw = _env_str("SEASONAL_CAP_FULL_EVENTS", "").strip()
-        if raw:
-            return {s.strip() for s in raw.split(",") if s.strip()}
-
+        events = [e.strip() for e in self.cfg.cap.full.events if e.strip()]
+        if events:
+            return set(events)
+        # Empty list in yaml means "match all qualifying severities" — use the canonical default set
         return {
             "Tornado Warning",
             "Severe Thunderstorm Warning",
@@ -3061,59 +3020,55 @@ class Orchestrator:
         }
 
     def _cap_full_cooldown_seconds(self) -> int:
-        return _env_int("SEASONAL_CAP_FULL_COOLDOWN_SECONDS", 180)
+        return self.cfg.cap.full.cooldown_seconds
 
     def _cap_voice_enabled(self) -> bool:
-        return _env_bool("SEASONAL_CAP_VOICE_ENABLED", default=False)
+        return self.cfg.cap.voice.enabled
 
     def _cap_voice_events(self) -> set[str]:
-        raw = _env_str("SEASONAL_CAP_VOICE_EVENTS", "Special Weather Statement")
-        return {s.strip() for s in raw.split(",") if s.strip()}
+        return {e.strip() for e in self.cfg.cap.voice.events if e.strip()}
 
     def _cap_voice_cooldown_seconds(self) -> int:
-        return _env_int("SEASONAL_CAP_VOICE_COOLDOWN_SECONDS", 600)
+        return self.cfg.cap.voice.cooldown_seconds
 
     # ---- ERN/GWES SAME monitor toggles ----
     def _ern_enabled(self) -> bool:
-        return _env_bool("SEASONAL_ERN_ENABLED", default=False)
+        return self.cfg.ern.enabled
 
     def _ern_dryrun(self) -> bool:
-        return _env_bool("SEASONAL_ERN_DRYRUN", default=True)
+        return self.cfg.ern.dryrun
 
     def _ern_url(self) -> str:
-        return _env_str("SEASONAL_ERN_URL", "").strip()
+        return self.cfg.ern.url.strip()
 
     def _ern_relay_enabled(self) -> bool:
-        return _env_bool("SEASONAL_ERN_RELAY_ENABLED", default=False)
+        return self.cfg.ern.relay.enabled
 
     def _ern_relay_events(self) -> set[str]:
-        raw = _env_str("SEASONAL_ERN_RELAY_EVENTS", "RWT,RMT")
-        return {s.strip().upper() for s in raw.split(",") if s.strip()}
+        return {e.strip().upper() for e in self.cfg.ern.relay.events if e.strip()}
 
     def _ern_relay_min_confidence(self) -> float:
-        return _env_float("SEASONAL_ERN_RELAY_MIN_CONFIDENCE", 0.80)
+        return self.cfg.ern.relay.min_confidence
 
     def _ern_relay_cooldown_seconds(self) -> int:
-        return _env_int("SEASONAL_ERN_RELAY_COOLDOWN_SECONDS", 300)
+        return self.cfg.ern.relay.cooldown_seconds
 
     def _ern_relay_senders(self) -> set[str]:
-        raw = _env_str("SEASONAL_ERN_RELAY_SENDERS", "").strip()
-        if not raw:
-            return set()
-        return {s.strip().upper() for s in raw.split(",") if s.strip()}
+        senders = [s.strip().upper() for s in self.cfg.ern.relay.senders if s.strip()]
+        return set(senders)
 
     # ---- SAME toggles ----
     def _same_enabled(self) -> bool:
-        return _env_bool("SEASONAL_SAME_ENABLED", default=False)
+        return self.cfg.same.enabled
 
     def _same_sender(self) -> str:
-        return _env_str("SEASONAL_SAME_SENDER", "SEASNWXR")
+        return self.cfg.same.sender
 
     def _same_duration_minutes(self) -> int:
-        return _env_int("SEASONAL_SAME_DURATION_MINUTES", 60)
+        return self.cfg.same.duration_minutes
 
     def _same_amplitude(self) -> float:
-        return _env_float("SEASONAL_SAME_AMPLITUDE", 0.35)
+        return self.cfg.same.amplitude
 
     # ---- LIVE TIME WAV (drift killer) ----
     def _live_time_wav_path(self) -> Path:
@@ -3164,25 +3119,25 @@ class Orchestrator:
 
     # ---- RWT/RMT scheduler toggles ----
     def _tests_enabled(self) -> bool:
-        return _env_bool("SEASONAL_TESTS_ENABLED", default=False)
+        return self.cfg.tests.enabled
 
     def _tests_postpone_minutes(self) -> int:
-        return _env_int("SEASONAL_TESTS_POSTPONE_MINUTES", 15)
+        return self.cfg.tests.postpone_minutes
 
     def _tests_max_postpone_hours(self) -> int:
-        return _env_int("SEASONAL_TESTS_MAX_POSTPONE_HOURS", 6)
+        return self.cfg.tests.max_postpone_hours
 
     def _tests_jitter_seconds(self) -> int:
-        return _env_int("SEASONAL_TESTS_JITTER_SECONDS", 60)
+        return self.cfg.tests.jitter_seconds
 
     def _tests_toneout_cooldown_seconds(self) -> int:
-        return _env_int("SEASONAL_TESTS_TONEOUT_COOLDOWN_SECONDS", int(self.cfg.cycle.min_heightened_seconds))
+        return self.cfg.tests.toneout_cooldown_seconds
 
     def _tests_cap_block_seconds(self) -> int:
-        return _env_int("SEASONAL_TESTS_CAP_BLOCK_SECONDS", 3600)
+        return self.cfg.tests.cap_block_seconds
 
     def _tests_ern_block_seconds(self) -> int:
-        return _env_int("SEASONAL_TESTS_ERN_BLOCK_SECONDS", 3600)
+        return self.cfg.tests.ern_block_seconds
 
     def _tests_gate(self) -> tuple[bool, str]:
         now = dt.datetime.now(tz=self._tz)
@@ -3351,7 +3306,16 @@ class Orchestrator:
         if self.live_time_enabled:
             tasks.append(asyncio.create_task(self._live_time_loop(), name="live_time_wav"))
 
-        xmpp = NWWSClient(self.jid, self.password, self.nwws_server, self.nwws_port, self.nwws_queue)
+        xmpp = NWWSClient(
+            self.jid, self.password, self.nwws_server, self.nwws_port, self.nwws_queue,
+            room_jid=self.cfg.nwws.room,
+            nick=self.cfg.nwws.nick,
+            stall_seconds=self.cfg.nwws.resiliency.stall_seconds,
+            muc_confirm_seconds=self.cfg.nwws.resiliency.muc_confirm_seconds,
+            start_wait_seconds=self.cfg.nwws.resiliency.start_wait_seconds,
+            join_wait_seconds=self.cfg.nwws.resiliency.join_wait_seconds,
+            backoff_max_seconds=self.cfg.nwws.resiliency.backoff_max_seconds,
+        )
         tasks.append(asyncio.create_task(xmpp.run_forever(), name="nwws_xmpp"))
         tasks.append(asyncio.create_task(self._consume_nwws(), name="nwws_consumer"))
         tasks.append(asyncio.create_task(self._cycle_loop(), name="cycle_loop"))
@@ -3375,6 +3339,8 @@ class Orchestrator:
                     same_fips_allow=self.cfg.service_area.same_fips_all,
                     poll_seconds=self._cap_poll_seconds(),
                     user_agent=self._cap_user_agent(),
+                    ledger_path=self.cfg.cap.ledger_path,
+                    ledger_max_age_days=self.cfg.cap.ledger_max_age_days,
                 )
                 url = self._cap_url().strip()
                 if url:
@@ -3385,7 +3351,7 @@ class Orchestrator:
                 tasks.append(asyncio.create_task(self._consume_cap(), name="cap_consumer"))
                 log.info("CAP ingest enabled (dryrun=%s full=%s voice=%s)", self._cap_dryrun(), self._cap_full_enabled(), self._cap_voice_enabled())
         else:
-            log.info("CAP ingest disabled (set SEASONAL_CAP_ENABLED=1 to enable)")
+            log.info("CAP ingest disabled (set cap.enabled: true in config.yaml to enable)")
 
         if self._ern_enabled():
             if ErnGwesMonitor is None or ErnSameEvent is None:
@@ -3395,12 +3361,17 @@ class Orchestrator:
                 if not url:
                     log.warning("ERN enabled but SEASONAL_ERN_URL is empty; ERN is disabled.")
                 else:
-                    env_defaults = defaults_from_env() if defaults_from_env is not None else {}
+                    ern_cfg = self.cfg.ern
                     mon = ErnGwesMonitor(
                         out_queue=self.ern_queue,
                         same_fips_allow=self.cfg.service_area.same_fips_all,
                         url=url,
-                        **env_defaults,
+                        sample_rate=ern_cfg.sample_rate,
+                        dedupe_seconds=ern_cfg.dedupe_seconds,
+                        trigger_ratio=ern_cfg.trigger_ratio,
+                        tail_seconds=ern_cfg.tail_seconds,
+                        confidence_min=ern_cfg.confidence_min,
+                        name=ern_cfg.name,
                     )
                     tasks.append(asyncio.create_task(mon.run_forever(), name="ern_monitor"))
                     tasks.append(asyncio.create_task(self._consume_ern(), name="ern_consumer"))
@@ -3411,7 +3382,7 @@ class Orchestrator:
                         self._ern_relay_enabled(),
                     )
         else:
-            log.info("ERN monitor disabled (set SEASONAL_ERN_ENABLED=1 to enable)")
+            log.info("ERN monitor disabled (set ern.enabled: true in config.yaml to enable)")
 
         if self._tests_enabled():
             try:
@@ -3422,15 +3393,15 @@ class Orchestrator:
                     tz_name=self.cfg.station.timezone,
 
                     rwt_enabled=True,
-                    rwt_weekday=_env_int("SEASONAL_RWT_WEEKDAY", 2),
-                    rwt_hour=_env_int("SEASONAL_RWT_HOUR", 11),
-                    rwt_minute=_env_int("SEASONAL_RWT_MINUTE", 0),
+                    rwt_weekday=self.cfg.tests.rwt.weekday,
+                    rwt_hour=self.cfg.tests.rwt.hour,
+                    rwt_minute=self.cfg.tests.rwt.minute,
 
                     rmt_enabled=True,
-                    rmt_nth=_env_int("SEASONAL_RMT_NTH", 1),
-                    rmt_weekday=_env_int("SEASONAL_RMT_WEEKDAY", 2),
-                    rmt_hour=_env_int("SEASONAL_RMT_HOUR", 11),
-                    rmt_minute=_env_int("SEASONAL_RMT_MINUTE", 0),
+                    rmt_nth=self.cfg.tests.rmt.nth,
+                    rmt_weekday=self.cfg.tests.rmt.weekday,
+                    rmt_hour=self.cfg.tests.rmt.hour,
+                    rmt_minute=self.cfg.tests.rmt.minute,
 
                     jitter_seconds=self._tests_jitter_seconds(),
                     postpone_minutes=self._tests_postpone_minutes(),
@@ -3452,7 +3423,7 @@ class Orchestrator:
             except Exception:
                 log.exception("Failed to start RWT/RMT scheduler")
         else:
-            log.info("RWT/RMT scheduler disabled (set SEASONAL_TESTS_ENABLED=1 to enable)")
+            log.info("RWT/RMT scheduler disabled (set tests.enabled: true in config.yaml to enable)")
 
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
         for t in done:
@@ -5530,7 +5501,7 @@ class Orchestrator:
         return out
 
     def _manual_full_eas_should_heighten(self) -> bool:
-        return _env_bool("SEASONAL_MANUAL_FULL_EAS_HEIGHTENS", default=True)
+        return self.cfg.api.manual_full_eas_heightens
 
     async def _note_manual_station_feed(
         self,
@@ -5789,7 +5760,7 @@ class Orchestrator:
 
             try:
                 segs = await self.cycle_builder.build_segments(
-                    station_name=_env_str("STATION_NAME", self.cfg.station.name),
+                    station_name=self.cfg.station.name,
                     service_area_name=self.cfg.station.service_area_name,
                     disclaimer=self.cfg.station.disclaimer,
                     ctx=ctx,

@@ -264,6 +264,7 @@ class TTS:
     rate_wpm: int
     volume: float
     sample_rate: int
+    vtp_cfg: object = None  # VoiceTextPaulConfig | None
 
     def synth_to_wav(self, text: str, out_wav: Path) -> None:
         out_wav.parent.mkdir(parents=True, exist_ok=True)
@@ -360,7 +361,8 @@ class TTS:
 
             elif self.backend == "voicetext_paul":
                 from .voicetext_paul_vtml import apply_voicetext_paul_vtml
-                msg = apply_voicetext_paul_vtml(msg)
+                _vtml_on = bool(getattr(self.vtp_cfg, "vtml_lexicon", True))
+                msg = apply_voicetext_paul_vtml(msg, vtml_lexicon=_vtml_on)
 
                 # VoiceText Paul via wrapper run as voicetext (or VOICETEXT_PAUL_RUN_AS) (avoids Wine crashes + perms under seasonalweather).
                 engine_dir = Path("/home/seasonalweather-data/var-lib-seasonalweather/voices/voicetext_paul/WeatherRadioSuite-LIB/binary")
@@ -375,16 +377,16 @@ class TTS:
                 if not shutil.which("sudo"):
                     raise RuntimeError("voicetext_paul backend selected but sudo not found")
                 # Run Wine engine as a dedicated low-priv user (default: voicetext)
-                run_as = (os.getenv("VOICETEXT_PAUL_RUN_AS", "voicetext") or "voicetext").strip() or "voicetext"
+                run_as = (getattr(self.vtp_cfg, "run_as", None) or "voicetext").strip() or "voicetext"
 
 
                 out_src = engine_dir / "output.wav"
                 out_src.unlink(missing_ok=True)
 
-                retries = int(os.getenv("VOICETEXT_PAUL_RETRIES", "1") or "1")
-                retry_sleep_ms = int(os.getenv("VOICETEXT_PAUL_RETRY_SLEEP_MS", "150") or "150")
-                reset_every = int(os.getenv("VOICETEXT_PAUL_RESET_EVERY", "0") or "0")
-                kill_before = (os.getenv("VOICETEXT_PAUL_KILL_BEFORE", "0") or "0").strip().lower() in {"1","true","yes","on"}
+                retries = int(getattr(self.vtp_cfg, "retries", 1) or 1)
+                retry_sleep_ms = int(getattr(self.vtp_cfg, "retry_sleep_ms", 150) or 150)
+                reset_every = int(getattr(self.vtp_cfg, "reset_every", 0) or 0)
+                kill_before = bool(getattr(self.vtp_cfg, "kill_before", False))
 
                 calls = getattr(self, "_vt_paul_calls", 0) + 1
                 setattr(self, "_vt_paul_calls", calls)

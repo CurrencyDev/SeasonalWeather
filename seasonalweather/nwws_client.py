@@ -118,17 +118,7 @@ def _slixmpp_run_compat(xmpp, loop):
 
     # Worst-case fallback: just run the loop forever.
     return loop.run_forever()
-def _env_int(key: str, default: int) -> int:
-    try:
-        v = os.environ.get(key, "").strip()
-        return int(v) if v else default
-    except Exception:
-        return default
-
-
-def _env_str(key: str, default: str = "") -> str:
-    v = os.environ.get(key, "")
-    return v.strip() if isinstance(v, str) else default
+# _env_* helpers removed — resiliency knobs now come from constructor args.
 
 
 async def _wait_evt(evt: threading.Event, timeout: float) -> bool:
@@ -590,6 +580,11 @@ class NWWSClient:
         room_jid: str = "NWWS@conference.nwws-oi.weather.gov",
         room_password: Optional[str] = None,
         nick: str = "SeasonalWeather",
+        stall_seconds: int = 60,
+        muc_confirm_seconds: int = 30,
+        start_wait_seconds: int = 25,
+        join_wait_seconds: int = 35,
+        backoff_max_seconds: int = 90,
     ) -> None:
         self.jid = jid
         self.password = password
@@ -600,6 +595,12 @@ class NWWSClient:
         self.room_jid = room_jid
         self.room_password = room_password
         self.nick = nick
+
+        self._stall_seconds = stall_seconds
+        self._muc_confirm_seconds = muc_confirm_seconds
+        self._start_wait_seconds = start_wait_seconds
+        self._join_wait_seconds = join_wait_seconds
+        self._backoff_max_seconds = float(backoff_max_seconds)
 
         self._main_loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -762,11 +763,11 @@ class NWWSClient:
         """
         self._main_loop = asyncio.get_running_loop()
 
-        stall_seconds = _env_int("SEASONAL_NWWS_STALL_SECONDS", 60)
-        muc_confirm_seconds = _env_int("SEASONAL_NWWS_MUC_CONFIRM_SECONDS", 30)
-        start_wait_seconds = _env_int("SEASONAL_NWWS_START_WAIT_SECONDS", 25)
-        join_wait_seconds = _env_int("SEASONAL_NWWS_JOIN_WAIT_SECONDS", 35)
-        max_backoff = float(_env_int("SEASONAL_NWWS_BACKOFF_MAX_SECONDS", 90))
+        stall_seconds = self._stall_seconds
+        muc_confirm_seconds = self._muc_confirm_seconds
+        start_wait_seconds = self._start_wait_seconds
+        join_wait_seconds = self._join_wait_seconds
+        max_backoff = self._backoff_max_seconds
 
         backoff = 2.0
 

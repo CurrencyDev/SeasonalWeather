@@ -89,19 +89,7 @@ _STATE_FIPS_TO_ABBR: dict[str, str] = {
 }
 
 
-def _env_int(key: str, default: int) -> int:
-    v = os.environ.get(key, "").strip()
-    if not v:
-        return default
-    try:
-        return int(v)
-    except Exception:
-        return default
-
-
-def _env_str(key: str, default: str) -> str:
-    v = os.environ.get(key)
-    return v.strip() if v else default
+# _env_* helpers removed — ledger config now comes from constructor args.
 
 
 def _norm_same(s: str) -> str | None:
@@ -209,6 +197,8 @@ class NwsCapPoller:
         poll_seconds: int = 60,
         user_agent: str = "SeasonalWeather (CAP monitor)",
         url: str | None = None,
+        ledger_path: str = "/var/lib/seasonalweather/cap_ledger.json",
+        ledger_max_age_days: int = 14,
     ) -> None:
         self.out_queue = out_queue
         self.poll_seconds = max(15, int(poll_seconds))
@@ -232,8 +222,6 @@ class NwsCapPoller:
         self._seen_keys: set[str] = set()
 
         # Persistent dedupe (prevents restart spam)
-        ledger_path = _env_str("SEASONAL_CAP_LEDGER_PATH", "/var/lib/seasonalweather/cap_ledger.json")
-        ledger_max_age_days = _env_int("SEASONAL_CAP_LEDGER_MAX_AGE_DAYS", 14)
         self._ledger = CapLedger(path=Path(ledger_path), max_age_days=ledger_max_age_days)
 
         self._client = httpx.AsyncClient(

@@ -8,9 +8,7 @@ from typing import Callable, Pattern
 # Split text vs tags so we never “rewrite inside markup”.
 _TAG_SPLIT_RE = re.compile(r"(<[^>]+>)")
 
-def _env_enabled() -> bool:
-    v = (os.getenv("VOICETEXT_PAUL_VTML_LEXICON", "1") or "1").strip().lower()
-    return v not in {"0", "false", "no", "off"}
+# _env_enabled() removed — vtml_lexicon is now passed as a function argument.
 
 @dataclass(frozen=True)
 class Rule:
@@ -99,6 +97,8 @@ _RULES: list[Rule] = [
     Rule(re.compile(r"(\d+(?:\.\d+)?)\s*(mi\.)\b", re.IGNORECASE), lambda m: f'{m.group(1)} <vtml_sub alias="miles">{m.group(2)}</vtml_sub>'),
 
     # --- A few NWS-ish abbreviations that show up in headers/closures ---
+    # NOAA: VoiceText Paul reads it as "N-O-A-A" letters without this rule.
+    Rule(re.compile(r"\bNOAA\b"), _sub_alias("noah")),
     Rule(re.compile(r"\bNWS\b"), _sub_alias("National Weather Service")),
     Rule(re.compile(r"\bTSTM\b", re.IGNORECASE), _sub_alias("thunderstorm")),
     Rule(re.compile(r"\bTSTMS\b", re.IGNORECASE), _sub_alias("thunderstorms")),
@@ -114,14 +114,16 @@ _RULES: list[Rule] = [
     Rule(re.compile(r"\bLIFR\b"), _sub_alias("L I F R")),
 ]
 
-def apply_voicetext_paul_vtml(text: str) -> str:
+def apply_voicetext_paul_vtml(text: str, vtml_lexicon: bool = True) -> str:
     """
     Apply small, meteorology-focused VTML tweaks.
     - Does NOT touch existing <...> tags.
     - No newlines are introduced (your wrapper still flattens anyway).
+    - vtml_lexicon: set False to skip all substitutions (pass from cfg.tts.voicetext_paul.vtml_lexicon).
     """
-    if not text or not _env_enabled():
+    if not text or not vtml_lexicon:
         return text or ""
+
 
     parts = _TAG_SPLIT_RE.split(text)
     for i in range(0, len(parts), 2):  # even indexes = plain text between tags
