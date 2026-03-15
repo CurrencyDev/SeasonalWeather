@@ -8,7 +8,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 1
 fi
 
-SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}]")/.." && pwd)"
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 log()  { echo "[+] $*"; }
 warn() { echo "[!] $*" >&2; }
