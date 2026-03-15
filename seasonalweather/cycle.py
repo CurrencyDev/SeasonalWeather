@@ -1041,16 +1041,32 @@ class CycleBuilder:
                     if not val:
                         continue
 
+                    # Temperature high/low from gridpoint forecast.
+                    # The gridpoint endpoint already returns Fahrenheit for CONUS —
+                    # no conversion needed (unlike observations, which return Celsius).
+                    # NOTE: no trailing period here — the group joiner (". ".join + ".")
+                    # owns all sentence-boundary punctuation. A trailing period in the
+                    # entry produces a double period ("degrees.. Tonight") which Paul
+                    # skips right over without pausing.
+                    temp_raw = p.get("temperature")
+                    is_day = bool(p.get("isDaytime", True))
+                    temp_phrase = ""
+                    if isinstance(temp_raw, (int, float)):
+                        temp_rounded = round(temp_raw)
+                        temp_phrase = (
+                            f" With a high near {temp_rounded} degrees"
+                            if is_day
+                            else f" With a low around {temp_rounded} degrees"
+                        )
+
                     # DECTalk pacing: kill em-dash and collapse odd whitespace
                     name = name.replace("—", "-")
                     val = val.replace("—", "-")
                     name = _SPACE_RE.sub(" ", name).strip()
                     val = _SPACE_RE.sub(" ", val).strip()
 
-                    if name:
-                        entries.append(f"{name}: {val}")
-                    else:
-                        entries.append(val)
+                    entry = f"{name}: {val}{temp_phrase}" if name else f"{val}{temp_phrase}"
+                    entries.append(entry.strip())
 
                 if not entries:
                     continue
