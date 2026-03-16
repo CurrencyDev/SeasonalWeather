@@ -1581,6 +1581,81 @@ class Orchestrator:
         blob = code_u + "|" + ",".join(locs_norm)
         return f"FUNC_FULL:{code_u}:{self._sha1_12(blob)}"
 
+
+    def _nwws_api_product_matches_raw(self, parsed: ParsedProduct, api_text: str) -> bool:
+        """
+        Accept an api.weather.gov product override only when it appears to be the
+        same issuance as the NWWS payload we already received.
+
+        This protects against the API returning an older "latest" product for the
+        same product type/location, which can otherwise cause stale VTEC, stale
+        expiries, and incorrect cross-source dedupe decisions.
+        """
+        if not api_text or not api_text.strip():
+            return False
+
+        api_parsed = parse_product_text(api_text)
+        if api_parsed:
+            raw_awips = (parsed.awips_id or "").strip().upper()
+            api_awips = (api_parsed.awips_id or "").strip().upper()
+            if raw_awips and api_awips and raw_awips != api_awips:
+                return False
+
+            raw_wfo = (parsed.wfo or "").strip().upper()
+            api_wfo = (api_parsed.wfo or "").strip().upper()
+            if raw_wfo and api_wfo and raw_wfo != api_wfo:
+                return False
+
+        raw_vtec = self._extract_vtec(parsed.raw_text or "")
+        api_vtec = self._extract_vtec(api_text)
+        raw_tracks = {track for (track, _act) in self._vtec_tracks(raw_vtec)}
+        api_tracks = {track for (track, _act) in self._vtec_tracks(api_vtec)}
+
+        # If NWWS already gave us a concrete VTEC track, the API override must
+        # agree on the same track. Different ETN == different alert == reject.
+        if raw_tracks:
+            return bool(api_tracks) and bool(raw_tracks & api_tracks)
+
+        # No VTEC in raw payload: fall back to AWIPS/WFO agreement only.
+        return True
+
+    async def _resolve_nwws_official_text(self, parsed: ParsedProduct) -> tuple[str, str | None]:
+        """
+        Prefer the live NWWS payload unless the API product can be validated as the
+        same issuance. This avoids stale-product regressions during active events.
+        """
+        official_text = parsed.raw_text or ""
+        pid: str | None = None
+        try:
+            pid = await self.api.latest_product_id(
+                parsed.product_type,
+                parsed.wfo[1:] if parsed.wfo.startswith("K") else parsed.wfo,
+            )
+            if not pid:
+                pid = await self.api.latest_product_id(parsed.product_type, parsed.wfo.replace("K", "", 1))
+            if pid:
+                prod = await self.api.get_product(pid)
+                if prod and prod.product_text:
+                    if self._nwws_api_product_matches_raw(parsed, prod.product_text):
+                        official_text = prod.product_text
+                    else:
+                        api_vtec = ",".join(self._extract_vtec(prod.product_text)[:2])
+                        raw_vtec = ",".join(self._extract_vtec(parsed.raw_text or "")[:2])
+                        log.warning(
+                            "NWWS API override rejected (stale/mismatched product): type=%s awips=%s wfo=%s pid=%s raw_vtec=%s api_vtec=%s",
+                            parsed.product_type,
+                            parsed.awips_id or "",
+                            parsed.wfo,
+                            pid,
+                            raw_vtec,
+                            api_vtec,
+                        )
+                        pid = None
+        except Exception:
+            log.exception('NWWS official-text resolution failed; falling back to raw payload')
+            pid = None
+        return official_text, pid
+
     def _extract_vtec(self, text: str) -> list[str]:
         if not text:
             return []
@@ -3813,10 +3888,13 @@ class Orchestrator:
         for v in vtec:
             keys.append(f"VTEC:{v}")
 
-        # Functional FULL dedupe shared with ERN (VTEC-independent)
-        fkey = self._dedupe_func_full_key(same_code, same_locs)
-        if fkey:
-            keys.append(fkey)
+        # Functional FULL dedupe is only safe when we do NOT have a concrete
+        # VTEC track.  Otherwise, two distinct warnings for the same counties can
+        # collide (for example TO.W.0004 vs TO.W.0005).
+        if not tracks:
+            fkey = self._dedupe_func_full_key(same_code, same_locs)
+            if fkey:
+                keys.append(fkey)
 
         fips_part = ",".join(sorted(set(str(x).strip() for x in (same_locs or []) if str(x).strip())))[:800]
         keys.append(f"CAPFULL:{(ev.event or '').strip()}:{(ev.sent or '').strip()}:{self._sha1_12((ev.alert_id or '') + '|' + fips_part)}")
@@ -4989,20 +5067,7 @@ class Orchestrator:
     async def _handle_toneout(self, parsed: ParsedProduct) -> None:
         log.info("NWWS toneout candidate: type=%s awips=%s wfo=%s", parsed.product_type, parsed.awips_id or "", parsed.wfo)
 
-        official_text = parsed.raw_text
-        try:
-            pid = await self.api.latest_product_id(
-                parsed.product_type,
-                parsed.wfo[1:] if parsed.wfo.startswith("K") else parsed.wfo,
-            )
-            if not pid:
-                pid = await self.api.latest_product_id(parsed.product_type, parsed.wfo.replace("K", "", 1))
-            if pid:
-                prod = await self.api.get_product(pid)
-                if prod and prod.product_text:
-                    official_text = prod.product_text
-        except Exception:
-            pass
+        official_text, pid = await self._resolve_nwws_official_text(parsed)
 
         # --- NEW: derive SAME targeting from UGC zones (NWWS-only) ---
         zones, in_area_same, src, mapped_ok = await self._nwws_same_targets_from_texts(parsed.raw_text or "", official_text or "")
@@ -5078,8 +5143,10 @@ class Orchestrator:
         for v in vtec:
             keys.append(f"VTEC:{v}")
 
-        # Functional FULL dedupe shared with ERN (VTEC-independent)
-        if should_full:
+        # Functional FULL dedupe is only safe when we do NOT have a concrete
+        # VTEC track.  Otherwise, distinct warnings for the same SAME footprint
+        # can suppress each other.
+        if should_full and not tracks:
             fkey2 = self._dedupe_func_full_key(parsed.product_type, in_area_same)
             if fkey2:
                 keys.append(fkey2)
