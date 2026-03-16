@@ -1226,6 +1226,11 @@ class Orchestrator:
         # Debounced cycle refill task (prevents rebuild spam on bursts of CAP voice cut-ins)
         self._cycle_refill_task: asyncio.Task | None = None
 
+        # Duration (seconds) of the last fully-built cycle audio train.
+        # Used by _cycle_loop to schedule the next rebuild based on actual audio length
+        # rather than the fixed scheduling interval, preventing mid-broadcast chops.
+        self._last_cycle_seq_dur: float = 0.0
+
         # Live time WAV (drift killer)
         self.live_time_enabled = cfg.live_time.enabled
         self.live_time_interval_seconds = cfg.live_time.interval_seconds
@@ -5820,6 +5825,9 @@ class Orchestrator:
                 if seq_dur <= 1.0:
                     seq_dur = float(max(10, interval))
 
+                # Persist so _cycle_loop can base its next-regen sleep on actual audio length.
+                self._last_cycle_seq_dur = seq_dur
+
                 try:
                     self.telnet.flush_cycle()
                 except Exception:
@@ -5863,7 +5871,21 @@ class Orchestrator:
                     log.info("AlertTracker: purged %d expired entry/entries", n)
             except Exception:
                 pass
-            await asyncio.sleep(max(30, interval))
+
+            # Sleep until (seq_dur - lead_time) so the next rebuild fires with enough
+            # headroom for fetch + synth before the current audio train runs out.
+            # Falls back to the configured interval if seq_dur wasn't captured yet.
+            _lead = int(self.cfg.cycle.lead_time_seconds)
+            _seq = self._last_cycle_seq_dur
+            if _seq > 0:
+                _sleep = max(30, _seq - _lead)
+            else:
+                _sleep = max(30, interval)
+            log.debug(
+                "Cycle loop sleeping %.1fs (seq_dur=%.1fs lead=%ds interval=%ds mode=%s)",
+                _sleep, _seq, _lead, interval, self.mode,
+            )
+            await asyncio.sleep(_sleep)
 
 
 def main(argv: list[str] | None = None) -> int:

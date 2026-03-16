@@ -130,6 +130,7 @@ class CycleConfig:
     normal_interval_seconds: int
     heightened_interval_seconds: int
     min_heightened_seconds: int
+    lead_time_seconds: int
     reference_points: List[Tuple[float, float, str]]
     last_product_max_chars: int
     spc: CycleSpcConfig
@@ -526,6 +527,7 @@ def load_config(path: str) -> AppConfig:
         normal_interval_seconds=int(cy["normal_interval_seconds"]),
         heightened_interval_seconds=int(cy["heightened_interval_seconds"]),
         min_heightened_seconds=int(cy["min_heightened_seconds"]),
+        lead_time_seconds=int(cy.get("lead_time_seconds", 90)),
         reference_points=[
             (float(a), float(b), str(lbl))
             for a, b, lbl in cy["reference_points"]
