@@ -95,6 +95,7 @@ _RULES: list[Rule] = [
     Rule(re.compile(r"(\d+(?:\.\d+)?)\s*(in\.)\b", re.IGNORECASE), lambda m: f'{m.group(1)} <vtml_sub alias="inches">{m.group(2)}</vtml_sub>'),
     Rule(re.compile(r"(\d+(?:\.\d+)?)\s*(ft\.)\b", re.IGNORECASE), lambda m: f'{m.group(1)} <vtml_sub alias="feet">{m.group(2)}</vtml_sub>'),
     Rule(re.compile(r"(\d+(?:\.\d+)?)\s*(mi\.)\b", re.IGNORECASE), lambda m: f'{m.group(1)} <vtml_sub alias="miles">{m.group(2)}</vtml_sub>'),
+    Rule(re.compile(r"(\d+(?:\.\d+)?)\s*(nm\.)\b", re.IGNORECASE), lambda m: f'{m.group(1)} <vtml_sub alias="nautical miles">{m.group(2)}</vtml_sub>'),
 
     # --- A few NWS-ish abbreviations that show up in headers/closures ---
     # NOAA: VoiceText Paul reads it as "N-O-A-A" letters without this rule.
