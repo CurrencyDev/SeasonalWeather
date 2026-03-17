@@ -305,6 +305,9 @@ station_feed:
     grace_sec: 5
     keep_unparseable: true     # keep entries that failed to parse rather than discarding
     housekeep_seconds: 30
+  nwws:
+    vtec_event_labels: {}      # optional StationFeed display overrides, e.g. {"WW.Y": "Winter Weather Advisory"}
+    tz_abbrev_overrides: {}    # optional timezone overrides/extensions, e.g. {"CHST": "+10:00"}
 
 # Alert rebroadcast (re-issue active alerts on the cycle)
 rebroadcast:

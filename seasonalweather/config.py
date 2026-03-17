@@ -321,6 +321,12 @@ class StationFeedHousekeepingConfig:
 
 
 @dataclass(frozen=True)
+class StationFeedNwwsConfig:
+    vtec_event_labels: dict[str, str]
+    tz_abbrev_overrides: dict[str, str]
+
+
+@dataclass(frozen=True)
 class StationFeedConfig:
     enabled: bool
     path: str
@@ -333,6 +339,7 @@ class StationFeedConfig:
     debug: bool
     ern_area_names: bool
     housekeeping: StationFeedHousekeepingConfig
+    nwws: StationFeedNwwsConfig
 
 
 # --- rebroadcast ---
@@ -743,6 +750,26 @@ def load_config(path: str) -> AppConfig:
     # ------------------------------------------------------------------
     sf_raw = raw.get("station_feed", {})
     sf_hk_raw = sf_raw.get("housekeeping", {})
+    sf_nwws_raw = sf_raw.get("nwws", {}) if isinstance(sf_raw.get("nwws", {}), dict) else {}
+
+    sf_nwws_labels_raw = sf_nwws_raw.get("vtec_event_labels", {})
+    if not isinstance(sf_nwws_labels_raw, dict):
+        sf_nwws_labels_raw = {}
+    sf_nwws_labels = {
+        str(k).strip().upper(): str(v).strip()
+        for k, v in sf_nwws_labels_raw.items()
+        if str(k).strip() and str(v).strip()
+    }
+
+    sf_nwws_tz_raw = sf_nwws_raw.get("tz_abbrev_overrides", {})
+    if not isinstance(sf_nwws_tz_raw, dict):
+        sf_nwws_tz_raw = {}
+    sf_nwws_tz = {
+        str(k).strip().upper(): str(v).strip()
+        for k, v in sf_nwws_tz_raw.items()
+        if str(k).strip() and str(v).strip()
+    }
+
     station_feed = StationFeedConfig(
         enabled=bool(sf_raw.get("enabled", False)),
         path=str(sf_raw.get("path", "/srv/seasonalweather/api/station/handled-alerts.json")),
@@ -760,6 +787,10 @@ def load_config(path: str) -> AppConfig:
             grace_sec=int(sf_hk_raw.get("grace_sec", 5)),
             keep_unparseable=bool(sf_hk_raw.get("keep_unparseable", True)),
             housekeep_seconds=int(sf_hk_raw.get("housekeep_seconds", 30)),
+        ),
+        nwws=StationFeedNwwsConfig(
+            vtec_event_labels=sf_nwws_labels,
+            tz_abbrev_overrides=sf_nwws_tz,
         ),
     )
 

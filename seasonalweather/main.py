@@ -39,7 +39,7 @@ _APP_CFG: "AppConfig | None" = None
 from .nws_api import NWSApi
 from .nwws_client import NWWSClient
 from .product import parse_product_text, ParsedProduct
-from .alert_builder import build_spoken_alert
+from .alert_builder import build_spoken_alert, strip_nws_product_headers
 from .tts import TTS
 from .audio import write_sine_wav, write_silence_wav, concat_wavs, wav_duration_seconds
 from .liquidsoap_telnet import LiquidsoapTelnet
@@ -348,6 +348,266 @@ def _sf_make_eas_headline(*, org, event_text, area_text, start_utc, end_utc, sen
         f"Message from {sender}."
     )
 
+
+
+_DEFAULT_SF_NWWS_VTEC_EVENT_LABELS: dict[str, str] = {
+    "TO.W": "Tornado Warning",
+    "TO.A": "Tornado Watch",
+    "SV.W": "Severe Thunderstorm Warning",
+    "SV.A": "Severe Thunderstorm Watch",
+    "FF.W": "Flash Flood Warning",
+    "FF.A": "Flash Flood Watch",
+    "FA.Y": "Flood Advisory",
+    "FA.W": "Flood Warning",
+    "FA.A": "Flood Watch",
+    "FL.Y": "Flood Advisory",
+    "FL.W": "Flood Warning",
+    "FL.A": "Flood Watch",
+    "CF.Y": "Coastal Flood Advisory",
+    "CF.W": "Coastal Flood Warning",
+    "CF.A": "Coastal Flood Watch",
+    "HU.W": "Hurricane Warning",
+    "HU.A": "Hurricane Watch",
+    "TR.W": "Tropical Storm Warning",
+    "TR.A": "Tropical Storm Watch",
+    "BZ.W": "Blizzard Warning",
+    "BZ.A": "Blizzard Watch",
+    "IS.W": "Ice Storm Warning",
+    "HW.W": "High Wind Warning",
+    "HW.A": "High Wind Watch",
+    "WI.Y": "Wind Advisory",
+    "EH.W": "Excessive Heat Warning",
+    "EH.A": "Excessive Heat Watch",
+    "HT.Y": "Heat Advisory",
+    "FR.Y": "Frost Advisory",
+    "HZ.W": "Hard Freeze Warning",
+    "HZ.A": "Hard Freeze Watch",
+    "FW.W": "Red Flag Warning",
+    "LE.W": "Lake Effect Snow Warning",
+    "LE.A": "Lake Effect Snow Watch",
+    "LE.Y": "Lake Effect Snow Advisory",
+    "WS.W": "Winter Storm Warning",
+    "WS.A": "Winter Storm Watch",
+    "WW.Y": "Winter Weather Advisory",
+}
+
+_DEFAULT_SF_NWWS_TZ_OFFSETS: dict[str, dt.tzinfo] = {
+    "UTC": dt.timezone.utc,
+    "GMT": dt.timezone.utc,
+    "EST": dt.timezone(dt.timedelta(hours=-5)),
+    "EDT": dt.timezone(dt.timedelta(hours=-4)),
+    "CST": dt.timezone(dt.timedelta(hours=-6)),
+    "CDT": dt.timezone(dt.timedelta(hours=-5)),
+    "MST": dt.timezone(dt.timedelta(hours=-7)),
+    "MDT": dt.timezone(dt.timedelta(hours=-6)),
+    "PST": dt.timezone(dt.timedelta(hours=-8)),
+    "PDT": dt.timezone(dt.timedelta(hours=-7)),
+    "AKST": dt.timezone(dt.timedelta(hours=-9)),
+    "AKDT": dt.timezone(dt.timedelta(hours=-8)),
+    "HST": dt.timezone(dt.timedelta(hours=-10)),
+    "AST": dt.timezone(dt.timedelta(hours=-4)),
+    "ADT": dt.timezone(dt.timedelta(hours=-3)),
+}
+
+
+def _sf_nwws_tzinfo_from_override(value):
+    if value is None:
+        return None
+    if isinstance(value, dt.tzinfo):
+        return value
+    s = str(value).strip()
+    if not s:
+        return None
+    su = s.upper()
+    if su in {"UTC", "GMT", "Z"}:
+        return dt.timezone.utc
+    m = re.fullmatch(r"([+-])(\d{1,2}):(\d{2})", s)
+    if m:
+        sign = 1 if m.group(1) == "+" else -1
+        hours = int(m.group(2))
+        minutes = int(m.group(3))
+        return dt.timezone(sign * dt.timedelta(hours=hours, minutes=minutes))
+    if re.fullmatch(r"[+-]?\d+", s):
+        try:
+            mins = int(s)
+            return dt.timezone(dt.timedelta(minutes=mins))
+        except Exception:
+            return None
+    return None
+
+
+def _sf_nwws_tz_offsets() -> dict[str, dt.tzinfo]:
+    out = dict(_DEFAULT_SF_NWWS_TZ_OFFSETS)
+    try:
+        cfg = getattr(getattr(_APP_CFG, "station_feed", None), "nwws", None)
+        overrides = getattr(cfg, "tz_abbrev_overrides", {}) if cfg is not None else {}
+        if isinstance(overrides, dict):
+            for raw_key, raw_val in overrides.items():
+                key = str(raw_key or "").strip().upper()
+                if not key:
+                    continue
+                tzinfo = _sf_nwws_tzinfo_from_override(raw_val)
+                if tzinfo is not None:
+                    out[key] = tzinfo
+    except Exception:
+        pass
+    return out
+
+
+def _sf_nwws_vtec_event_labels() -> dict[str, str]:
+    out = dict(_DEFAULT_SF_NWWS_VTEC_EVENT_LABELS)
+    try:
+        cfg = getattr(getattr(_APP_CFG, "station_feed", None), "nwws", None)
+        overrides = getattr(cfg, "vtec_event_labels", {}) if cfg is not None else {}
+        if isinstance(overrides, dict):
+            for raw_key, raw_val in overrides.items():
+                key = str(raw_key or "").strip().upper()
+                val = str(raw_val or "").strip()
+                if key and val:
+                    out[key] = val
+    except Exception:
+        pass
+    return out
+
+
+def _sf_nwws_titlecase_event(text: str) -> str:
+    s = re.sub(r"\s+", " ", str(text or "")).strip(" .")
+    if not s:
+        return ""
+    if s.upper() == s:
+        s = s.title().replace("Nws", "NWS")
+    return s
+
+
+def _sf_nwws_parse_header_issued_dt(text: str):
+    tz_map = _sf_nwws_tz_offsets()
+    for ln in (text or "").splitlines()[:120]:
+        s = (ln or "").strip()
+        m = _NWS_HEADER_ISSUED_RE.match(s)
+        if not m:
+            continue
+        hhmm = m.group("hhmm")
+        if len(hhmm) == 3:
+            hour = int(hhmm[0]); minute = int(hhmm[1:])
+        else:
+            hour = int(hhmm[:2]); minute = int(hhmm[2:])
+        ampm = m.group("ampm").upper()
+        if ampm == "AM":
+            hour = 0 if hour == 12 else hour
+        else:
+            hour = 12 if hour == 12 else hour + 12
+        month = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,"JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}.get(m.group("mon").strip().upper())
+        tzinfo = tz_map.get(m.group("tz").strip().upper())
+        if month is None or tzinfo is None:
+            continue
+        try:
+            return dt.datetime(int(m.group("year")), month, int(m.group("day")), hour, minute, tzinfo=tzinfo)
+        except Exception:
+            continue
+    return None
+
+
+def _sf_nwws_best_issued_dt(parsed, official_text: str):
+    issued = _sf_parse_dt(getattr(parsed, "issued", None))
+    if issued is not None:
+        if issued.tzinfo is None:
+            issued = issued.replace(tzinfo=dt.timezone.utc)
+        return issued
+    return _sf_nwws_parse_header_issued_dt(official_text)
+
+
+def _sf_nwws_extract_issuer(text: str, fallback_wfo: str = "") -> str:
+    for ln in (text or "").splitlines()[:80]:
+        s = re.sub(r"\s+", " ", (ln or "").strip())
+        if s.lower().startswith("national weather service "):
+            return "NWS " + s[len("National Weather Service "):].strip()
+    f = (fallback_wfo or "").strip()
+    return f"NWS {f}".strip() if f else "NWS"
+
+
+def _sf_nwws_event_from_text(text: str) -> str:
+    for ln in (strip_nws_product_headers(text or "") or "").splitlines()[:80]:
+        s = re.sub(r"\s+", " ", (ln or "").strip())
+        if not s:
+            continue
+        m = re.match(r"^\.\.\.(?P<ev>.+?)(?:\s+(?:NOW\s+)?IN EFFECT.*)?\.\.\.$", s, flags=re.IGNORECASE)
+        if m:
+            ev = _sf_nwws_titlecase_event(m.group("ev"))
+            if re.search(r"\b(?:warning|watch|advisory|statement|emergency|message)\b", ev, flags=re.IGNORECASE):
+                return ev
+        if re.search(r"\b(?:warning|watch|advisory|statement|emergency|message)\b$", s, flags=re.IGNORECASE):
+            return _sf_nwws_titlecase_event(s)
+    return ""
+
+
+def _sf_nwws_event_label(prod_type: str, *, vtec_list=None, text: str = "") -> str:
+    label_map = _sf_nwws_vtec_event_labels()
+    for raw in (vtec_list or []):
+        m = _VTEC_PARSE_RE.search(str(raw or ""))
+        if not m:
+            continue
+        label = label_map.get(f"{m.group('phen')}.{m.group('sig')}")
+        if label:
+            return label
+    text_label = _sf_nwws_event_from_text(text)
+    if text_label:
+        return text_label
+    return _sf_eas_event_label_full(prod_type)
+
+
+def _sf_nwws_area_from_text(text: str) -> str:
+    lines = [re.sub(r"\s+", " ", (ln or "").strip()) for ln in (strip_nws_product_headers(text or "") or "").splitlines()]
+    lines = [ln for ln in lines if ln]
+    for i, ln in enumerate(lines):
+        if re.match(r"^\*\s*WHERE\.\.\.", ln, flags=re.IGNORECASE):
+            parts = [re.sub(r"^\*\s*WHERE\.\.\.\s*", "", ln, flags=re.IGNORECASE).strip()]
+            j = i + 1
+            while j < len(lines):
+                nxt = lines[j]
+                if re.match(r"^\*\s*[A-Z][A-Z /-]*\.\.\.", nxt) or nxt.startswith("*"):
+                    break
+                parts.append(nxt.strip())
+                j += 1
+            out = re.sub(r"\s+", " ", " ".join(p for p in parts if p)).strip(" .")
+            if out:
+                return out
+    for i, ln in enumerate(lines):
+        if re.match(r"^\*\s+.+?\s+for\.\.\.$", ln, flags=re.IGNORECASE):
+            parts = []
+            j = i + 1
+            while j < len(lines):
+                nxt = lines[j]
+                if nxt.startswith("*") or re.match(r"^(At|HAZARD\.\.\.|SOURCE\.\.\.|IMPACT\.\.\.|TORNADO\.|MAX )", nxt, flags=re.IGNORECASE):
+                    break
+                parts.append(nxt.strip(" ."))
+                j += 1
+            out = re.sub(r"\s+", " ", " ".join(p for p in parts if p)).strip(" .")
+            if out:
+                return out
+    return ""
+
+
+def _sf_fmt_issued_until(issued_dt, end_dt, issuer: str) -> str:
+    bits = []
+    if issued_dt is not None:
+        try:
+            bits.append(issued_dt.astimezone().strftime("issued %B %-d at %-I:%M%p %Z"))
+        except Exception:
+            bits.append(f"issued {_sf_iso(issued_dt)}")
+    if end_dt is not None:
+        try:
+            bits.append(end_dt.astimezone().strftime("until %B %-d at %-I:%M%p %Z"))
+        except Exception:
+            bits.append(f"until {_sf_iso(end_dt)}")
+    if issuer:
+        bits.append(f"by {issuer}")
+    return " ".join(bits).strip()
+
+
+def _sf_nwws_make_headline(event_text: str, *, issued_dt=None, end_dt=None, issuer: str = "") -> str:
+    ev = str(event_text or "Alert").strip() or "Alert"
+    suffix = _sf_fmt_issued_until(issued_dt, end_dt, issuer)
+    return f"{ev} {suffix}".strip() if suffix else ev
 
 
 ### STATION_FEED_EAS_LABELS_FULL_PATCH ###
@@ -1016,27 +1276,45 @@ def _station_feed_note_ern(ev, *, same_locations, out_wav: str) -> None:
         log.exception("Station feed: failed to note ERN relay")
 
 
-def _station_feed_note_nwws(parsed, *, mode: str, same_locations, out_wav: str, product_id=None, expires_at=None) -> None:
+def _station_feed_note_nwws(
+    parsed,
+    *,
+    mode: str,
+    same_locations,
+    out_wav: str,
+    product_id=None,
+    expires_at=None,
+    vtec=None,
+    official_text=None,
+    issued_at=None,
+    event_text=None,
+    headline=None,
+    area_text=None,
+) -> None:
     if not _sf_enabled():
         return
     try:
         awips = getattr(parsed, "awips_id", None) or getattr(parsed, "awips", None) or ""
         wfo = getattr(parsed, "wfo", None) or ""
         prod_type = getattr(parsed, "product_type", None) or "NWWS"
-        issued = getattr(parsed, "issued", None)
-        raw_vtec = _extract_vtec(getattr(parsed, "raw_text", "") or "")
+        base_text = str(official_text or getattr(parsed, "raw_text", "") or "")
+        raw_vtec = [str(x) for x in (vtec or []) if str(x).strip()]
+        if not raw_vtec and base_text:
+            raw_vtec = _VTEC_FIND_RE.findall(base_text)
         vtec_tracks = _sf_vtec_track_ids(raw_vtec)
         vtec_actions = {act for (_track, act) in _vtec_tracks(raw_vtec)} if raw_vtec else set()
         if vtec_actions & {"CAN", "EXP"}:
             _sf_remove_by_vtec_tracks(vtec_tracks)
             return
-        key = f"nwws:{prod_type}:{awips}:{wfo}:{issued}"
-        alert_id = vtec_tracks[0] if vtec_tracks else _sf_sha1_12(key)
 
-        headline = f"{prod_type} {awips}".strip()
+        key = f"nwws:{prod_type}:{awips}:{wfo}:{issued_at or getattr(parsed, 'issued', None)}"
+        alert_id = vtec_tracks[0] if vtec_tracks else _sf_sha1_12(key)
         sender = FeedSender(name="NWWS-OI", kind="relay") if FeedSender else None
 
-        # Prefer upstream computed expiry (exp_utc) if provided, then fall back to parsed fields.
+        issued_dt = _sf_parse_dt(issued_at) if issued_at is not None else _sf_nwws_best_issued_dt(parsed, base_text)
+        if issued_dt is not None and issued_dt.tzinfo is None:
+            issued_dt = issued_dt.replace(tzinfo=dt.timezone.utc)
+
         end_raw = (
             expires_at
             or getattr(parsed, "expires", None)
@@ -1045,37 +1323,38 @@ def _station_feed_note_nwws(parsed, *, mode: str, same_locations, out_wav: str, 
             or getattr(parsed, "end_time", None)
             or getattr(parsed, "valid_until", None)
         )
+        if not end_raw and issued_dt is not None:
+            end_raw = issued_dt + dt.timedelta(hours=6)
+        end_dt = _sf_parse_dt(end_raw)
 
-        # Final safety fallback so NWWS items still prune if upstream didn't provide an end
-        if not end_raw:
-            try:
-                issued_dt = _sf_parse_dt(issued) if issued else None
-            except Exception:
-                issued_dt = None
-            if issued_dt is not None:
-                end_raw = issued_dt + dt.timedelta(hours=6)
+        event_display = str(event_text or _sf_nwws_event_label(prod_type, vtec_list=raw_vtec, text=base_text)).strip()
+        issuer = _sf_nwws_extract_issuer(base_text, fallback_wfo=wfo)
+        headline_display = str(headline or _sf_nwws_make_headline(event_display, issued_dt=issued_dt, end_dt=end_dt, issuer=issuer)).strip()
+        area_display = str(area_text or "").strip() or _sf_nwws_area_from_text(base_text) or str(wfo)
 
         links = {"mode": mode, "wav": out_wav}
         if product_id:
             links["nws"] = f"https://api.weather.gov/products/{product_id}"
+        if raw_vtec:
+            links["vtec"] = raw_vtec
 
         alert = StationFeedAlert(
             id=str(alert_id),
-            event=str(prod_type),
-            headline=headline,
+            event=event_display,
+            headline=headline_display,
             severity="Unknown",
             urgency="Unknown",
             certainty="Unknown",
-            area=str(wfo),
-            effective=_sf_iso(issued),
-            ends=_sf_iso(end_raw),
-            expires=_sf_iso(end_raw),
-            sent=_sf_iso(issued),
+            area=str(area_display),
+            effective=_sf_iso(issued_dt),
+            ends=_sf_iso(end_dt or end_raw),
+            expires=_sf_iso(end_dt or end_raw),
+            sent=_sf_iso(issued_dt),
             sameCodes=[str(x) for x in (same_locations or [])],
             from_=sender,
             links=links,
         )
-        _sf_emit(alert, expires_at=end_raw)
+        _sf_emit(alert, expires_at=(end_dt or end_raw))
     except Exception:
         log.exception("Station feed: failed to note NWWS toneout")
 
@@ -1486,12 +1765,25 @@ class Orchestrator:
                     if area:
                         break
 
+            script_text = str(item.get("script_text") or "")
             event = str(item.get("event") or item.get("code") or "Alert")
             headline = str(item.get("headline") or event)
             issued_raw = item.get("issued")
             cycle_only = bool(item.get("cycle_only", False))
             same_locs = [str(x) for x in (item.get("same_locs") or []) if str(x).strip()]
             code = str(item.get("code") or "").strip()
+
+            if source == "NWWS":
+                event = _sf_nwws_event_label(code or event, vtec_list=vtec_list, text=script_text or headline)
+                if not headline or re.fullmatch(r"[A-Z0-9]{6,16}", headline):
+                    headline = _sf_nwws_make_headline(
+                        event,
+                        issued_dt=_sf_parse_dt(issued_raw),
+                        end_dt=_sf_parse_dt(expires_raw),
+                        issuer=_sf_nwws_extract_issuer(script_text, fallback_wfo=area),
+                    )
+                if not area or re.fullmatch(r"[A-Z]{4}", area):
+                    area = _sf_nwws_area_from_text(script_text) or area
 
             links = {"mode": "VOICE" if cycle_only else "FULL"}
             if audio_path:
@@ -5267,6 +5559,7 @@ class Orchestrator:
 
         vtec = self._extract_vtec(official_text)
         tracks = self._vtec_tracks(vtec)
+        exp_utc = self._best_expiry_from_vtec(vtec)
 
         # Decide FULL vs voice-only based on VTEC action if present.
         # FULL: NEW, UPG, EXA, EXB
@@ -5278,7 +5571,6 @@ class Orchestrator:
         # Keep rebroadcast rotation in sync with VTEC lifecycle.
         if self.rebroadcast_enabled and tracks:
             now_local = dt.datetime.now(self.local_tz)
-            exp_utc = self._best_expiry_from_vtec(vtec)
             expires_at = self._rebroadcast_clamp_expiry(now_local, exp_utc)
 
             if vtec_actions & {"CAN", "EXP"}:
@@ -5343,6 +5635,22 @@ class Orchestrator:
         try:
             spoken = build_spoken_alert(parsed, official_text)
 
+            sf_issued_dt = _sf_nwws_best_issued_dt(parsed, official_text)
+            sf_event_label = _sf_nwws_event_label(parsed.product_type, vtec_list=vtec, text=official_text)
+            sf_area_text = ""
+            if in_area_same:
+                try:
+                    sf_area_text = await self._sf_area_text_from_same_codes(list(in_area_same))
+                except Exception:
+                    sf_area_text = ""
+            if not sf_area_text:
+                sf_area_text = _sf_nwws_area_from_text(official_text)
+            sf_headline = _sf_nwws_make_headline(
+                sf_event_label,
+                issued_dt=sf_issued_dt,
+                end_dt=exp_utc,
+                issuer=_sf_nwws_extract_issuer(official_text, fallback_wfo=parsed.wfo),
+            )
 
             # --- Less-urgent polish / todos ---
             # SPS preamble: NWR-ish intro, avoid duplicated boilerplate.
@@ -5392,7 +5700,7 @@ class Orchestrator:
                     self.telnet.flush_cycle()
                 except Exception:
                     pass
-                event_label = _sf_eas_event_label_full(parsed.product_type)
+                event_label = sf_event_label
                 if (not should_full) and (("EXP" in vtec_actions) or ("CAN" in vtec_actions)):
                     tkey = "nwws_end"
                 elif should_full:
@@ -5440,10 +5748,16 @@ class Orchestrator:
             _station_feed_note_nwws(
                 parsed,
                 mode=_sf_mode,
-                same_locations=(same_for_render if _sf_mode == "FULL" else []),
+                same_locations=list(in_area_same or []),
                 out_wav=str(out_wav),
                 product_id=pid,
                 expires_at=exp_utc,
+                vtec=vtec,
+                official_text=official_text,
+                issued_at=sf_issued_dt,
+                event_text=sf_event_label,
+                headline=sf_headline,
+                area_text=sf_area_text,
             )
 
             self._schedule_cycle_refill("post-alert")
@@ -5459,6 +5773,8 @@ class Orchestrator:
                 _nw_same_code = _safe_event_code(parsed.product_type)
                 _nw_same_locs = list(in_area_same) if in_area_same else []
                 _nw_track_ids = {_vtec_track_id(v) for v in _nw_vtec if _vtec_track_id(v)}
+                _nw_event_label = sf_event_label
+                _nw_headline = sf_headline
                 if _nw_vtec_actions & {"CAN", "EXP"} and not should_full:
                     # Cancellation/expiry voice-only: remove from tracker
                     removed_n = self.alert_tracker.remove_by_vtec_tracks(
@@ -5473,16 +5789,16 @@ class Orchestrator:
                     _nw_tracker_id = f"NWWS:{_nw_tid_str}" if _nw_tid_str else (
                         f"NWWS:{parsed.product_type}:{parsed.wfo}:{(parsed.awips_id or '').strip()}")
                     _nw_is_cycle_only = not should_full
-                    _nw_issued = _sf_parse_dt(getattr(parsed, "issued", None)) or dt.datetime.now(dt.timezone.utc)
+                    _nw_issued = sf_issued_dt or dt.datetime.now(dt.timezone.utc)
                     if _nw_issued.tzinfo is None:
                         _nw_issued = _nw_issued.replace(tzinfo=dt.timezone.utc)
                     _ae_nw = ActiveAlert(
                         id=_nw_tracker_id,
                         source="NWWS",
-                        event=_sf_eas_event_label_full(parsed.product_type),
+                        event=_nw_event_label,
                         code=_nw_same_code,
                         vtec=_nw_vtec,
-                        headline=str(parsed.awips_id or ""),
+                        headline=_nw_headline,
                         script_text=spoken.script,
                         audio_path=str(out_wav),
                         expires=_nw_expires_iso,
