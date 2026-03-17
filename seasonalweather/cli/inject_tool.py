@@ -285,6 +285,8 @@ def _render_alert_block_wav(
         rate_wpm=cfg.tts.rate_wpm,
         volume=cfg.tts.volume,
         sample_rate=sr,
+        text_overrides=cfg.tts.text_overrides,
+        vtp_cfg=cfg.tts.voicetext_paul,
     )
     tts.synth_to_wav(spoken_text, voice)
 

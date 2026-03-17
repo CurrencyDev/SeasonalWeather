@@ -344,6 +344,17 @@ tts:
   voice: "9"                 # backend voice switcher
   rate_wpm: 165
   volume: 1.0
+
+  # Generic text replacements applied to ALL TTS backends after clean_for_tts().
+  # Useful for simple QoL pronunciation fixes that do not need backend-specific phonemes.
+  text_overrides: []
+  # Example:
+  # text_overrides:
+  #   - match: "NWR"
+  #     replace: "NOAA Weather Radio"
+  #     regex: false
+  #     ignore_case: false
+
   voicetext_paul:
     run_as: "voicetext"        # sudo target user for the synth binary
     retries: 1
@@ -351,6 +362,24 @@ tts:
     reset_every: 0             # reset process every N calls (0 = never)
     kill_before: false         # SIGKILL old process before each run
     vtml_lexicon: true         # apply the built-in VTML lexicon substitutions
+
+    # Manual VTML alias overrides (VoiceText Paul only)
+    alias_overrides: []
+    # Example:
+    # alias_overrides:
+    #   - match: "\\bSMW\\b"
+    #     alias: "Special Marine Warning"
+    #     regex: true
+    #     ignore_case: true
+
+    # Manual x-cmu phoneme overrides (VoiceText Paul only)
+    phoneme_overrides_x_cmu: []
+    # Example:
+    # phoneme_overrides_x_cmu:
+    #   - match: "\\bthunderstorm\\b"
+    #     ph: "TH AH1 N D ER0 S T AO2 R M"
+    #     regex: true
+    #     ignore_case: true
 
 audio:
   sample_rate: 48000

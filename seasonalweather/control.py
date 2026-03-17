@@ -571,6 +571,8 @@ class OrchestratorControl:
             rate_wpm=new_cfg.tts.rate_wpm,
             volume=new_cfg.tts.volume,
             sample_rate=new_cfg.audio.sample_rate,
+            text_overrides=new_cfg.tts.text_overrides,
+            vtp_cfg=new_cfg.tts.voicetext_paul,
         )
         self.orch.cycle_builder = CycleBuilder(
             api=self.orch.api,

@@ -1544,6 +1544,7 @@ class Orchestrator:
             rate_wpm=cfg.tts.rate_wpm,
             volume=cfg.tts.volume,
             sample_rate=cfg.audio.sample_rate,
+            text_overrides=cfg.tts.text_overrides,
             vtp_cfg=cfg.tts.voicetext_paul,
         )
 

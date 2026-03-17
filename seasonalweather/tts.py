@@ -26,6 +26,31 @@ _URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)", re.IGNORECASE)
 _ANGLE_URL_RE = re.compile(r"<(https?://[^>]+)>", re.IGNORECASE)
 
+def _compile_text_override_rx(spec: dict) -> re.Pattern[str]:
+    match = str(spec.get("match", "") or "")
+    if not match:
+        raise ValueError("text override is missing 'match'")
+    flags = re.IGNORECASE if bool(spec.get("ignore_case", False)) else 0
+    if bool(spec.get("regex", False)):
+        return re.compile(match, flags)
+    return re.compile(re.escape(match), flags)
+
+def _apply_text_overrides(text: str, overrides: list[dict] | None) -> str:
+    s = text or ""
+    for spec in overrides or []:
+        if not isinstance(spec, dict):
+            continue
+        repl = str(spec.get("replace", "") or "")
+        match = str(spec.get("match", "") or "")
+        if not match:
+            continue
+        try:
+            rx = _compile_text_override_rx(spec)
+        except Exception:
+            continue
+        s = rx.sub(repl, s)
+    return s
+
 # Common “NWS product wrapper” / footer junk we do NOT want spoken
 _SKIP_LINE_RE = re.compile(r"^\s*(?:\$\$|&&|NNNN|0{3,})\s*$")
 
@@ -276,12 +301,14 @@ class TTS:
     rate_wpm: int
     volume: float
     sample_rate: int
+    text_overrides: list[dict] | None = None
     vtp_cfg: object = None  # VoiceTextPaulConfig | None
 
     def synth_to_wav(self, text: str, out_wav: Path) -> None:
         out_wav.parent.mkdir(parents=True, exist_ok=True)
 
         msg = clean_for_tts(text)
+        msg = _apply_text_overrides(msg, self.text_overrides)
         tmp_wav = out_wav.with_suffix(".tmp.wav")
 
         try:
@@ -374,7 +401,14 @@ class TTS:
             elif self.backend == "voicetext_paul":
                 from .voicetext_paul_vtml import apply_voicetext_paul_vtml
                 _vtml_on = bool(getattr(self.vtp_cfg, "vtml_lexicon", True))
-                msg = apply_voicetext_paul_vtml(msg, vtml_lexicon=_vtml_on)
+                _alias_overrides = list(getattr(self.vtp_cfg, "alias_overrides", []) or [])
+                _phoneme_overrides = list(getattr(self.vtp_cfg, "phoneme_overrides_x_cmu", []) or [])
+                msg = apply_voicetext_paul_vtml(
+                    msg,
+                    vtml_lexicon=_vtml_on,
+                    alias_overrides=_alias_overrides,
+                    phoneme_overrides_x_cmu=_phoneme_overrides,
+                )
 
                 # VoiceText Paul via wrapper run as voicetext (or VOICETEXT_PAUL_RUN_AS) (avoids Wine crashes + perms under seasonalweather).
                 engine_dir = Path("/home/seasonalweather-data/var-lib-seasonalweather/voices/voicetext_paul/WeatherRadioSuite-LIB/binary")

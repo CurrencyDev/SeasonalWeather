@@ -232,21 +232,80 @@ _RULES: list[Rule] = [
     Rule(re.compile(r"\bLIFR\b"), _sub_alias("L I F R")),
 ]
 
-def apply_voicetext_paul_vtml(text: str, vtml_lexicon: bool = True) -> str:
+def _user_rule_flags(spec: dict) -> int:
+    return re.IGNORECASE if bool(spec.get("ignore_case", False)) else 0
+
+def _compile_user_rule_rx(spec: dict) -> Pattern[str]:
+    match = str(spec.get("match", "") or "")
+    if not match:
+        raise ValueError("override is missing 'match'")
+    if bool(spec.get("regex", False)):
+        return re.compile(match, _user_rule_flags(spec))
+    return re.compile(re.escape(match), _user_rule_flags(spec))
+
+def _build_user_rules(
+    alias_overrides: list[dict] | None = None,
+    phoneme_overrides_x_cmu: list[dict] | None = None,
+) -> list[Rule]:
+    rules: list[Rule] = []
+
+    # Phonemes first, then aliases, so a manual phoneme can win cleanly.
+    for spec in phoneme_overrides_x_cmu or []:
+        if not isinstance(spec, dict):
+            continue
+        ph = str(spec.get("ph", "") or "").strip()
+        if not ph:
+            continue
+        try:
+            rx = _compile_user_rule_rx(spec)
+        except Exception:
+            continue
+        rules.append(Rule(rx, _phoneme_x_cmu(ph)))
+
+    for spec in alias_overrides or []:
+        if not isinstance(spec, dict):
+            continue
+        alias = str(spec.get("alias", "") or "").strip()
+        if not alias:
+            continue
+        try:
+            rx = _compile_user_rule_rx(spec)
+        except Exception:
+            continue
+        rules.append(Rule(rx, _sub_alias(alias)))
+
+    return rules
+
+def apply_voicetext_paul_vtml(
+    text: str,
+    vtml_lexicon: bool = True,
+    alias_overrides: list[dict] | None = None,
+    phoneme_overrides_x_cmu: list[dict] | None = None,
+) -> str:
     """
     Apply small, meteorology-focused VTML tweaks.
     - Does NOT touch existing <...> tags.
     - No newlines are introduced (your wrapper still flattens anyway).
-    - vtml_lexicon: set False to skip all substitutions (pass from cfg.tts.voicetext_paul.vtml_lexicon).
+    - vtml_lexicon: set False to skip built-in substitutions.
+    - alias_overrides / phoneme_overrides_x_cmu: optional user-configured rules.
     """
-    if not text or not vtml_lexicon:
-        return text or ""
+    if not text:
+        return ""
 
+    rules = _build_user_rules(
+        alias_overrides=alias_overrides,
+        phoneme_overrides_x_cmu=phoneme_overrides_x_cmu,
+    )
+    if vtml_lexicon:
+        rules.extend(_RULES)
+
+    if not rules:
+        return text
 
     parts = _TAG_SPLIT_RE.split(text)
     for i in range(0, len(parts), 2):  # even indexes = plain text between tags
         s = parts[i]
-        for r in _RULES:
+        for r in rules:
             s = r.rx.sub(r.repl, s)
         parts[i] = s
 

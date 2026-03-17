@@ -394,6 +394,8 @@ class VoiceTextPaulConfig:
     reset_every: int
     kill_before: bool
     vtml_lexicon: bool
+    alias_overrides: List[Dict[str, Any]] = field(default_factory=list)
+    phoneme_overrides_x_cmu: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -403,6 +405,7 @@ class TTSConfig:
     rate_wpm: int
     volume: float
     voicetext_paul: VoiceTextPaulConfig
+    text_overrides: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -848,6 +851,7 @@ def load_config(path: str) -> AppConfig:
         voice=str(tts_raw.get("voice", "9")),
         rate_wpm=int(tts_raw.get("rate_wpm", 165)),
         volume=float(tts_raw.get("volume", 1.0)),
+        text_overrides=list(tts_raw.get("text_overrides", []) or []),
         voicetext_paul=VoiceTextPaulConfig(
             run_as=str(vtp_raw.get("run_as", "voicetext")),
             retries=int(vtp_raw.get("retries", 1)),
@@ -855,6 +859,8 @@ def load_config(path: str) -> AppConfig:
             reset_every=int(vtp_raw.get("reset_every", 0)),
             kill_before=bool(vtp_raw.get("kill_before", False)),
             vtml_lexicon=bool(vtp_raw.get("vtml_lexicon", True)),
+            alias_overrides=list(vtp_raw.get("alias_overrides", []) or []),
+            phoneme_overrides_x_cmu=list(vtp_raw.get("phoneme_overrides_x_cmu", []) or []),
         ),
     )
 
