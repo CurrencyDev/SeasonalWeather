@@ -245,6 +245,30 @@ def _sf_vtec_track_ids(vtec_list) -> list[str]:
     return out
 
 
+def _sf_vtec_tracks(vtec_list) -> list[tuple[str, str]]:
+    """
+    Module-level VTEC parser for station-feed helpers.
+    Returns [(track_id, action)] where track_id := OFFICE.PHEN.SIG.ETN.
+    """
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for raw in (vtec_list or []):
+        s = "".join(str(raw).split()).strip()
+        if not s:
+            continue
+        m = _VTEC_PARSE_RE.search(s)
+        if not m:
+            continue
+        track = f"{m.group('office')}.{m.group('phen')}.{m.group('sig')}.{m.group('etn')}"
+        act = (m.group('act') or '').upper()
+        key = f"{track}|{act}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((track, act))
+    return out
+
+
 def _sf_eas_article(word: str) -> str:
     w = (word or "").strip()
     return "an" if (w[:1].lower() in "aeiou") else "a"
@@ -1039,7 +1063,7 @@ def _station_feed_note_cap(ev, *, mode: str, same_locations, out_wav: str, same_
     try:
         vtec_list = list(vtec or [])
         vtec_tracks = _sf_vtec_track_ids(vtec_list)
-        vtec_actions = {act for (_track, act) in _vtec_tracks(vtec_list)} if vtec_list else set()
+        vtec_actions = {act for (_track, act) in _sf_vtec_tracks(vtec_list)} if vtec_list else set()
         if vtec_actions & {"CAN", "EXP"}:
             _sf_remove_by_vtec_tracks(vtec_tracks)
             _sf_remove_ids(_sf_cap_reference_ids(ev) + [getattr(ev, "alert_id", None)])
@@ -1302,7 +1326,7 @@ def _station_feed_note_nwws(
         if not raw_vtec and base_text:
             raw_vtec = _VTEC_FIND_RE.findall(base_text)
         vtec_tracks = _sf_vtec_track_ids(raw_vtec)
-        vtec_actions = {act for (_track, act) in _vtec_tracks(raw_vtec)} if raw_vtec else set()
+        vtec_actions = {act for (_track, act) in _sf_vtec_tracks(raw_vtec)} if raw_vtec else set()
         if vtec_actions & {"CAN", "EXP"}:
             _sf_remove_by_vtec_tracks(vtec_tracks)
             return
@@ -2017,11 +2041,20 @@ class Orchestrator:
 
         raw_vtec = self._extract_vtec(parsed.raw_text or "")
         api_vtec = self._extract_vtec(api_text)
-        raw_tracks = {track for (track, _act) in self._vtec_tracks(raw_vtec)}
-        api_tracks = {track for (track, _act) in self._vtec_tracks(api_vtec)}
+        raw_track_actions = set(self._vtec_tracks(raw_vtec))
+        api_track_actions = set(self._vtec_tracks(api_vtec))
+        raw_tracks = {track for (track, _act) in raw_track_actions}
+        api_tracks = {track for (track, _act) in api_track_actions}
 
-        # If NWWS already gave us a concrete VTEC track, the API override must
-        # agree on the same track. Different ETN == different alert == reject.
+        # If NWWS already gave us a concrete VTEC action for a concrete track,
+        # the API override must agree on at least one identical (track, action)
+        # pair. Matching only the track is too weak: a stale EXA/CON product can
+        # otherwise override a newer EXP/CAN product on the same ETN and cause a
+        # full tone-out for what should have been a voice-only expiration.
+        if raw_track_actions:
+            return bool(api_track_actions) and bool(raw_track_actions & api_track_actions)
+
+        # If the raw payload has track IDs but no usable action pair match, reject.
         if raw_tracks:
             return bool(api_tracks) and bool(raw_tracks & api_tracks)
 
@@ -2370,6 +2403,26 @@ class Orchestrator:
         return "\n".join(lines).strip()
 
     # ---- NWWS UGC -> SAME targeting helpers ----
+    def _build_nwws_statement_vtec_action_script(
+        self,
+        *,
+        event_text: str,
+        area_text: str,
+        official_text: str,
+        headline: str,
+        vtec_actions: set[str],
+    ) -> str:
+        """
+        Reuse the CAP advisory/statement/message EXP/CAN helper for NWWS voice-only
+        updates so CAP and NWWS expiration/cancellation copy stays aligned.
+        """
+        faux_ev = type("NwwsStatementEvent", (), {})()
+        faux_ev.event = str(event_text or "Weather alert").strip()
+        faux_ev.area_desc = str(area_text or _sf_nwws_area_from_text(official_text) or "the affected areas").strip()
+        faux_ev.description = str(official_text or "").strip()
+        faux_ev.headline = str(headline or event_text or "").strip()
+        return self._build_statement_vtec_action_script(faux_ev, vtec_actions, [])
+
     def _state_to_fips2(self, st: str) -> str | None:
         s = (st or "").strip().upper()
         if not s:
@@ -4640,6 +4693,8 @@ class Orchestrator:
 
         if is_watch:
             script = self._build_watch_vtec_action_script(ev, vtec_actions, tracks, watch_number, watch_kind)
+        elif self._cap_prefers_statement_update_script(ev_event, vtec_actions):
+            script = self._build_statement_vtec_action_script(ev, vtec_actions, tracks)
         else:
             script = self._build_warning_vtec_action_script(ev, vtec_actions, tracks)
 
@@ -5060,6 +5115,83 @@ class Orchestrator:
             return str(raw).strip()
         # Fallback: 6 hours from now
         return (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=6)).isoformat()
+
+    def _cap_prefers_statement_update_script(self, event: str, vtec_actions: set[str]) -> bool:
+        e = (event or '').strip().lower()
+        if not e:
+            return False
+        if not (vtec_actions & {'CAN', 'EXP'}):
+            return False
+        return e.endswith('advisory') or e.endswith('statement') or e.endswith('message')
+
+    def _cap_expiry_summary_line(self, text: str) -> str:
+        src = str(text or '').strip()
+        if not src:
+            return ''
+        flat = re.sub(r'\s+', ' ', src)
+        m = re.search(
+            r'([^.]{0,220}\b(?:will expire|has expired|has been allowed to expire|has ended|is no longer in effect|the threat has ended)\b[^.]{0,220}[.?!]?)',
+            flat,
+            flags=re.IGNORECASE,
+        )
+        if not m:
+            return ''
+        line = m.group(1).strip()
+        if line and not line.endswith(('.', '!', '?')):
+            line += '.'
+        return line
+
+    def _build_statement_vtec_action_script(
+        self,
+        ev: "CapAlertEvent",  # type: ignore[name-defined]
+        vtec_actions: set[str],
+        tracks: list[tuple[str, str]],
+    ) -> str:
+        """
+        Lighter-weight voice cut-in for advisory / statement / message EXP/CAN updates.
+        This intentionally sounds like a short NWR-style statement instead of a full
+        warning, or watch style update.
+        """
+        event = self._clean_cap_text(ev.event or '', limit=120)
+        area_desc = (getattr(ev, 'area_desc', '') or '').strip()
+        desc = str(getattr(ev, 'description', '') or '').strip()
+        headline = str(getattr(ev, 'headline', '') or '').strip()
+
+        groups, order, misc = self._parse_cap_area_by_state(area_desc)
+
+        def _county_segs() -> str:
+            if not groups:
+                return self._clean_cap_text(area_desc or 'the affected areas', limit=400)
+            parts: list[str] = []
+            for st in order:
+                st_full = self._STATE_NAME_FULL.get(st, st)
+                county_list = self._join_oxford(groups[st])
+                if county_list:
+                    parts.append(f'in {st_full}, {county_list}')
+            if misc:
+                parts.append(self._join_oxford(misc))
+            return '; '.join(parts) if parts else self._clean_cap_text(area_desc or 'the affected areas', limit=400)
+
+        summary_line = ''
+        if vtec_actions & {'EXP'}:
+            summary_line = self._cap_expiry_summary_line(desc) or self._cap_expiry_summary_line(headline)
+            if not summary_line and event:
+                summary_line = f'The {event} has expired.'
+        elif vtec_actions & {'CAN'}:
+            summary_line = self._cap_expiry_summary_line(desc) or self._cap_expiry_summary_line(headline)
+            if not summary_line and event:
+                summary_line = f'The {event} has been cancelled.'
+
+        lines: list[str] = ['This is a statement from the National Weather Service.']
+        area_line = _county_segs()
+        if area_line:
+            lines.append(f'For the following counties: {area_line}.')
+        if summary_line:
+            lines.append(summary_line)
+        elif event:
+            lines.append(f'The {event} has been updated.')
+        lines.append('End of message.')
+        return "\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
 
     def _build_warning_vtec_action_script(
         self,
@@ -5665,20 +5797,37 @@ class Orchestrator:
                 log.exception('NWWS SPS preamble normalization failed; continuing with original script')
 
             # EXP/CAN short narration: if VTEC says expired/cancel and this is voice-only,
-            # prefer a small 'has expired' narration instead of reading the whole product.
+            # keep NWWS aligned with the CAP advisory/statement/message helper when the
+            # event class is light enough for statement-style narration.
             try:
                 if tracks and not should_full:
                     if ('EXP' in vtec_actions) or ('CAN' in vtec_actions):
-                        summ = self._expiry_summary_script(official_text)
-                        if summ:
-                            spoken.script = summ
+                        if self._cap_prefers_statement_update_script(sf_event_label, vtec_actions):
+                            spoken.script = self._build_nwws_statement_vtec_action_script(
+                                event_text=sf_event_label,
+                                area_text=sf_area_text,
+                                official_text=official_text,
+                                headline=sf_headline,
+                                vtec_actions=vtec_actions,
+                            )
                             log.info(
-                                'NWWS EXP/CAN summary enabled (act=%s type=%s awips=%s wfo=%s)',
+                                'NWWS statement-style EXP/CAN enabled (act=%s type=%s awips=%s wfo=%s)',
                                 ','.join(sorted(vtec_actions))[:64],
                                 parsed.product_type,
                                 parsed.awips_id or '',
                                 parsed.wfo,
                             )
+                        else:
+                            summ = self._expiry_summary_script(official_text)
+                            if summ:
+                                spoken.script = summ
+                                log.info(
+                                    'NWWS EXP/CAN summary enabled (act=%s type=%s awips=%s wfo=%s)',
+                                    ','.join(sorted(vtec_actions))[:64],
+                                    parsed.product_type,
+                                    parsed.awips_id or '',
+                                    parsed.wfo,
+                                )
             except Exception:
                 log.exception('NWWS EXP/CAN summary failed; continuing with original script')
 
