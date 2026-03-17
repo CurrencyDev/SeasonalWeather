@@ -31,6 +31,14 @@ _SKIP_LINE_RE = re.compile(r"^\s*(?:\$\$|&&|NNNN|0{3,})\s*$")
 
 # WMO-style header line (ex: FXUS61 KLWX 201925)
 _WMO_HEADER_RE = re.compile(r"^[A-Z]{3,6}\d{2}\s+[A-Z]{4}\s+\d{6}(?:\s+[A-Z]{3})?$")
+# Human-readable issued line (ex: 1118 AM EDT Mon Mar 16 2026)
+_NWS_ISSUED_LINE_RE = re.compile(r"^\d{3,4}\s*(?:AM|PM)\s+[A-Z]{2,4}\s+[A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{4}$")
+_PRODUCT_MASTHEAD_RE = re.compile(
+    r"^(?:URGENT\s*-\s*)?(?:WINTER WEATHER MESSAGE|COASTAL HAZARD MESSAGE|SPECIAL WEATHER STATEMENT|"
+    r"FLOOD WARNING|FLOOD WATCH|FLOOD ADVISORY|SEVERE WEATHER STATEMENT|SEVERE THUNDERSTORM WARNING|"
+    r"TORNADO WARNING|BLIZZARD WARNING|HIGH WIND WARNING|HURRICANE LOCAL STATEMENT)\s*$",
+    re.IGNORECASE,
+)
 
 # A line that is mostly uppercase/digits/punct and short -> often metadata, not prose
 _METAISH_RE = re.compile(r"^[A-Z0-9 \-\/\.\(\):;,+#]{1,50}$")
@@ -132,8 +140,12 @@ def clean_for_tts(text: str) -> str:
         if line.lower() in {"link", "links"}:
             continue
 
-        # Drop obvious WMO header lines
+        # Drop obvious WMO / issued / masthead header lines
         if _WMO_HEADER_RE.match(line):
+            continue
+        if _NWS_ISSUED_LINE_RE.match(line):
+            continue
+        if _PRODUCT_MASTHEAD_RE.match(line):
             continue
 
         low = line.lower()

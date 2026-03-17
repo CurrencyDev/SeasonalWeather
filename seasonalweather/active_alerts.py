@@ -30,6 +30,21 @@ log = logging.getLogger("seasonalweather.active_alerts")
 
 _SCHEMA_VERSION = 2
 
+
+def _parse_iso_dt(value: str | None) -> dt.datetime:
+    s = (value or "").strip()
+    if not s:
+        return dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        out = dt.datetime.fromisoformat(s)
+        if out.tzinfo is None:
+            out = out.replace(tzinfo=dt.timezone.utc)
+        return out.astimezone(dt.timezone.utc)
+    except Exception:
+        return dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+
 # VTEC track-id parser: OFFICE.PHEN.SIG.ETN
 _VTEC_TRACK_RE = re.compile(
     r"/[A-Z]\.(?:[A-Z]{3})\."
@@ -154,6 +169,15 @@ class AlertTracker:
 
     def add_or_update(self, alert: ActiveAlert) -> None:
         """Register or refresh an alert slot. Persists immediately."""
+        prev = self._alerts.get(alert.id)
+        if prev is not None:
+            # Preserve original chronology so updates do not jump the queue.
+            alert.issued = prev.issued or alert.issued
+            alert.first_aired = prev.first_aired or alert.first_aired
+            alert.last_aired = prev.last_aired or alert.last_aired
+            alert.airing_count = max(int(prev.airing_count or 0), int(alert.airing_count or 0))
+            if alert.watch_number is None:
+                alert.watch_number = prev.watch_number
         self._alerts[alert.id] = alert
         self._persist()
 
@@ -193,10 +217,10 @@ class AlertTracker:
     # ------------------------------------------------------------------ #
 
     def get_active(self, now: Optional[dt.datetime] = None) -> list[ActiveAlert]:
-        """Return non-expired alerts sorted by issued time (oldest first)."""
+        """Return non-expired alerts sorted by first-seen chronology (oldest first)."""
         now = now or dt.datetime.now(dt.timezone.utc)
         active = [a for a in self._alerts.values() if not a.is_expired(now)]
-        active.sort(key=lambda a: (a.issued or "", a.id))
+        active.sort(key=lambda a: (_parse_iso_dt(a.first_aired or a.issued), _parse_iso_dt(a.issued), a.id))
         return active
 
     def get_cycle_alerts(self, now: Optional[dt.datetime] = None) -> list[ActiveAlert]:

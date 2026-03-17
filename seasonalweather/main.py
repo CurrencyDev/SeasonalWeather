@@ -193,6 +193,57 @@ def _sf_emit(alert, *, expires_at=None) -> None:
         log.exception("Station feed: failed to write handled-alerts.json")
 
 
+def _sf_remove_ids(ids) -> int:
+    if not _sf_enabled():
+        return 0
+    removed = 0
+    try:
+        now_ts = time.time()
+        for raw in ids or []:
+            sid = str(raw or "").strip()
+            if not sid:
+                continue
+            if _STATION_FEED_STATE.pop(sid, None) is not None:
+                removed += 1
+        if removed:
+            _sf_write(now_ts)
+    except Exception:
+        log.exception("Station feed: failed removing ids=%s", ids)
+    return removed
+
+
+def _sf_remove_by_vtec_tracks(tracks) -> int:
+    track_ids = {(t[0] if isinstance(t, tuple) else t) for t in (tracks or []) if (t[0] if isinstance(t, tuple) else t)}
+    return _sf_remove_ids(track_ids)
+
+
+
+def _sf_cap_reference_ids(ev) -> list[str]:
+    refs = getattr(ev, "references", None)
+    if not isinstance(refs, (list, tuple)):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in refs:
+        s = str(raw or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _sf_vtec_track_ids(vtec_list) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in (vtec_list or []):
+        tid = _vtec_track_id(str(raw))
+        if not tid or tid in seen:
+            continue
+        seen.add(tid)
+        out.append(tid)
+    return out
+
 
 def _sf_eas_article(word: str) -> str:
     w = (word or "").strip()
@@ -625,6 +676,24 @@ def _sf_station_feed_hk_start():
 # Housekeeping is started by Orchestrator.__init__ after cfg is loaded.
 
 
+def _sf_is_non_alert_station_item(*, alert_id=None, source=None, event=None, headline=None, cycle_only=False) -> bool:
+    """Return True for internal cycle-only items that should not appear in StationFeed."""
+    try:
+        aid = str(alert_id or "").strip()
+        src = str(source or "").strip().upper()
+        ev = str(event or "").strip().lower()
+        hd = str(headline or "").strip().lower()
+        if aid.startswith("PNS_SAFETY:"):
+            return True
+        if src == "PNS_CYCLE":
+            return True
+        if cycle_only and (ev == "severe weather safety rules" or hd == "severe weather safety rules"):
+            return True
+    except Exception:
+        return False
+    return False
+
+
 def _sf_seed_memory_from_payload_file() -> int:
     """
     Restore handled-alerts.json into the in-memory station-feed cache without
@@ -653,6 +722,15 @@ def _sf_seed_memory_from_payload_file() -> int:
 
     for item in alerts:
         if not isinstance(item, dict):
+            continue
+
+        if _sf_is_non_alert_station_item(
+            alert_id=item.get("id"),
+            source=((item.get("from") or {}).get("name") if isinstance(item.get("from"), dict) else None),
+            event=item.get("event"),
+            headline=item.get("headline"),
+            cycle_only=(str(((item.get("links") or {}).get("mode") or "")).upper() == "VOICE"),
+        ):
             continue
 
         exp_ts = _sf_hk_alert_expiry_ts(item)
@@ -699,7 +777,14 @@ def _station_feed_note_cap(ev, *, mode: str, same_locations, out_wav: str, same_
     if not _sf_enabled():
         return
     try:
-        alert_id = getattr(ev, "alert_id", None) or getattr(ev, "id", None) or _sf_sha1_12(str(ev))
+        vtec_list = list(vtec or [])
+        vtec_tracks = _sf_vtec_track_ids(vtec_list)
+        vtec_actions = {act for (_track, act) in _vtec_tracks(vtec_list)} if vtec_list else set()
+        if vtec_actions & {"CAN", "EXP"}:
+            _sf_remove_by_vtec_tracks(vtec_tracks)
+            _sf_remove_ids(_sf_cap_reference_ids(ev) + [getattr(ev, "alert_id", None)])
+            return
+        alert_id = (vtec_tracks[0] if vtec_tracks else None) or getattr(ev, "alert_id", None) or getattr(ev, "id", None) or _sf_sha1_12(str(ev))
         event = getattr(ev, "event", None) or "Alert"
         headline = getattr(ev, "headline", None) or event
         severity = getattr(ev, "severity", None) or "Unknown"
@@ -939,8 +1024,14 @@ def _station_feed_note_nwws(parsed, *, mode: str, same_locations, out_wav: str, 
         wfo = getattr(parsed, "wfo", None) or ""
         prod_type = getattr(parsed, "product_type", None) or "NWWS"
         issued = getattr(parsed, "issued", None)
+        raw_vtec = _extract_vtec(getattr(parsed, "raw_text", "") or "")
+        vtec_tracks = _sf_vtec_track_ids(raw_vtec)
+        vtec_actions = {act for (_track, act) in _vtec_tracks(raw_vtec)} if raw_vtec else set()
+        if vtec_actions & {"CAN", "EXP"}:
+            _sf_remove_by_vtec_tracks(vtec_tracks)
+            return
         key = f"nwws:{prod_type}:{awips}:{wfo}:{issued}"
-        alert_id = _sf_sha1_12(key)
+        alert_id = vtec_tracks[0] if vtec_tracks else _sf_sha1_12(key)
 
         headline = f"{prod_type} {awips}".strip()
         sender = FeedSender(name="NWWS-OI", kind="relay") if FeedSender else None
@@ -1323,6 +1414,17 @@ class Orchestrator:
             except Exception:
                 continue
 
+        existing_vtec_tracks: set[str] = set()
+        for _alert_obj, _exp_ts in _STATION_FEED_STATE.values():
+            try:
+                _links = getattr(_alert_obj, "links", {}) or {}
+                for _v in (_links.get("vtec") or []):
+                    _tid = _vtec_track_id(str(_v))
+                    if _tid:
+                        existing_vtec_tracks.add(_tid)
+            except Exception:
+                continue
+
         seeded = 0
         for item in items:
             if not isinstance(item, dict):
@@ -1347,6 +1449,15 @@ class Orchestrator:
                 continue
 
             source = str(item.get("source") or "").strip().upper()
+            if _sf_is_non_alert_station_item(
+                alert_id=tracker_id,
+                source=source,
+                event=item.get("event"),
+                headline=item.get("headline"),
+                cycle_only=bool(item.get("cycle_only", False)),
+            ):
+                continue
+
             if source == "CAP":
                 sender_name, sender_kind = "CAP restore", "relay"
             elif source == "NWWS":
@@ -1362,6 +1473,10 @@ class Orchestrator:
             if not isinstance(vtec_list, list):
                 vtec_list = [vtec_list] if vtec_list else []
             vtec_list = [str(x) for x in vtec_list if str(x).strip()]
+
+            tracker_vtec_tracks = {_vtec_track_id(v) for v in vtec_list if _vtec_track_id(v)}
+            if tracker_vtec_tracks and (tracker_vtec_tracks & existing_vtec_tracks):
+                continue
 
             area = ""
             for _raw_vtec in vtec_list:
@@ -1407,6 +1522,7 @@ class Orchestrator:
                 existing_ids.add(str(alert.id))
                 if audio_path:
                     existing_wavs.add(audio_path)
+                existing_vtec_tracks.update({t for t in tracker_vtec_tracks if t})
                 seeded += 1
             except Exception:
                 log.exception("Station feed: failed seeding one AlertTracker entry into StationFeed")
@@ -1791,6 +1907,53 @@ class Orchestrator:
         return out
 
     # ---- Spoken-script post-processing (NWWS path) ----
+    def _nws_header_issued_dt(self, text: str) -> dt.datetime | None:
+        """Parse an NWS issued-time header into local time for freshness checks."""
+        if not text:
+            return None
+        for raw in (text or "").splitlines()[:40]:
+            s = raw.strip()
+            m = _NWS_HEADER_ISSUED_RE.match(s)
+            if not m:
+                continue
+            hhmm = m.group("hhmm")
+            ampm = (m.group("ampm") or "").upper()
+            mon = m.group("mon")
+            day = int(m.group("day"))
+            year = int(m.group("year"))
+            hhmm_i = int(hhmm)
+            hour = hhmm_i // 100
+            minute = hhmm_i % 100
+            if ampm == "PM" and hour != 12:
+                hour += 12
+            if ampm == "AM" and hour == 12:
+                hour = 0
+            try:
+                naive = dt.datetime.strptime(f"{year} {mon} {day} {hour:02d}:{minute:02d}", "%Y %b %d %H:%M")
+                return naive.replace(tzinfo=self._tz)
+            except Exception:
+                continue
+        return None
+
+    def _pns_safety_is_fresh(self, text: str, parsed_issued: object = None) -> bool:
+        """Only air severe-weather safety-rules PNS products while they are still same-day and fresh."""
+        now_local = dt.datetime.now(self._tz)
+        issued_local = self._nws_header_issued_dt(text)
+        if issued_local is None:
+            issued_dt = _sf_parse_dt(parsed_issued)
+            if issued_dt is not None:
+                if issued_dt.tzinfo is None:
+                    issued_dt = issued_dt.replace(tzinfo=dt.timezone.utc)
+                issued_local = issued_dt.astimezone(self._tz)
+        if issued_local is None:
+            return False
+        age = now_local - issued_local
+        if age.total_seconds() < -300:
+            return False
+        if age > dt.timedelta(hours=18):
+            return False
+        return issued_local.date() == now_local.date()
+
     def _nws_header_issued_phrase(self, text: str) -> str | None:
         """
         Extract a nicer spoken timestamp from an NWS header line like:
@@ -3571,6 +3734,9 @@ class Orchestrator:
                         pass
 
                     if self._is_safety_rules_pns(official_pns):
+                        if not self._pns_safety_is_fresh(official_pns, getattr(parsed, "issued", None)):
+                            log.info("PNS safety rules skipped (stale product) wfo=%s awips=%s", parsed.wfo, parsed.awips_id or "")
+                            continue
                         pns_script = self._build_pns_safety_script(official_pns)
                         if pns_script.strip():
                             pns_key = f"PNS_SAFETY:{(parsed.wfo or '').strip()}:{self._sha1_12(official_pns[:800])}"
@@ -3610,7 +3776,7 @@ class Orchestrator:
             if str(ev.status or "").strip().lower() != "actual":
                 return False
             mt = str(ev.message_type or "").strip().lower()
-            if mt and mt not in {"alert", "update"}:
+            if mt and mt not in {"alert", "update", "cancel"}:
                 return False
         except Exception:
             return False
@@ -3730,7 +3896,7 @@ class Orchestrator:
         if not self._cap_is_actionable(ev):
             return False
         mt = str(ev.message_type or "").strip().lower()
-        if mt != "update":
+        if mt not in {"update", "cancel"}:
             return False
         event = (ev.event or "").strip()
         if event not in self._cap_full_events():
@@ -3747,6 +3913,18 @@ class Orchestrator:
 
             vtec = self._cap_vtec_list(ev)
             tracks = self._vtec_tracks(vtec)
+            cap_mt = str(getattr(ev, "message_type", None) or "").strip().lower()
+            cap_ref_ids = _sf_cap_reference_ids(ev)
+
+            if cap_mt == "cancel" and not tracks:
+                try:
+                    same_code = self._cap_event_to_same_code((ev.event or "").strip())
+                    self.alert_tracker.remove(self._alert_tracker_id_for_cap(ev, same_code))
+                except Exception:
+                    log.exception("AlertTracker: failed handling CAP cancel without VTEC id=%s", getattr(ev, "alert_id", None))
+                _sf_remove_ids(cap_ref_ids + [getattr(ev, "alert_id", None)])
+                log.info("CAP cancel: evicted state without airing id=%s refs=%s", getattr(ev, "alert_id", None), ",".join(cap_ref_ids[:4]))
+                continue
 
             # Keep rebroadcast rotation in sync with VTEC lifecycle.
             # - CAN/EXP => remove immediately so we don't re-air a dead event.
@@ -3763,6 +3941,8 @@ class Orchestrator:
                         tracks=tracks,
                         reason=f"cap:{mt}:{','.join(sorted(vtec_actions & {'CAN','EXP'}))}",
                     )
+                    _sf_remove_by_vtec_tracks(tracks)
+                    _sf_remove_ids(cap_ref_ids + [getattr(ev, "alert_id", None)])
                     # Also remove from AlertTracker (if not already handled by _air_cap_update)
                     try:
                         _can_track_ids = {_vtec_track_id(v) for v in vtec if _vtec_track_id(v)}
@@ -4842,15 +5022,11 @@ class Orchestrator:
         instr = self._clean_cap_text(getattr(ev, "instruction", "") or "", limit=700)
 
         lines: list[str] = []
-        lines.append("The National Weather Service has issued the following message.")
         if event:
             lines.append(f"{event}.")
 
         if headline:
             lines.append(headline if headline.endswith((".", "!", "?")) else headline + ".")
-
-        if area:
-            lines.append(f"For the following areas: {area}.")
 
         if desc:
             lines.append(desc)
@@ -4870,13 +5046,10 @@ class Orchestrator:
         instr = self._clean_cap_text(getattr(ev, "instruction", "") or "", limit=500)
 
         lines: list[str] = []
-        lines.append("This is a statement from the National Weather Service.")
         if event and event.lower() != "special weather statement":
             lines.append(f"{event}.")
         if headline:
             lines.append(headline if headline.endswith((".", "!", "?")) else headline + ".")
-        if area:
-            lines.append(f"For the following areas: {area}.")
         if desc:
             lines.append(desc)
         if instr:
@@ -5300,6 +5473,9 @@ class Orchestrator:
                     _nw_tracker_id = f"NWWS:{_nw_tid_str}" if _nw_tid_str else (
                         f"NWWS:{parsed.product_type}:{parsed.wfo}:{(parsed.awips_id or '').strip()}")
                     _nw_is_cycle_only = not should_full
+                    _nw_issued = _sf_parse_dt(getattr(parsed, "issued", None)) or dt.datetime.now(dt.timezone.utc)
+                    if _nw_issued.tzinfo is None:
+                        _nw_issued = _nw_issued.replace(tzinfo=dt.timezone.utc)
                     _ae_nw = ActiveAlert(
                         id=_nw_tracker_id,
                         source="NWWS",
@@ -5310,7 +5486,7 @@ class Orchestrator:
                         script_text=spoken.script,
                         audio_path=str(out_wav),
                         expires=_nw_expires_iso,
-                        issued=dt.datetime.now(dt.timezone.utc).isoformat(),
+                        issued=_nw_issued.isoformat(),
                         same_locs=_nw_same_locs,
                         cycle_only=_nw_is_cycle_only,
                     )

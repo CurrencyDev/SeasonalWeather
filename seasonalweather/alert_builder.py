@@ -15,6 +15,14 @@ _END_PUNCT_RE = re.compile(r"(\.\.\.|[.!?:;])$")
 _UGC_RE = re.compile(r"^[A-Z]{2}[CZ]\d{3}(?:-\d{3})*-\d{6}-?$")
 # WMO example: WWUS51 KCTP 112100
 _WMO_RE = re.compile(r"^[A-Z]{4}\d{2}\s+[A-Z]{4}\s+\d{6}$")
+# Human-readable product timestamp line: 1118 AM EDT Mon Mar 16 2026
+_NWS_ISSUED_RE = re.compile(r"^\d{3,4}\s*(?:AM|PM)\s+[A-Z]{2,4}\s+[A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{4}$")
+_PRODUCT_MASTHEAD_RE = re.compile(
+    r"^(?:URGENT\s*-\s*)?(?:WINTER WEATHER MESSAGE|COASTAL HAZARD MESSAGE|SPECIAL WEATHER STATEMENT|"
+    r"FLOOD WARNING|FLOOD WATCH|FLOOD ADVISORY|SEVERE WEATHER STATEMENT|SEVERE THUNDERSTORM WARNING|"
+    r"TORNADO WARNING|BLIZZARD WARNING|HIGH WIND WARNING|HURRICANE LOCAL STATEMENT)\s*$",
+    re.IGNORECASE,
+)
 # "PRECAUTIONARY/PREPAREDNESS ACTIONS..." header (we don't speak the header)
 _PPA_RE = re.compile(r"^PRECAUTIONARY/PREPAREDNESS ACTIONS\b", re.IGNORECASE)
 
@@ -76,7 +84,7 @@ def strip_nws_product_headers(raw: str) -> str:
 
     def is_noise_line(line: str) -> bool:
         t = line.strip()
-        return t in {"", "NNNN", "$$", "&&"} or t.isdigit()
+        return t in {"", "NNNN", "$$", "&&"} or t.isdigit() or bool(_NWS_ISSUED_RE.match(t)) or bool(_PRODUCT_MASTHEAD_RE.match(t))
 
     # Drop leading empties/noise
     while i < len(lines) and is_noise_line(lines[i]):
@@ -241,6 +249,10 @@ def build_spoken_alert_full(parsed: ParsedProduct, official_text: str) -> Spoken
         if re.fullmatch(r"[0-9]{3,}", s):  # "000"
             continue
         if _WMO_RE.match(s):
+            continue
+        if _NWS_ISSUED_RE.match(s):
+            continue
+        if _PRODUCT_MASTHEAD_RE.match(s):
             continue
         if re.fullmatch(r"[A-Z]{6}", s):  # "SQWCTP" etc
             continue

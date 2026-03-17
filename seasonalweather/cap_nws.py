@@ -167,6 +167,12 @@ class CapAlertEvent:
     description: str | None
     instruction: str | None
 
+    effective: str | None
+    onset: str | None
+    ends: str | None
+    expires: str | None
+    references: list[str]
+
     same_fips: list[str]
 
     # NEW: NWS CAP "parameters" passthrough + VTEC list extraction
@@ -325,6 +331,40 @@ class NwsCapPoller:
             out.append(x)
         return out
 
+    def _extract_references(self, props: dict[str, Any]) -> list[str]:
+        """
+        CAP references may arrive as a whitespace/comma separated string or a JSON list.
+        Keep them normalized so downstream cleanup can evict superseded alerts.
+        """
+        raw = props.get("references") if isinstance(props, dict) else None
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def _add(val: Any) -> None:
+            s = str(val or "").strip()
+            if not s:
+                return
+            if s in seen:
+                return
+            seen.add(s)
+            out.append(s)
+
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, str):
+                    for part in re.split(r"[\s,]+", item.strip()):
+                        if part:
+                            _add(part)
+                else:
+                    _add(item)
+            return out
+
+        if raw is not None:
+            for part in re.split(r"[\s,]+", str(raw).strip()):
+                if part:
+                    _add(part)
+        return out
+
     def _matches_service_area(self, same_list: list[str]) -> bool:
         if not same_list:
             return False
@@ -354,6 +394,7 @@ class NwsCapPoller:
 
         params = self._extract_parameters(props)
         vtec = self._extract_vtec(params)
+        references = self._extract_references(props)
 
         ev = CapAlertEvent(
             alert_id=alert_id,
@@ -368,6 +409,11 @@ class NwsCapPoller:
             area_desc=str(props.get("areaDesc")).strip() if props.get("areaDesc") is not None else None,
             description=str(props.get("description")).strip() if props.get("description") is not None else None,
             instruction=str(props.get("instruction")).strip() if props.get("instruction") is not None else None,
+            effective=str(props.get("effective")).strip() if props.get("effective") is not None else None,
+            onset=str(props.get("onset")).strip() if props.get("onset") is not None else None,
+            ends=str(props.get("ends")).strip() if props.get("ends") is not None else None,
+            expires=str(props.get("expires")).strip() if props.get("expires") is not None else None,
+            references=references,
             same_fips=same_list,
             parameters=params,
             vtec=vtec,
