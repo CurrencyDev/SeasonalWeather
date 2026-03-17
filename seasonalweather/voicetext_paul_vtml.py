@@ -42,6 +42,118 @@ def _wind_dir_repl(m: re.Match[str]) -> str:
         return tok
     return f'<vtml_sub alias="{alias}">{tok}</vtml_sub>'
 
+# State/territory abbreviations -> spoken names, but only in place-name contexts
+# like "Baltimore MD", "Smith Point VA", "Washington DC", etc.
+_STATE_MAP = {
+    "AL": "Alabama",
+    "AK": "Alaska",
+    "AZ": "Arizona",
+    "AR": "Arkansas",
+    "CA": "California",
+    "CO": "Colorado",
+    "CT": "Connecticut",
+    "DE": "Delaware",
+    "DC": "District of Columbia",
+    "FL": "Florida",
+    "GA": "Georgia",
+    "HI": "Hawaii",
+    "ID": "Idaho",
+    "IL": "Illinois",
+    "IN": "Indiana",
+    "IA": "Iowa",
+    "KS": "Kansas",
+    "KY": "Kentucky",
+    "LA": "Louisiana",
+    "ME": "Maine",
+    "MD": "Maryland",
+    "MA": "Massachusetts",
+    "MI": "Michigan",
+    "MN": "Minnesota",
+    "MS": "Mississippi",
+    "MO": "Missouri",
+    "MT": "Montana",
+    "NE": "Nebraska",
+    "NV": "Nevada",
+    "NH": "New Hampshire",
+    "NJ": "New Jersey",
+    "NM": "New Mexico",
+    "NY": "New York",
+    "NC": "North Carolina",
+    "ND": "North Dakota",
+    "OH": "Ohio",
+    "OK": "Oklahoma",
+    "OR": "Oregon",
+    "PA": "Pennsylvania",
+    "RI": "Rhode Island",
+    "SC": "South Carolina",
+    "SD": "South Dakota",
+    "TN": "Tennessee",
+    "TX": "Texas",
+    "UT": "Utah",
+    "VT": "Vermont",
+    "VA": "Virginia",
+    "WA": "Washington",
+    "WV": "West Virginia",
+    "WI": "Wisconsin",
+    "WY": "Wyoming",
+    "PR": "Puerto Rico",
+    "VI": "U.S. Virgin Islands",
+    "GU": "Guam",
+    "AS": "American Samoa",
+    "MP": "Northern Mariana Islands",
+}
+
+_AMBIGUOUS_STATE_CODES = {"IN", "OR", "ME", "HI", "OK"}
+
+# If one of the ambiguous state codes appears after one of these words,
+# it's probably normal sentence text, not a place name.
+_PLACE_STOPWORDS = {
+    "A", "AN", "AND", "ARE", "AS", "AT", "BE", "BECOME", "BECOMING", "BEEN", "BEING",
+    "BY", "CAN", "COULD", "EXPECTED", "FOR", "FROM", "HAS", "HAVE", "IN", "INTO",
+    "IS", "IT", "ITS", "LIKELY", "MAY", "MOVING", "NEAR", "OF", "ON", "OR",
+    "POSSIBLE", "REMAIN", "REMAINS", "REMAINING", "SHOULD", "THE", "THAT", "THESE",
+    "THIS", "THOSE", "TO", "WAS", "WERE", "WILL", "WITH",
+}
+
+_PLACE_STATE_RE = re.compile(
+    r"(?P<prefix>\b(?:[A-Z][A-Za-z.'’\-]*)(?:[ ,]+[A-Z][A-Za-z.'’\-]*){0,5}[ ,]+)"
+    r"(?P<st>"
+    + "|".join(sorted(_STATE_MAP, key=len, reverse=True))
+    + r")"
+    r"(?=(?:\s+(?:to|and)\b)|(?:\s*(?:/|,|\.{1,3}|;|:|\)|$)))"
+)
+
+_PLACE_WORD_RE = re.compile(r"[A-Z][A-Za-z.'’\-]*")
+
+def _place_state_repl(m: re.Match[str]) -> str:
+    prefix = m.group("prefix")
+    st = m.group("st")
+    alias = _STATE_MAP.get(st.upper())
+    if not alias:
+        return m.group(0)
+
+    words = _PLACE_WORD_RE.findall(prefix.rstrip(" ,"))
+    if not words:
+        return m.group(0)
+
+    last_word = words[-1]
+    last_upper = last_word.upper()
+
+    # Peek at following text so we can be stricter for ambiguous codes.
+    tail = m.string[m.end():m.end() + 16]
+
+    # Extra guardrail for ambiguous state codes.
+    if st.upper() in _AMBIGUOUS_STATE_CODES:
+        if last_upper in _PLACE_STOPWORDS:
+            return m.group(0)
+
+        # If the next token is a connector like "to" / "and", be stricter.
+        if re.match(r"\s+(?:to|and)\b", tail, re.IGNORECASE):
+            if len(words) == 1 and last_upper in _PLACE_STOPWORDS:
+                return m.group(0)
+
+    return f'{prefix}<vtml_sub alias="{alias}">{st}</vtml_sub>'
+
 _RULES: list[Rule] = [
     # --- Common wind-direction abbreviations, only in "NW winds ..." contexts ---
     Rule(
@@ -92,17 +204,22 @@ _RULES: list[Rule] = [
     Rule(re.compile(r"°\s*C\b"), _sub_alias("degrees Celsius")),
 
     # Measurements only when they look like units after a number.
-    Rule(re.compile(r"(\d+(?:\.\d+)?)\s*(in\.)\b", re.IGNORECASE), lambda m: f'{m.group(1)} <vtml_sub alias="inches">{m.group(2)}</vtml_sub>'),
-    Rule(re.compile(r"(\d+(?:\.\d+)?)\s*(ft\.)\b", re.IGNORECASE), lambda m: f'{m.group(1)} <vtml_sub alias="feet">{m.group(2)}</vtml_sub>'),
-    Rule(re.compile(r"(\d+(?:\.\d+)?)\s*(mi\.)\b", re.IGNORECASE), lambda m: f'{m.group(1)} <vtml_sub alias="miles">{m.group(2)}</vtml_sub>'),
-    Rule(re.compile(r"(\d+(?:\.\d+)?)\s*(nm\.)\b", re.IGNORECASE), lambda m: f'{m.group(1)} <vtml_sub alias="nautical miles">{m.group(2)}</vtml_sub>'),
+    Rule(re.compile(r"(\d+(?:\.\d+)?)\s*((?:in)\.?)(?=\s|$|[,:;!?])", re.IGNORECASE), lambda m: f'{m.group(1)} <vtml_sub alias="inches">{m.group(2)}</vtml_sub>'),
+    Rule(re.compile(r"(\d+(?:\.\d+)?)\s*((?:ft)\.?)(?=\s|$|[,:;!?])", re.IGNORECASE), lambda m: f'{m.group(1)} <vtml_sub alias="feet">{m.group(2)}</vtml_sub>'),
+    Rule(re.compile(r"(\d+(?:\.\d+)?)\s*((?:mi)\.?)(?=\s|$|[,:;!?])", re.IGNORECASE), lambda m: f'{m.group(1)} <vtml_sub alias="miles">{m.group(2)}</vtml_sub>'),
+    Rule(re.compile(r"(\d+(?:\.\d+)?)\s*((?:nm)\.?)(?=\s|$|[,:;!?])", re.IGNORECASE), lambda m: f'{m.group(1)} <vtml_sub alias="nautical miles">{m.group(2)}</vtml_sub>'),
+
+    # State abbreviations only when they look like place-name suffixes.
+    Rule(_PLACE_STATE_RE, _place_state_repl),
 
     # --- A few NWS-ish abbreviations that show up in headers/closures ---
     # NOAA: VoiceText Paul reads it as "N-O-A-A" letters without this rule.
     Rule(re.compile(r"\bNOAA\b"), _sub_alias("noah")),
     Rule(re.compile(r"\bNWS\b"), _sub_alias("National Weather Service")),
-    Rule(re.compile(r"\bTSTM\b", re.IGNORECASE), _sub_alias("thunderstorm")),
-    Rule(re.compile(r"\bTSTMS\b", re.IGNORECASE), _sub_alias("thunderstorms")),
+    Rule(re.compile(r"\bthunderstorms\b", re.IGNORECASE), _phoneme_x_cmu("TH AH1 N D ER0 S T AO2 R M Z")),
+    Rule(re.compile(r"\bthunderstorm\b", re.IGNORECASE), _phoneme_x_cmu("TH AH1 N D ER0 S T AO2 R M")),
+    Rule(re.compile(r"\bTSTMS\b", re.IGNORECASE), _phoneme_x_cmu("TH AH1 N D ER0 S T AO2 R M Z")),
+    Rule(re.compile(r"\bTSTM\b", re.IGNORECASE), _phoneme_x_cmu("TH AH1 N D ER0 S T AO2 R M")),
 
     # Time zone abbreviations that may still appear in headers or time announcements
     Rule(re.compile(r"\bEST\b"), _sub_alias("Eastern Standard Time")),
