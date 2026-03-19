@@ -37,7 +37,7 @@ def _clamp_sender(sender: str) -> str:
     s = (sender or "").strip().upper()
     if not s:
         s = DEFAULT_SENDER
-    s = "".join(ch for ch in s if ch.isalnum())
+    s = "".join(ch for ch in s if 0x20 <= ord(ch) <= 0x7E and ch not in "-+")
     if len(s) >= 8:
         return s[:8]
     return (s + (" " * 8))[:8]
