@@ -515,6 +515,7 @@ class OrchestratorControl:
                 actor=actor,
                 interrupt_policy=req.interrupt_policy,
                 expires_in_minutes=req.expires_in_minutes,
+                heightened_override=req.heightened,
             )
         except NotImplementedError as exc:
             raise ControlError("manual_origination_not_supported", str(exc)) from exc
@@ -545,6 +546,7 @@ class OrchestratorControl:
                 actor=actor,
                 interrupt_policy=req.interrupt_policy,
                 expires_in_minutes=req.expires_in_minutes,
+                heightened_override=req.heightened,
             )
         except FileNotFoundError as exc:
             out_path.unlink(missing_ok=True)

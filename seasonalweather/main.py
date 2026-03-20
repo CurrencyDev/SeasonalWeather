@@ -6300,6 +6300,7 @@ class Orchestrator:
         interrupt_policy: str = "interrupt_then_refill",
         same_locations: list[str] | None = None,
         expires_in_minutes: int | None = None,
+        heightened_override: bool | None = None,
     ) -> dict[str, object]:
         policy = (interrupt_policy or "interrupt_then_refill").strip().lower()
         if policy != "interrupt_then_refill":
@@ -6336,10 +6337,18 @@ class Orchestrator:
         self.last_product_desc = title[:200]
         if mode == "full_eas":
             self.last_toneout_at = now
-            if self._manual_full_eas_should_heighten():
-                self.last_heightened_at = now
-                self.heightened_until = now + dt.timedelta(seconds=self.cfg.cycle.min_heightened_seconds)
-                self._update_mode()
+        # Tristate heightened override:
+        #   True  → always heighten (works for voice_only too)
+        #   False → suppress even if config says to heighten
+        #   None  → fall back to station config (manual_full_eas_heightens, full_eas only)
+        if heightened_override is not None:
+            _should_heighten = heightened_override
+        else:
+            _should_heighten = mode == "full_eas" and self._manual_full_eas_should_heighten()
+        if _should_heighten:
+            self.last_heightened_at = now
+            self.heightened_until = now + dt.timedelta(seconds=self.cfg.cycle.min_heightened_seconds)
+            self._update_mode()
 
         self._schedule_cycle_refill("post-api-origination")
         await self._note_manual_station_feed(
@@ -6375,6 +6384,7 @@ class Orchestrator:
         actor: str | None = None,
         interrupt_policy: str = "interrupt_then_refill",
         expires_in_minutes: int | None = None,
+        heightened_override: bool | None = None,
     ) -> dict[str, object]:
         code = _safe_event_code(event_code)
         mode = (voice_mode or "voice_only").strip().lower()
@@ -6396,6 +6406,7 @@ class Orchestrator:
             interrupt_policy=interrupt_policy,
             same_locations=filtered_same,
             expires_in_minutes=expires_in_minutes,
+            heightened_override=heightened_override,
         )
         result["script_text"] = script_text
         return result
@@ -6412,6 +6423,7 @@ class Orchestrator:
         actor: str | None = None,
         interrupt_policy: str = "interrupt_then_refill",
         expires_in_minutes: int | None = None,
+        heightened_override: bool | None = None,
     ) -> dict[str, object]:
         code = _safe_event_code(event_code)
         mode = (voice_mode or "voice_only").strip().lower()
@@ -6444,6 +6456,7 @@ class Orchestrator:
             interrupt_policy=interrupt_policy,
             same_locations=filtered_same,
             expires_in_minutes=expires_in_minutes,
+            heightened_override=heightened_override,
         )
 
     async def _render_cycle_segment_audio(self, seg: CycleSegment) -> Path:

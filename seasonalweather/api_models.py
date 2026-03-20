@@ -84,6 +84,15 @@ class OriginateBaseRequest(ApiModel):
     sender: str | None = Field(default=None, min_length=3, max_length=16)
     expires_in_minutes: int = Field(default=30, ge=1, le=360)
     interrupt_policy: InterruptPolicy = Field(default=InterruptPolicy.INTERRUPT_THEN_REFILL)
+    heightened: bool | None = Field(
+        default=None,
+        description=(
+            "Override heightened-mode behaviour for this origination. "
+            "True forces heightened mode on; False suppresses it even if the "
+            "station config would normally enable it. "
+            "Omit (null) to use the station default (manual_full_eas_heightens)."
+        ),
+    )
 
     @field_validator("event_code")
     @classmethod
