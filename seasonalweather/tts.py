@@ -61,7 +61,9 @@ _NWS_ISSUED_LINE_RE = re.compile(r"^\d{3,4}\s*(?:AM|PM)\s+[A-Z]{2,4}\s+[A-Za-z]{
 _PRODUCT_MASTHEAD_RE = re.compile(
     r"^(?:URGENT\s*-\s*)?(?:WINTER WEATHER MESSAGE|COASTAL HAZARD MESSAGE|SPECIAL WEATHER STATEMENT|"
     r"FLOOD WARNING|FLOOD WATCH|FLOOD ADVISORY|SEVERE WEATHER STATEMENT|SEVERE THUNDERSTORM WARNING|"
-    r"TORNADO WARNING|BLIZZARD WARNING|HIGH WIND WARNING|HURRICANE LOCAL STATEMENT)\s*$",
+    r"TORNADO WARNING|BLIZZARD WARNING|HIGH WIND WARNING|HURRICANE LOCAL STATEMENT|"
+    r"REGIONAL WEATHER SUMMARY|HAZARDOUS WEATHER OUTLOOK|AREA FORECAST DISCUSSION|"
+    r"ZONE FORECAST PRODUCT|REGIONAL WEATHER SYNOPSIS)\s*$",
     re.IGNORECASE,
 )
 
@@ -77,6 +79,8 @@ _FOOTER_PREFIXES = (
     "twitter",
     "youtube",
     "weather.gov",
+    "national weather service",  # product masthead: e.g. "National Weather Service Baltimore MD/Washington DC"
+    "here is a look at the weather features",
 )
 
 # HWO section lines like:

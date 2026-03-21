@@ -205,7 +205,14 @@ def _scrub_nws_product_text(text: str) -> str:
             continue
 
         if _CODELINE_RE.match(line) and not any(ch.islower() for ch in line):
-            continue
+            # Prose gate: 3+ purely alphabetic tokens means this is all-caps NWS prose
+            # (e.g. SYN product body: "HIGH PRESSURE WILL REMAIN OVER THE REGION."),
+            # NOT a code/routing line.  Code lines (TAF, WMO headers, AWIPS IDs) have
+            # at most 1-2 purely alphabetic tokens; the rest are digit-heavy abbreviations.
+            if sum(1 for w in line.split() if w.isalpha()) >= 3:
+                pass  # all-caps prose — keep it
+            else:
+                continue
 
         out_lines.append(line)
 
@@ -575,12 +582,14 @@ class CycleBuilder:
 
     async def _build_synopsis_text(self, ctx: CycleContext) -> Optional[str]:
         """
-        “Synopsis” segment source order:
-          1) SYN product if available
-          2) AFD .SYNOPSIS only (NOT the full AFD)
-          3) None (fail closed; never read full ZFP by accident)
+        "Synopsis" segment source order:
+          1) SYN product if available (some offices: BOU, ABR, GJT, MRX)
+          2) RWS (Regional Weather Summary) — what LWX and many eastern offices publish;
+             this is the same product real NWR transmitters read for their synopsis segment
+          3) AFD .SYNOPSIS only (fallback for offices with neither SYN nor RWS)
+          4) None (fail closed; never read full ZFP by accident)
         """
-        # 1) Dedicated synopsis product if LWX publishes it
+        # 1) Dedicated synopsis product (a few offices only)
         syn_raw = await self._fetch_product_text("SYN", "LWX")
         if syn_raw:
             syn_clean = clean_for_tts(syn_raw)
@@ -589,7 +598,16 @@ class CycleBuilder:
             if syn_clean:
                 return syn_clean
 
-        # 2) AFD synopsis extraction fallback
+        # 2) Regional Weather Summary — broadcast-ready prose, same format real NWR uses
+        rws_raw = await self._fetch_product_text("RWS", "LWX")
+        if rws_raw:
+            rws_clean = clean_for_tts(rws_raw)
+            rws_clean = _trim_chars(rws_clean, self._product_max_chars("SYN", ctx.mode))
+            rws_clean = _scrub_nws_product_text(rws_clean)
+            if rws_clean:
+                return rws_clean
+
+        # 3) AFD synopsis extraction fallback
         afd_raw = await self._fetch_product_text("AFD", "LWX")
         if afd_raw:
             syn = _extract_afd_synopsis(afd_raw)
@@ -995,9 +1013,6 @@ class CycleBuilder:
             hwo_text = None
 
         # --- Synopsis (NOT full ZFP) ---
-        # --- Synopsis (NOT full ZFP) ---
-        # --- Synopsis (NOT full ZFP) ---
-        # --- Synopsis (NOT full ZFP) ---
         synopsis_text = await self._build_synopsis_text(ctx)
 
         # --- Forecast snippets (gridpoint) ---
@@ -1210,7 +1225,7 @@ class CycleBuilder:
                 CycleSegment(
                     key="zfp",
                     title="Synopsis",
-                    text=("This is the weather synopsis for our area. And now for the weather features affecting our area over the next several days. " + synopsis_text),
+                    text=("This is the weather synopsis for our area. And now for the weather features affecting our region over the next several days. " + synopsis_text),
                 )
             )
 
