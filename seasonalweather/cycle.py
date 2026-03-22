@@ -11,6 +11,10 @@ from typing import Any, Dict, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 from .nws_api import NWSApi
+from .rwr import (
+    ObsPressureCache, parse_rwr, build_rwr_obs_text, build_asos_obs_text,
+    asos_to_rwr_station,
+)
 from .tts import clean_for_tts
 
 
@@ -592,6 +596,7 @@ class CycleBuilder:
         reference_points: List[Tuple[float, float, str]],
         same_fips_all: List[str],
         cycle_cfg=None,
+        work_dir: str = "/var/lib/seasonalweather",
     ) -> None:
         self.api = api
         self.tz = ZoneInfo(tz_name)
@@ -599,6 +604,15 @@ class CycleBuilder:
         self.points = reference_points
         self.same_fips = set(same_fips_all)
         self._cycle_cfg = cycle_cfg  # CycleConfig | None — None falls back to hardcoded defaults
+        # Pressure cache for RWR trend derivation (survives restarts)
+        import os as _os
+        _cache_path = _os.path.join(work_dir, "obs_pressure_cache.json")
+        _rwr = cycle_cfg.rwr if cycle_cfg else None
+        self._pressure_cache = ObsPressureCache(
+            path=_cache_path,
+            max_hours=float(_rwr.pressure_cache_hours) if _rwr else 3.0,
+            trend_threshold_inhg=float(_rwr.pressure_trend_threshold_inhg) if _rwr else 0.02,
+        )
 
         # Observation station naming
         self._obs_aliases: Dict[str, str] = dict(cycle_cfg.obs.aliases) if cycle_cfg else {}
@@ -1086,6 +1100,95 @@ class CycleBuilder:
                 continue
         return None
 
+    async def _build_obs_rwr_segment(self, ctx: CycleContext) -> Optional[str]:
+        # Build the observations segment using RWR as primary source,
+        # falling back to ASOS when RWR is stale or unavailable.
+        # Returns the spoken text string or None.
+        import datetime as _dt
+        rwr_cfg = self._cycle_cfg.rwr if self._cycle_cfg else None
+        rwr_enabled = rwr_cfg and rwr_cfg.enabled
+        intro = "And now for the current observed weather conditions in our area"
+
+        if rwr_enabled:
+            try:
+                raw = await self._fetch_product_text("RWR", rwr_cfg.office)
+                if raw:
+                    product = parse_rwr(
+                        raw,
+                        name_map=dict(rwr_cfg.station_names) if rwr_cfg else {},
+                    )
+                    # Staleness check
+                    stale = True
+                    if product and product.issuance_dt:
+                        age_mins = (
+                            _dt.datetime.now(tz=_dt.timezone.utc)
+                            - product.issuance_dt
+                        ).total_seconds() / 60
+                        stale = age_mins > (rwr_cfg.staleness_minutes if rwr_cfg else 75)
+                    if product and not stale:
+                        anchors = list(rwr_cfg.anchor_stations) if rwr_cfg else []
+                        text = build_rwr_obs_text(
+                            product=product,
+                            anchor_names=anchors,
+                            max_compact_per_section=(
+                                rwr_cfg.max_compact_per_section if rwr_cfg else 8
+                            ),
+                            intro_prefix=intro,
+                            cache=self._pressure_cache,
+                        )
+                        if text:
+                            return text
+            except Exception:
+                pass  # fall through to ASOS
+
+        # ASOS fallback
+        fallback_ids = (
+            list(rwr_cfg.fallback_stations)
+            if rwr_cfg and rwr_cfg.fallback_stations
+            else list(self.obs_stations)
+        )
+        if not fallback_ids:
+            return None
+
+        # Height-aware station count
+        max_obs = 1 if ctx.mode == "heightened" else (
+            (self._cycle_cfg.obs.max_normal if self._cycle_cfg else 0)
+            or min(8, len(fallback_ids))
+        )
+
+        # Rotation
+        sts = list(fallback_ids)
+        rot_period = self._cycle_cfg.obs.rotate_period_s if self._cycle_cfg else 300
+        rot_step = (self._cycle_cfg.obs.rotate_step or max_obs) if self._cycle_cfg else max_obs
+        import datetime as _dt2
+        slot = int(_dt2.datetime.now().timestamp() // max(rot_period, 1))
+        offset = (slot * max(rot_step, 1)) % len(sts)
+        sts = sts[offset:] + sts[:offset]
+
+        # Fetch ASOS observations
+        name_map = dict(rwr_cfg.station_names) if rwr_cfg else {}
+        anchor = sts[0] if sts else ""
+        station_obs: List[Any] = []
+        for st in sts[:max_obs]:
+            try:
+                props = await self.api.latest_observation(st)
+                if props:
+                    station_obs.append((st, props))
+            except Exception:
+                continue
+
+        if not station_obs:
+            return None
+
+        return build_asos_obs_text(
+            stations=station_obs,
+            anchor_id=anchor,
+            max_compact=max_obs,
+            intro_prefix=intro,
+            cache=self._pressure_cache,
+            name_map=name_map,
+        )
+
     async def build_segments(
         self,
         station_name: str,
@@ -1317,50 +1420,10 @@ class CycleBuilder:
         # --- CWF fetch (assembled into segments below, after `segments` is defined) ---
         cwf_text = await self._build_cwf_text(ctx)
 
-        # --- Observations ---
-        obs_lines: List[str] = []
-        _obs_max_normal = (self._cycle_cfg.obs.max_normal if self._cycle_cfg else 0) or min(8, len(self.obs_stations) or 0)
-        max_obs = 1 if ctx.mode == "heightened" else _obs_max_normal
-
-        sts = list(self.obs_stations)
-        if sts:
-            rot_period = self._cycle_cfg.obs.rotate_period_s if self._cycle_cfg else 300
-            rot_step = (self._cycle_cfg.obs.rotate_step or max_obs) if self._cycle_cfg else max_obs
-            slot = int(now.timestamp() // max(rot_period, 1))
-            offset = (slot * max(rot_step, 1)) % len(sts)
-            sts = sts[offset:] + sts[:offset]
-
-        for st in sts[:max_obs]:
-            try:
-                props = await self.api.latest_observation(st)
-                if not props:
-                    continue
-
-                label = await self._obs_label(st)
-
-                desc = props.get("textDescription") or ""
-                temp_c = (props.get("temperature") or {}).get("value")
-                temp_f = None
-                if isinstance(temp_c, (int, float)):
-                    temp_f = temp_c * 9 / 5 + 32
-                wind_mps = (props.get("windSpeed") or {}).get("value")
-                wind_mph = None
-                if isinstance(wind_mps, (int, float)):
-                    wind_mph = wind_mps * 2.23694
-
-                seg = f"At {label}, "
-                if temp_f is not None:
-                    seg += f"{round(temp_f)} degrees. "
-                if isinstance(desc, str) and desc:
-                    seg += f"{desc}. "
-                if wind_mph is not None and wind_mph >= 3:
-                    seg += f"Wind {round(wind_mph)} miles per hour."
-
-                seg = _scrub_nws_product_text(seg).strip()
-                if seg:
-                    obs_lines.append(seg)
-            except Exception:
-                continue
+        # --- Observations (RWR primary / ASOS fallback) ---
+        # obs_text is assembled here but appended to segments below,
+        # after the forecast + CWF segments (correct NWR cycle order).
+        obs_text_rwr = await self._build_obs_rwr_segment(ctx)
 
         # --- Station ID ---
         # --- Station ID ---
@@ -1466,9 +1529,8 @@ class CycleBuilder:
             )
 
         # --- Observations ---
-        if obs_lines:
-            obs_text = "And now for the current observed weather conditions in our area. " + " ".join(obs_lines)
-            segments.append(CycleSegment(key="obs", title="Observations", text=obs_text))
+        if obs_text_rwr:
+            segments.append(CycleSegment(key="obs", title="Observations", text=obs_text_rwr))
 
         segments.append(
             CycleSegment(

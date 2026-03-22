@@ -146,6 +146,27 @@ class CycleCwfConfig:
 
 
 @dataclass(frozen=True)
+class CycleRwrConfig:
+    # Regional Weather Roundup (RWR) observations segment configuration.
+    enabled: bool
+    office: str                 # WFO to pull RWR from (e.g. 'LWX')
+    staleness_minutes: int      # fall back to ASOS if RWR older than this
+    # Station names matching the raw RWR product (upper-case) that get
+    # full-detail treatment (wind, pressure, dew point, humidity).
+    # Empty list = auto-derive from first station in first section.
+    anchor_stations: List[str]
+    # ASOS station IDs to use when RWR is stale/unavailable.
+    # Empty = use observations.stations from the main config.
+    fallback_stations: List[str]
+    pressure_trend_threshold_inhg: float
+    pressure_cache_hours: float
+    max_compact_per_section: int
+    # Optional spoken-name overrides for RWR station abbreviations.
+    # {RAW_UPPER: spoken_name}  e.g. {'DULLES': 'Dulles Airport'}
+    station_names: Dict[str, str]
+
+
+@dataclass(frozen=True)
 class CycleConfig:
     normal_interval_seconds: int
     heightened_interval_seconds: int
@@ -160,6 +181,7 @@ class CycleConfig:
     afd: CycleProductConfig
     syn: CycleProductConfig
     cwf: CycleCwfConfig
+    rwr: CycleRwrConfig
 
 
 @dataclass(frozen=True)
@@ -561,6 +583,7 @@ def load_config(path: str) -> AppConfig:
     afd_raw = cy.get("afd", {})
     syn_raw = cy.get("syn", {})
     cwf_raw = cy.get("cwf", {})
+    rwr_raw = cy.get("rwr", {})
 
     cycle = CycleConfig(
         normal_interval_seconds=int(cy["normal_interval_seconds"]),
@@ -619,6 +642,31 @@ def load_config(path: str) -> AppConfig:
             offices=[str(o).upper().strip() for o in (cwf_raw.get("offices") or [])],
             max_chars_normal=int(cwf_raw.get("max_chars_normal", 2000)),
             max_chars_heightened=int(cwf_raw.get("max_chars_heightened", 1200)),
+        ),
+        rwr=CycleRwrConfig(
+            enabled=bool(rwr_raw.get("enabled", False)),
+            office=str(rwr_raw.get("office", "LWX")).upper().strip(),
+            staleness_minutes=int(rwr_raw.get("staleness_minutes", 75)),
+            anchor_stations=[
+                str(s).upper().strip()
+                for s in (rwr_raw.get("anchor_stations") or [])
+                if str(s).strip()
+            ],
+            fallback_stations=[
+                str(s).upper().strip()
+                for s in (rwr_raw.get("fallback_stations") or [])
+                if str(s).strip()
+            ],
+            pressure_trend_threshold_inhg=float(
+                rwr_raw.get("pressure_trend_threshold_inhg", 0.02)
+            ),
+            pressure_cache_hours=float(rwr_raw.get("pressure_cache_hours", 3.0)),
+            max_compact_per_section=int(rwr_raw.get("max_compact_per_section", 8)),
+            station_names={
+                str(k).upper().strip(): str(v).strip()
+                for k, v in (rwr_raw.get("station_names") or {}).items()
+                if str(k).strip() and str(v).strip()
+            },
         ),
     )
 
