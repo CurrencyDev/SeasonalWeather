@@ -56,6 +56,123 @@ _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
 _SPACE_RE = re.compile(r"\s+")
 _ALL_PUNCT_LINE_RE = re.compile(r"^[\W_]+$")
 
+# CWF/marine product zone routing lines look like:
+#   ANZ531-532-533-212300-  or  MDZ010-011-VAZ036-260700-
+# The existing _scrub_nws_product_text catches most of these via _CODELINE_RE
+# but this dedicated regex guarantees removal as a lightweight pre-pass.
+_MARINE_ZONE_ROUTING_RE = re.compile(
+    r"^[A-Z]{2}[Z0-9]\d{2,3}(?:-[A-Z0-9]{3,6})*-\d{6}-?\s*$"
+)
+
+
+def _strip_marine_routing_lines(text: str) -> str:
+    # Pre-pass for CWF / marine product text.
+    # Strips zone routing/expiry header lines before the main scrubber.
+    # Examples removed:
+    #   ANZ531-532-533-534-212300-
+    #   MDZ010-011-VAZ036-260700-
+    out = []
+    for ln in (text or "").splitlines():
+        if _MARINE_ZONE_ROUTING_RE.match(ln.strip()):
+            continue
+        out.append(ln)
+    return "\n".join(out)
+
+
+def _scrub_cwf_product_text(text: str) -> str:
+    # CWF-specific pre-pass before the generic NWS scrubber.
+    # Strips marine product boilerplate, expands period markers
+    # (.SUN... -> 'Sunday.'), advisory banners, direction
+    # abbreviations (NW -> northwest), and units (kt -> knots).
+
+    _period_map = {
+        'REST OF TONIGHT': 'Rest of tonight',
+        'REST OF TODAY':   'Rest of today',
+        'TONIGHT': 'Tonight',
+        'TODAY':   'Today',
+        'SUN': 'Sunday',       'SUN NIGHT': 'Sunday night',
+        'MON': 'Monday',       'MON NIGHT': 'Monday night',
+        'TUE': 'Tuesday',      'TUE NIGHT': 'Tuesday night',
+        'WED': 'Wednesday',    'WED NIGHT': 'Wednesday night',
+        'THU': 'Thursday',     'THU NIGHT': 'Thursday night',
+        'FRI': 'Friday',       'FRI NIGHT': 'Friday night',
+        'SAT': 'Saturday',     'SAT NIGHT': 'Saturday night',
+    }
+    # Longest keys first so 'SUN NIGHT' matches before 'SUN'.
+    _period_keys = sorted(_period_map, key=len, reverse=True)
+    _period_re = re.compile(
+        r'^\.' + r'(' + '|'.join(re.escape(k) for k in _period_keys) + r')'
+        + r'\s*\.{3}(.*)',
+        re.IGNORECASE,
+    )
+
+    # Boilerplate lines to drop entirely.
+    _drop_res = [
+        re.compile(r"^coastal waters forecast\s*$", re.IGNORECASE),
+        re.compile(r"^forecasts of wave heights", re.IGNORECASE),
+        re.compile(r"^relative to tidal currents", re.IGNORECASE),
+        re.compile(r"^blowing against the tidal", re.IGNORECASE),
+        re.compile(r"^waves flat where waters are iced", re.IGNORECASE),
+        # .SYNOPSIS FOR THE ... section headers
+        re.compile(r"^\.[A-Z ]+for the [A-Z ]+\.{3}\s*$", re.IGNORECASE),
+    ]
+
+    # Inline advisory banners: ...SMALL CRAFT ADVISORY IN EFFECT...
+    _advisory_re = re.compile(r"^\.{3}([A-Z][A-Z ,/]+?)\.{3}\s*$")
+
+    # Direction abbreviations: longest first to avoid N matching in NW etc.
+    _dir_map = {
+        'NNW': 'north-northwest', 'NNE': 'north-northeast',
+        'SSW': 'south-southwest', 'SSE': 'south-southeast',
+        'NW': 'northwest', 'NE': 'northeast',
+        'SW': 'southwest', 'SE': 'southeast',
+        'N': 'north', 'S': 'south', 'E': 'east', 'W': 'west',
+    }
+    _dir_re = re.compile(r'\b(NNW|NNE|SSW|SSE|NW|NE|SW|SE|N|S|E|W)\b')
+
+    out: List[str] = []
+    for raw_ln in (text or '').replace('\r', '').splitlines():
+        ln = raw_ln.strip()
+
+        if not ln:
+            out.append('')
+            continue
+
+        # Drop known boilerplate lines.
+        if any(pat.search(ln) for pat in _drop_res):
+            continue
+
+        # Transform inline advisory banners.
+        m = _advisory_re.match(ln)
+        if m:
+            out.append(m.group(1).strip().title() + '.')
+            continue
+
+        # Expand .DAY... period markers.
+        m = _period_re.match(ln)
+        if m:
+            key = m.group(1).strip().upper()
+            rest = m.group(2).strip()
+            spoken = _period_map.get(key, key.title())
+            ln = f'{spoken}. {rest}' if rest else f'{spoken}.'
+
+        # Collapse remaining ... to ', '
+        ln = re.sub(r'\.{3,}', ', ', ln)
+
+        # Expand direction abbreviations.
+        ln = _dir_re.sub(lambda mo: _dir_map.get(mo.group(1), mo.group(1)), ln)
+
+        # Expand marine units -- singular before plural so '1 ft' -> '1 foot'
+        # not '1 feet', matching how real NWR reads the CWF.
+        ln = re.sub(r'\b1\s+kt\b', '1 knot', ln)
+        ln = re.sub(r'\b1\s+ft\b', '1 foot', ln)
+        ln = re.sub(r'\bkt\b', 'knots', ln)
+        ln = re.sub(r'\bft\b', 'feet', ln)
+
+        out.append(ln)
+
+    return '\n'.join(out)
+
 _WMO_HEADER_RE = re.compile(r"^[A-Z]{4}\d{2}\s+[A-Z]{4}\s+\d{6}$")
 _ALL_ZERO_RE = re.compile(r"^0{3,}$")
 _CODELINE_RE = re.compile(r"^[A-Z0-9/>\-.,\s]{10,}$")
@@ -566,6 +683,11 @@ class CycleBuilder:
                 return self._cycle_cfg.syn.max_chars_heightened if self._cycle_cfg else 900
             return self._cycle_cfg.syn.max_chars_normal if self._cycle_cfg else 1500
 
+        if k == "CWF":
+            if m == "heightened":
+                return self._cycle_cfg.cwf.max_chars_heightened if self._cycle_cfg else 1200
+            return self._cycle_cfg.cwf.max_chars_normal if self._cycle_cfg else 2000
+
         return None
 
     async def _fetch_product_text(self, kind: str, office: str) -> Optional[str]:
@@ -936,6 +1058,34 @@ class CycleBuilder:
 
         return "And now, for the Storm Prediction Center's convective outlook for severe thunderstorms in our area. " + " ".join(lines)
 
+    async def _build_cwf_text(self, ctx: CycleContext) -> Optional[str]:
+        # Fetch and scrub the Coastal Waters Forecast for this cycle.
+        # Enabled when cycle.cwf.enabled = true.
+        # Tries each configured office in order; returns first non-empty result.
+        if not (self._cycle_cfg and self._cycle_cfg.cwf.enabled):
+            return None
+        offices = list(self._cycle_cfg.cwf.offices) if self._cycle_cfg else []
+        if not offices:
+            return None
+        max_chars = self._product_max_chars("CWF", ctx.mode)
+        for office in offices:
+            try:
+                raw = await self.api.coastal_waters_forecast_text(office)
+                if not raw:
+                    continue
+                # Pre-pass: strip zone routing lines (ANZ531-532-212300-)
+                cleaned = _strip_marine_routing_lines(raw)
+                # CWF-specific pass: boilerplate, period markers, abbrevs
+                cleaned = _scrub_cwf_product_text(cleaned)
+                cleaned = clean_for_tts(cleaned)
+                cleaned = _scrub_nws_product_text(cleaned)
+                cleaned = _trim_chars(cleaned, max_chars)
+                if cleaned:
+                    return cleaned
+            except Exception:
+                continue
+        return None
+
     async def build_segments(
         self,
         station_name: str,
@@ -1035,72 +1185,137 @@ class CycleBuilder:
         # Per-point safety trim (keep generous; avoid "Tuesday…" mid-cut)
         point_max = (self._cycle_cfg.fc.point_max_chars if self._cycle_cfg else 1600)
 
-        pts = list(self.points)
-        if pts:
-            rot_period = self._cycle_cfg.fc.rotate_period_s if self._cycle_cfg else 300
-            rot_step = (self._cycle_cfg.fc.rotate_step or max_points) if self._cycle_cfg else max_points
-            slot = int(now.timestamp() // max(rot_period, 1))
-            offset = (slot * max(rot_step, 1)) % len(pts)
-            pts = pts[offset:] + pts[:offset]
+        # --- ZFP zone-aware forecast ---
+        # When forecast_zones are configured in cycle.fc, use the NWS
+        # /zones/forecast/{zoneId}/forecast endpoint (ZFP human-authored
+        # broadcast prose, same as real NWR reads).  Falls back to the
+        # legacy gridpoint path when zones list is empty or all fetches fail.
+        #
+        # ZFP differences vs gridpoint:
+        #   - Always uses detailedForecast (temps embedded in prose text)
+        #   - No temperature phrase appended (already in text: 'highs near 65')
+        #   - No isDaytime / temperature fields on zone periods
+        forecast_zones = list(self._cycle_cfg.fc.forecast_zones) if self._cycle_cfg else []
 
-        for lat, lon, label in pts[:max_points]:
-            try:
-                periods = await self.api.point_forecast_periods(lat, lon)
-                if not periods:
-                    continue
+        if forecast_zones:
+            # Rotate through configured zones using the same rhythm as gridpoint.
+            rot_period_z = self._cycle_cfg.fc.rotate_period_s if self._cycle_cfg else 300
+            rot_step_z = (self._cycle_cfg.fc.rotate_step or max_points) if self._cycle_cfg else max_points
+            slot_z = int(now.timestamp() // max(rot_period_z, 1))
+            offset_z = (slot_z * max(rot_step_z, 1)) % len(forecast_zones)
+            zones_rot = forecast_zones[offset_z:] + forecast_zones[:offset_z]
 
-                entries: List[str] = []
-                for p in periods[:max_periods]:
-                    name = (p.get("name") or "").strip()
-                    val = (p.get(field) or "").strip()
-                    if not val:
+            for zone_id, label in zones_rot[:max_points]:
+                try:
+                    periods = await self.api.zone_forecast_periods(zone_id)
+                    if not periods:
                         continue
 
-                    # Temperature high/low from gridpoint forecast.
-                    # The gridpoint endpoint already returns Fahrenheit for CONUS —
-                    # no conversion needed (unlike observations, which return Celsius).
-                    # NOTE: no trailing period here — the group joiner (". ".join + ".")
-                    # owns all sentence-boundary punctuation. A trailing period in the
-                    # entry produces a double period ("degrees.. Tonight") which Paul
-                    # skips right over without pausing.
-                    temp_raw = p.get("temperature")
-                    is_day = bool(p.get("isDaytime", True))
-                    temp_phrase = ""
-                    if isinstance(temp_raw, (int, float)):
-                        temp_rounded = round(temp_raw)
-                        temp_phrase = (
-                            f" With a high near {temp_rounded} degrees"
-                            if is_day
-                            else f" With a low around {temp_rounded} degrees"
-                        )
+                    entries: List[str] = []
+                    for p in periods[:max_periods]:
+                        name = (p.get("name") or "").strip()
+                        # ZFP always has detailedForecast prose; temps are
+                        # embedded -- no separate temp_phrase needed.
+                        val = (p.get("detailedForecast") or "").strip()
+                        if not val:
+                            continue
+                        name = name.replace("—", "-")
+                        val = val.replace("—", "-")
+                        name = _SPACE_RE.sub(" ", name).strip()
+                        val = _SPACE_RE.sub(" ", val).strip()
+                        entry = f"{name}: {val}" if name else val
+                        # ZFP prose already ends with '.'; the group joiner
+                        # adds its own sentence boundary, so strip the trailing
+                        # period to avoid 'mph.. Sunday:' speed-reads.
+                        entry = re.sub(r'\.\s*$', '', entry.strip())
+                        entries.append(entry)
 
-                    # DECTalk pacing: kill em-dash and collapse odd whitespace
-                    name = name.replace("—", "-")
-                    val = val.replace("—", "-")
-                    name = _SPACE_RE.sub(" ", name).strip()
-                    val = _SPACE_RE.sub(" ", val).strip()
+                    if not entries:
+                        continue
 
-                    entry = f"{name}: {val}{temp_phrase}" if name else f"{val}{temp_phrase}"
-                    entries.append(entry.strip())
+                    groups: List[str] = []
+                    for i in range(0, len(entries), max(1, per_group)):
+                        chunk = entries[i:i + max(1, per_group)]
+                        groups.append(". ".join(chunk) + ".")
 
-                if not entries:
+                    line = f"The forecast for {label}.\n" + "\n".join(groups)
+                    line = _scrub_nws_product_text(line)
+                    line = _trim_chars(line, point_max)
+                    if line:
+                        fc_lines.append(line)
+                except Exception:
                     continue
 
-                groups: List[str] = []
-                for i in range(0, len(entries), max(1, per_group)):
-                    chunk = entries[i:i + max(1, per_group)]
-                    # Sentence-ish pacing
-                    groups.append(". ".join(chunk) + ".")
+        else:
+            # Legacy gridpoint path -- used when no forecast_zones are configured.
+            pts = list(self.points)
+            if pts:
+                rot_period = self._cycle_cfg.fc.rotate_period_s if self._cycle_cfg else 300
+                rot_step = (self._cycle_cfg.fc.rotate_step or max_points) if self._cycle_cfg else max_points
+                slot = int(now.timestamp() // max(rot_period, 1))
+                offset = (slot * max(rot_step, 1)) % len(pts)
+                pts = pts[offset:] + pts[:offset]
 
-                # Newlines create audible pauses; keep it compact but not crunched
-                line = f"The forecast for {label}.\n" + "\n".join(groups)
-                line = _scrub_nws_product_text(line)
-                line = _trim_chars(line, point_max)
+            for lat, lon, label in pts[:max_points]:
+                try:
+                    periods = await self.api.point_forecast_periods(lat, lon)
+                    if not periods:
+                        continue
 
-                if line:
-                    fc_lines.append(line)
-            except Exception:
-                continue
+                    entries: List[str] = []
+                    for p in periods[:max_periods]:
+                        name = (p.get("name") or "").strip()
+                        val = (p.get(field) or "").strip()
+                        if not val:
+                            continue
+
+                        # Temperature high/low from gridpoint forecast.
+                        # The gridpoint endpoint already returns Fahrenheit for CONUS --
+                        # no conversion needed (unlike observations, which return Celsius).
+                        # NOTE: no trailing period here -- the group joiner joins with
+                        # ". " and appends ".". A trailing period in the entry produces
+                        # a double period ("degrees.. Tonight") which Paul skips over.
+                        temp_raw = p.get("temperature")
+                        is_day = bool(p.get("isDaytime", True))
+                        temp_phrase = ""
+                        if isinstance(temp_raw, (int, float)):
+                            temp_rounded = round(temp_raw)
+                            temp_phrase = (
+                                f" With a high near {temp_rounded} degrees"
+                                if is_day
+                                else f" With a low around {temp_rounded} degrees"
+                            )
+
+                        # DECTalk pacing: kill em-dash and collapse odd whitespace
+                        name = name.replace("—", "-")
+                        val = val.replace("—", "-")
+                        name = _SPACE_RE.sub(" ", name).strip()
+                        val = _SPACE_RE.sub(" ", val).strip()
+
+                        entry = f"{name}: {val}{temp_phrase}" if name else f"{val}{temp_phrase}"
+                        entries.append(entry.strip())
+
+                    if not entries:
+                        continue
+
+                    groups: List[str] = []
+                    for i in range(0, len(entries), max(1, per_group)):
+                        chunk = entries[i:i + max(1, per_group)]
+                        # Sentence-ish pacing
+                        groups.append(". ".join(chunk) + ".")
+
+                    # Newlines create audible pauses; keep it compact but not crunched
+                    line = f"The forecast for {label}.\n" + "\n".join(groups)
+                    line = _scrub_nws_product_text(line)
+                    line = _trim_chars(line, point_max)
+
+                    if line:
+                        fc_lines.append(line)
+                except Exception:
+                    continue
+
+        # --- CWF fetch (assembled into segments below, after `segments` is defined) ---
+        cwf_text = await self._build_cwf_text(ctx)
 
         # --- Observations ---
         obs_lines: List[str] = []
@@ -1236,6 +1451,19 @@ class CycleBuilder:
             else:
                 forecast_text = "This is the overall forecast section for our area from the National Weather Service. " + " ".join(fc_lines)
             segments.append(CycleSegment(key="fcst", title="Forecast", text=forecast_text))
+
+        # --- Coastal Waters Forecast ---
+        if cwf_text:
+            segments.append(
+                CycleSegment(
+                    key="cwf",
+                    title="Coastal Waters Forecast",
+                    text=(
+                        "And now for the coastal and marine weather forecast for our area. "
+                        + cwf_text
+                    ),
+                )
+            )
 
         # --- Observations ---
         if obs_lines:

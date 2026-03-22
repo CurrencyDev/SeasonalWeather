@@ -98,3 +98,22 @@ class NWSApi:
         data = await self._get_json("https://api.weather.gov/alerts/active", params=params)
         feats = data.get("features")
         return list(feats) if isinstance(feats, list) else []
+
+    async def zone_forecast_periods(self, zone_id: str) -> List[Dict[str, Any]]:
+        # Fetch ZFP forecast periods for a public forecast zone (e.g. 'MDZ010').
+        # Endpoint: /zones/forecast/{zoneId}/forecast
+        # Returns period dicts with at minimum 'name' and 'detailedForecast'.
+        url = f"https://api.weather.gov/zones/forecast/{zone_id}/forecast"
+        data = await self._get_json(url)
+        return list((data.get("properties", {}) or {}).get("periods", []) or [])
+
+    async def coastal_waters_forecast_text(self, office: str) -> Optional[str]:
+        # Fetch the latest CWF (Coastal Waters Forecast) product text
+        # for the given WFO office (e.g. 'LWX').  Returns raw text or None.
+        pid = await self.latest_product_id("CWF", office)
+        if not pid:
+            return None
+        prod = await self.get_product(pid)
+        if not prod or not prod.product_text:
+            return None
+        return prod.product_text

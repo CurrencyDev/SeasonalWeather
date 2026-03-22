@@ -70,6 +70,13 @@ class StationConfig:
     service_area_name: str
     timezone: str
     disclaimer: str
+    # Governs which broadcast segments are generated.
+    # land         - ZFP land zones only, no marine segment
+    # coastal      - CWF marine segment only (pure marine station)
+    # land_coastal - ZFP + CWF (default for Canonical SeasonalWeather)
+    # land_marine  - ZFP + CWF for inland/bay waters (non-ocean)
+    # marine       - CWF / marine products only
+    deployment_type: str = "land"  # land|coastal|land_coastal|land_marine|marine
 
 
 @dataclass(frozen=True)
@@ -101,6 +108,10 @@ class CycleFcConfig:
     line_max_chars: int
     rotate_period_s: int
     rotate_step: int
+    # Ordered list of (zone_id, display_label) pairs.  When non-empty
+    # the ZFP /zones/forecast/{zoneId}/forecast path is used instead of
+    # gridpoint lat/lon fetches.  Falls back to gridpoint if empty.
+    forecast_zones: List[Tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -126,6 +137,15 @@ class CycleHwoConfig:
 
 
 @dataclass(frozen=True)
+class CycleCwfConfig:
+    # Coastal Waters Forecast segment configuration.
+    enabled: bool
+    offices: List[str]          # WFO offices to pull CWF from, e.g. ["LWX"]
+    max_chars_normal: int       # 0 = unlimited
+    max_chars_heightened: int
+
+
+@dataclass(frozen=True)
 class CycleConfig:
     normal_interval_seconds: int
     heightened_interval_seconds: int
@@ -139,6 +159,7 @@ class CycleConfig:
     hwo: CycleHwoConfig
     afd: CycleProductConfig
     syn: CycleProductConfig
+    cwf: CycleCwfConfig
 
 
 @dataclass(frozen=True)
@@ -515,7 +536,14 @@ def load_config(path: str) -> AppConfig:
     # ------------------------------------------------------------------
     # station
     # ------------------------------------------------------------------
-    station = StationConfig(**raw["station"])
+    st = raw["station"]
+    station = StationConfig(
+        name=str(st["name"]),
+        service_area_name=str(st["service_area_name"]),
+        timezone=str(st["timezone"]),
+        disclaimer=str(st["disclaimer"]),
+        deployment_type=str(st.get("deployment_type", "land")),
+    )
 
     # ------------------------------------------------------------------
     # stream
@@ -532,6 +560,7 @@ def load_config(path: str) -> AppConfig:
     hwo_raw = cy.get("hwo", {})
     afd_raw = cy.get("afd", {})
     syn_raw = cy.get("syn", {})
+    cwf_raw = cy.get("cwf", {})
 
     cycle = CycleConfig(
         normal_interval_seconds=int(cy["normal_interval_seconds"]),
@@ -560,6 +589,11 @@ def load_config(path: str) -> AppConfig:
             line_max_chars=int(fc_raw.get("line_max_chars", 1600)),
             rotate_period_s=int(fc_raw.get("rotate_period_s", 300)),
             rotate_step=int(fc_raw.get("rotate_step", 0)),
+            forecast_zones=[
+                (str(z["id"]).upper().strip(), str(z["label"]).strip())
+                for z in (fc_raw.get("forecast_zones") or [])
+                if isinstance(z, dict) and z.get("id") and z.get("label")
+            ],
         ),
         obs=CycleObsConfig(
             max_normal=int(obs_raw.get("max_normal", 0)),
@@ -579,6 +613,12 @@ def load_config(path: str) -> AppConfig:
         syn=CycleProductConfig(
             max_chars_normal=int(syn_raw.get("max_chars_normal", 1500)),
             max_chars_heightened=int(syn_raw.get("max_chars_heightened", 900)),
+        ),
+        cwf=CycleCwfConfig(
+            enabled=bool(cwf_raw.get("enabled", False)),
+            offices=[str(o).upper().strip() for o in (cwf_raw.get("offices") or [])],
+            max_chars_normal=int(cwf_raw.get("max_chars_normal", 2000)),
+            max_chars_heightened=int(cwf_raw.get("max_chars_heightened", 1200)),
         ),
     )
 
