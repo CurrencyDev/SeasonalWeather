@@ -429,6 +429,47 @@ class DedupeConfig:
 
 # --- tts ---
 
+
+
+@dataclass(frozen=True)
+class LogsDiscordConfig:
+    """Discord webhook logging knobs. URLs come from .env, not config.yaml."""
+    enabled: bool = False
+
+    # Per-channel on/off toggles.  A channel only fires if both `enabled` AND
+    # the corresponding env var is set.
+    alerts_enabled: bool = True
+    ops_enabled: bool = True
+    api_enabled: bool = True
+    errors_enabled: bool = True
+
+    # Webhook URLs (populated from .env by load_config; kept as empty strings
+    # here so the dataclass can be constructed without env vars in tests).
+    alerts_url: str = ""
+    ops_url: str = ""
+    api_url: str = ""
+    errors_url: str = ""
+
+    # Rate limiting — max embeds per webhook per minute.
+    # Discord allows ~30/min per webhook; stay conservative.
+    rate_limit_per_minute: int = 20
+
+    # Content knobs
+    post_tests: bool = True           # Post RWT/RMT test originations to alerts channel
+    post_voice_only: bool = True      # Post voice-only cut-ins (SPS, CAP voice, etc.)
+    cycle_rebuild_log: bool = True    # Post cycle rebuild events to ops channel
+    # AlertTracker lifecycle (load/purge on startup) — slightly noisy, off by default
+    alerttracker_lifecycle_log: bool = False
+
+    # Base URL for the Lucide icon CDN, e.g. "https://cdn.seasonalnet.org"
+    # Leave empty to omit thumbnails from all embeds.
+    icon_cdn_url: str = ""
+
+
+@dataclass(frozen=True)
+class LogsConfig:
+    discord: LogsDiscordConfig = field(default_factory=LogsDiscordConfig)
+
 @dataclass(frozen=True)
 class VoiceTextPaulConfig:
     run_as: str
@@ -531,6 +572,7 @@ class AppConfig:
     api: ApiConfig
     live_time: LiveTimeConfig
     dedupe: DedupeConfig
+    logs: LogsConfig
 
     # secrets (from environment)
     secrets: SecretsConfig
@@ -989,6 +1031,33 @@ def load_config(path: str) -> AppConfig:
         liquidsoap_port=_env_int("LIQUIDSOAP_TELNET_PORT", 1234),
     )
 
+
+    # ------------------------------------------------------------------
+    # logs — Discord webhook URLs (from .env, not config.yaml)
+    # ------------------------------------------------------------------
+    _ld = _get(raw, "logs", "discord") or {}
+    _logs_discord = LogsDiscordConfig(
+        enabled=bool(_get(_ld, "enabled", default=False)),
+        alerts_enabled=bool(_get(_ld, "alerts_enabled", default=True)),
+        ops_enabled=bool(_get(_ld, "ops_enabled", default=True)),
+        api_enabled=bool(_get(_ld, "api_enabled", default=True)),
+        errors_enabled=bool(_get(_ld, "errors_enabled", default=True)),
+        # URLs come exclusively from env; not from config.yaml (no auth on webhooks)
+        alerts_url=_env_str("SEASONAL_DISCORD_ALERTS_WEBHOOK", ""),
+        ops_url=_env_str("SEASONAL_DISCORD_OPS_WEBHOOK", ""),
+        api_url=_env_str("SEASONAL_DISCORD_API_WEBHOOK", ""),
+        errors_url=_env_str("SEASONAL_DISCORD_ERRORS_WEBHOOK", ""),
+        rate_limit_per_minute=int(_get(_ld, "rate_limit_per_minute", default=20)),
+        post_tests=bool(_get(_ld, "post_tests", default=True)),
+        post_voice_only=bool(_get(_ld, "post_voice_only", default=True)),
+        cycle_rebuild_log=bool(_get(_ld, "cycle_rebuild_log", default=True)),
+        alerttracker_lifecycle_log=bool(
+            _get(_ld, "alerttracker_lifecycle_log", default=False)
+        ),
+        icon_cdn_url=str(_get(_ld, "icon_cdn_url", default="") or "").strip(),
+    )
+    logs = LogsConfig(discord=_logs_discord)
+
     return AppConfig(
         station=station,
         stream=stream,
@@ -1014,4 +1083,5 @@ def load_config(path: str) -> AppConfig:
         live_time=live_time,
         dedupe=dedupe,
         secrets=secrets,
+        logs=logs,
     )

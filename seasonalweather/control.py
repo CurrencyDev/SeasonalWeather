@@ -331,6 +331,17 @@ class OrchestratorControl:
         self._ensure_backend_ready()
         reason_text = (reason or "admin-request").strip() or "admin-request"
         await self.orch._queue_cycle_once(reason=f"api-{reason_text[:48]}")
+        # _API_REBUILD_DL_
+        try:
+            self.orch.discord.api_action(
+                method="POST",
+                endpoint="/v1/cycle/rebuild",
+                actor=actor,
+                status="succeeded",
+                details={"reason": reason_text, "mode": getattr(self.orch, "mode", "unknown")},
+            )
+        except Exception:
+            pass
         return {
             "ok": True,
             "reason": reason_text,
@@ -345,6 +356,17 @@ class OrchestratorControl:
         self.orch._update_mode()
         self.orch.last_product_desc = f"Manual heightened mode: {reason}"[:200]
         await self.orch._queue_cycle_once(reason="api-heightened")
+        # _API_SET_HEIGHTENED_DL_
+        try:
+            self.orch.discord.api_action(
+                method="POST",
+                endpoint="/v1/mode/heightened",
+                actor=actor,
+                status="succeeded",
+                details={"minutes": minutes, "reason": reason},
+            )
+        except Exception:
+            pass
         return {
             "ok": True,
             "mode": getattr(self.orch, "mode", "unknown"),
@@ -358,6 +380,17 @@ class OrchestratorControl:
         self.orch._update_mode()
         self.orch.last_product_desc = (f"Manual heightened mode cleared: {reason}" if reason else "Manual heightened mode cleared")[:200]
         await self.orch._queue_cycle_once(reason="api-clear-heightened")
+        # _API_CLEAR_HEIGHTENED_DL_
+        try:
+            self.orch.discord.api_action(
+                method="POST",
+                endpoint="/v1/mode/clear",
+                actor=actor,
+                status="succeeded",
+                details={"reason": reason or ""},
+            )
+        except Exception:
+            pass
         return {
             "ok": True,
             "mode": getattr(self.orch, "mode", "unknown"),
@@ -371,6 +404,17 @@ class OrchestratorControl:
         if not allowed:
             raise ConflictError("test_gate_blocked", "Required test origination is currently blocked.", details={"reason": why})
         await self.orch._originate_required_test(event_code)
+        # _API_ORIGINATE_TEST_DL_
+        try:
+            self.orch.discord.api_action(
+                method="POST",
+                endpoint="/v1/originate/test",
+                actor=actor,
+                status="succeeded",
+                details={"event_code": event_code},
+            )
+        except Exception:
+            pass
         return {"ok": True, "event_code": event_code, "actor": actor}
 
     async def stage_wav_upload(self, *, filename: str, content_type: str, data: bytes, actor: str) -> dict[str, Any]:
@@ -505,7 +549,7 @@ class OrchestratorControl:
             self._same_codes_in_service_area(same_codes)
 
         try:
-            return await self.orch.originate_manual_text(
+            _ot_result = await self.orch.originate_manual_text(
                 event_code=req.event_code,
                 headline=req.headline,
                 script_text=req.text,
@@ -523,6 +567,34 @@ class OrchestratorControl:
             raise NotFoundError("manual_audio_missing", "Manual origination audio source is missing.", details={"path": str(exc)}) from exc
         except ValueError as exc:
             raise ControlError("invalid_manual_origination", str(exc)) from exc
+        # _API_ORIGINATE_TEXT_DL_
+        try:
+            self.orch.discord.api_action(
+                method="POST",
+                endpoint="/v1/originate/text",
+                actor=actor,
+                status="succeeded",
+                headline=req.headline,
+                details={
+                    "event_code": req.event_code,
+                    "voice_mode": req.voice_mode,
+                },
+            )
+        except Exception:
+            pass
+        # _API_TEXT_EAS_DL_
+        if req.voice_mode == "full_eas":
+            try:
+                self.orch.discord.alert_aired(
+                    code=req.event_code,
+                    event=req.headline,
+                    source="SeasonalWeather (local API)",
+                    mode="full",
+                    area=", ".join(req.same_codes) if req.same_codes else "",
+                )
+            except Exception:
+                pass
+        return _ot_result
 
     async def originate_audio(self, req: OriginateAudioRequest, *, actor: str) -> dict[str, Any]:
         same_codes = list(req.same_codes)
@@ -557,6 +629,34 @@ class OrchestratorControl:
 
         result["audio_asset_id"] = req.audio_asset_id
         result["audio_path"] = str(out_path)
+        # _API_ORIGINATE_AUDIO_DL_
+        try:
+            self.orch.discord.api_action(
+                method="POST",
+                endpoint="/v1/originate/audio",
+                actor=actor,
+                status="succeeded",
+                headline=req.headline,
+                details={
+                    "event_code": req.event_code,
+                    "voice_mode": req.voice_mode,
+                    "asset_id": req.audio_asset_id,
+                },
+            )
+        except Exception:
+            pass
+        # _API_AUDIO_EAS_DL_
+        if req.voice_mode == "full_eas":
+            try:
+                self.orch.discord.alert_aired(
+                    code=req.event_code,
+                    event=req.headline,
+                    source="SeasonalWeather (local API)",
+                    mode="full",
+                    area=", ".join(req.same_codes) if req.same_codes else "",
+                )
+            except Exception:
+                pass
         return result
 
     async def reload_config(self, *, actor: str, reason: str | None = None) -> dict[str, Any]:
@@ -595,6 +695,17 @@ class OrchestratorControl:
         if old_cfg.paths != new_cfg.paths:
             caveats.append("Changed paths are only partly hot-applied; a process restart is safer for path changes.")
 
+        # _API_RELOAD_CONFIG_DL_
+        try:
+            self.orch.discord.api_action(
+                method="POST",
+                endpoint="/v1/config/reload",
+                actor=actor,
+                status="succeeded",
+                details={"reason": reason or "", "warnings": len(caveats)},
+            )
+        except Exception:
+            pass
         return {
             "ok": True,
             "old_config_sha256": old_hash,
@@ -603,3 +714,7 @@ class OrchestratorControl:
             "reason": reason,
             "warnings": caveats,
         }
+
+# _CONTROL_DL_APPLIED_
+
+# _CONTROL_EAS_ALERT_DL_APPLIED_

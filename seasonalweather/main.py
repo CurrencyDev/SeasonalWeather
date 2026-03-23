@@ -47,6 +47,7 @@ from .cycle import CycleBuilder, CycleContext, CycleSegment
 
 # Active alert tracker (persistent cycle state across restarts)
 from .active_alerts import ActiveAlert, AlertTracker, _vtec_track_id
+from .discord_log import DiscordLogger
 
 # RWT/RMT scheduler
 from .rwt_rmt import RwtRmtSchedule, RwtRmtScheduler
@@ -1684,6 +1685,9 @@ class Orchestrator:
         _tracker_path = Path(cfg.paths.work_dir) / "alert_state.json"
         self.alert_tracker = AlertTracker(_tracker_path)
 
+        # Discord webhook logger (fire-and-forget; starts its drain task in run())
+        self.discord = DiscordLogger.from_config(cfg.logs.discord)
+
     def _station_feed_seed_from_alert_tracker(self) -> int:
         """
         Restore active alerts from alert_state.json into the in-memory station-feed
@@ -1947,11 +1951,17 @@ class Orchestrator:
         raise RuntimeError("Liquidsoap telnet did not become reachable (is seasonalweather-liquidsoap running?)")
 
     def _update_mode(self) -> None:
+        _prev_mode = getattr(self, "mode", "normal")
         now = dt.datetime.now(tz=self._tz)
         if self.heightened_until and now < self.heightened_until:
             self.mode = "heightened"
         else:
             self.mode = "normal"
+        if self.mode != _prev_mode:
+            try:
+                self.discord.mode_changed(old_mode=_prev_mode, new_mode=self.mode)
+            except Exception:
+                pass
 
     def _heightened_ago_str(self) -> str | None:
         if not self.last_heightened_at:
@@ -3859,6 +3869,14 @@ class Orchestrator:
 
         self._schedule_cycle_refill("post-test")
         log.info("Originated %s test (audio=%s)", code, out_wav)
+        # _TEST_DL_v3_
+        self.discord.alert_aired(
+            code=code,
+            event=f"Required {'Weekly' if code == 'RWT' else 'Monthly'} Test",
+            source="SeasonalWeather (local)",
+            mode="full",
+            is_test=True,
+        )
 
     async def run(self) -> None:
         work, audio, cache, logs = self._paths()
@@ -3866,6 +3884,12 @@ class Orchestrator:
             p.mkdir(parents=True, exist_ok=True)
 
         await self._wait_for_liquidsoap()
+        self.discord.service_started(
+            cap_enabled=self._cap_enabled(),
+            ern_enabled=self._ern_enabled(),
+            tests_enabled=self._tests_enabled(),
+            mode=self.mode,
+        )
 
         # --- Persistent alert state: restore from disk, drop expired ---
         try:
@@ -3877,6 +3901,15 @@ class Orchestrator:
             )
         except Exception:
             log.exception("AlertTracker: startup load/purge failed")
+        # _TRACKER_DL_
+        try:
+            self.discord.alerttracker_lifecycle(
+                loaded=_loaded,
+                purged=_purged,
+                active=len(self.alert_tracker.get_cycle_alerts()),
+            )
+        except Exception:
+            pass
 
         try:
             _sf_restored_file = _sf_seed_memory_from_payload_file()
@@ -3899,6 +3932,7 @@ class Orchestrator:
             self.jid, self.password, self.nwws_server, self.nwws_port, self.nwws_queue,
             room_jid=self.cfg.nwws.room,
             nick=self.cfg.nwws.nick,
+            # TODO: wire stall/reconnect callbacks to self.discord.nwws_stall() / .nwws_reconnected() once NWWSClient exposes them
             stall_seconds=self.cfg.nwws.resiliency.stall_seconds,
             muc_confirm_seconds=self.cfg.nwws.resiliency.muc_confirm_seconds,
             start_wait_seconds=self.cfg.nwws.resiliency.start_wait_seconds,
@@ -4014,6 +4048,7 @@ class Orchestrator:
         else:
             log.info("RWT/RMT scheduler disabled (set tests.enabled: true in config.yaml to enable)")
 
+        tasks.append(asyncio.create_task(self.discord.start(), name="discord_log_drain"))
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
         for t in done:
             exc = t.exception()
@@ -4494,6 +4529,18 @@ class Orchestrator:
             except Exception:
                 log.exception("Rebroadcast: failed to add CAP FULL item")
             log.info("CAP ACTION: aired FULL event=%s code=%s id=%s sent=%s vtec=%s audio=%s", ev.event, same_code, ev.alert_id, ev.sent, ",".join(vtec[:2]) if vtec else "", out_wav)
+            # _CAP_FULL_DL_
+            self.discord.alert_aired(
+                code=same_code,
+                event=(ev.event or "").strip(),
+                source="CAP",
+                mode="full",
+                area=getattr(ev, "area_desc", "") or "",
+                vtec=vtec[:2],
+                expires=self._fmt_local_from_utc_iso(
+                    str(getattr(ev, "expires", "") or "")
+                ),
+            )
             _station_feed_note_cap(ev, mode="FULL", same_locations=(same_locs if same_locs else same_locs_raw), out_wav=str(out_wav), same_code=same_code, vtec=vtec)
 
             # ---- Register to AlertTracker for restart-safe rebroadcast ----
@@ -4621,6 +4668,15 @@ class Orchestrator:
             except Exception:
                 log.exception("Rebroadcast: failed to add CAP VOICE item")
             log.info("CAP ACTION: aired voice-only event=%s id=%s sent=%s audio=%s", ev.event, ev.alert_id, ev.sent, out_wav)
+            # _CAP_VOICE_DL_
+            self.discord.alert_aired(
+                code=same_code,
+                event=(ev.event or "").strip(),
+                source="CAP",
+                mode="voice",
+                area=getattr(ev, "area_desc", "") or "",
+                vtec=vtec[:2],
+            )
 
             # Register to AlertTracker (cycle_only → no SAME retone on cycle replay)
             try:
@@ -4766,6 +4822,25 @@ class Orchestrator:
 
             log.info("CAP ACTION: aired UPDATE event=%s code=%s id=%s vtec_actions=%s audio=%s",
                      ev_event, same_code, ev.alert_id, vtec_actions, out_wav)
+            # _CAP_UPDATE_DL_
+            if vtec_actions & {"CAN", "EXP"}:
+                self.discord.alert_expired(
+                    code=same_code,
+                    event=ev_event,
+                    vtec_action=next(iter(vtec_actions & {"CAN", "EXP"})),
+                    source="CAP",
+                    area=getattr(ev, "area_desc", "") or "",
+                    vtec=vtec[:2],
+                )
+            else:
+                self.discord.alert_updated(
+                    code=same_code,
+                    event=ev_event,
+                    vtec_action=next(iter(vtec_actions), "CON"),
+                    source="CAP",
+                    area=getattr(ev, "area_desc", "") or "",
+                    vtec=vtec[:2],
+                )
             _station_feed_note_cap(ev, mode="VOICE", same_locations=(same_locs if same_locs else same_locs_raw),
                                    out_wav=str(out_wav), same_code=same_code, vtec=vtec)
         except Exception:
@@ -5646,6 +5721,14 @@ class Orchestrator:
                 len(in_area_locs),
                 out_wav,
             )
+            # _ERN_DL_
+            self.discord.alert_aired(
+                code=code,
+                event=_sf_eas_event_label_full(code),
+                source=f"ERN/GWES ({(ev.sender or '').strip() or 'unknown'})",
+                mode="full",
+                is_ern=True,
+            )
             sf_ev = ev
             try:
                 area_text = await self._sf_area_text_from_same_codes(in_area_locs)
@@ -5894,6 +5977,37 @@ class Orchestrator:
                 ",".join(t for (t, _a) in tracks[:2]) if tracks else "",
                 out_wav,
             )
+            # _NWWS_DL_
+            _dl_vtec_acts = vtec_actions
+            _dl_mode = "full" if should_full else "voice"
+            if _dl_vtec_acts & {"CAN", "EXP"}:
+                self.discord.alert_expired(
+                    code=parsed.product_type,
+                    event=sf_event_label,
+                    vtec_action=next(iter(_dl_vtec_acts & {"CAN", "EXP"})),
+                    source="NWWS-OI",
+                    area=sf_area_text,
+                    vtec=vtec[:2],
+                )
+            elif not should_full and _dl_vtec_acts & {"CON", "EXT", "EXA", "EXB"}:
+                self.discord.alert_updated(
+                    code=parsed.product_type,
+                    event=sf_event_label,
+                    vtec_action=next(iter(_dl_vtec_acts & {"CON", "EXT", "EXA", "EXB"})),
+                    source="NWWS-OI",
+                    area=sf_area_text,
+                    vtec=vtec[:2],
+                )
+            else:
+                self.discord.alert_aired(
+                    code=parsed.product_type,
+                    event=sf_event_label,
+                    source="NWWS-OI",
+                    mode=_dl_mode,
+                    area=sf_area_text,
+                    vtec=vtec[:2],
+                    is_test=(parsed.product_type in {"RWT", "RMT"}),
+                )
             _sf_mode = getattr(spoken, "mode", ("FULL" if should_full else "VOICE"))
             _station_feed_note_nwws(
                 parsed,
@@ -6078,6 +6192,15 @@ class Orchestrator:
                 same_hdr_all = None
                 same_eom_wav = None
                 log.exception("SAME generation failed; continuing without SAME for this alert")
+                # _SAME_FAIL_DL_
+                self.discord.error(
+                    title="SAME generation failed",
+                    module="same.py",
+                    exception_type="Exception",
+                    message="SAME burst rendering raised an exception. Alert aired without SAME headers.",
+                    context={"alert_type": parsed.product_type, "wfo": parsed.wfo},
+                    fallback="Aired voice-only (no SAME)",
+                )
 
         write_sine_wav(tone, self.cfg.audio.attention_tone_hz, self.cfg.audio.attention_tone_seconds, self.cfg.audio.sample_rate)
         self.tts.synth_to_wav(script_text, tts_wav)
@@ -6577,6 +6700,18 @@ class Orchestrator:
                     repeats,
                     reason,
                 )
+                # _CYCLE_DL_
+                try:
+                    self.discord.cycle_rebuilt(
+                        reason=reason,
+                        mode=self.mode,
+                        interval=interval,
+                        seq_dur=seq_dur,
+                        segments=len(segs),
+                        active_alerts=len(self.alert_tracker.get_cycle_alerts()),
+                    )
+                except Exception:
+                    pass
 
             except Exception as e:
                 log.exception("Segmented cycle build failed (%s): %s", reason, e)
@@ -6624,3 +6759,5 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+# _DISCORD_LOG_ALL_HOOKS_APPLIED_
