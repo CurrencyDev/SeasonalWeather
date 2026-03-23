@@ -21,6 +21,14 @@ def _sub_alias(alias: str) -> Callable[[re.Match[str]], str]:
         return f'<vtml_sub alias="{alias}">{m.group(0)}</vtml_sub>'
     return _r
 
+def _word_with_trailing_pause(ms: int) -> Callable[[re.Match[str]], str]:
+    """Return the matched word as-is, followed by a VTML pause of <ms> milliseconds.
+    Used to insert a hard word-boundary hint so Paul doesn't garble the following token.
+    ms=0 is the conventional NWR trick for words like 'fog' that otherwise bleed."""
+    def _r(m: re.Match[str]) -> str:
+        return f'{m.group(0)}<vtml_pause time="{ms}"/>'
+    return _r
+
 def _phoneme_x_cmu(ph: str) -> Callable[[re.Match[str]], str]:
     def _r(m: re.Match[str]) -> str:
         # x-cmu uses CMU dict phonemes with stress numbers (ASCII-friendly).
@@ -226,10 +234,10 @@ _RULES: list[Rule] = [
     # NOAA: VoiceText Paul reads it as "N-O-A-A" letters without this rule.
     Rule(re.compile(r"\bNOAA\b"), _sub_alias("noah")),
     Rule(re.compile(r"\bNWS\b"), _sub_alias("National Weather Service")),
-    Rule(re.compile(r"\bthunderstorms\b", re.IGNORECASE), _phoneme_x_cmu("TH AH1 N D ER0 S T AO2 R M Z")),
-    Rule(re.compile(r"\bthunderstorm\b", re.IGNORECASE), _phoneme_x_cmu("TH AH1 N D ER0 S T AO2 R M")),
-    Rule(re.compile(r"\bTSTMS\b", re.IGNORECASE), _phoneme_x_cmu("TH AH1 N D ER0 S T AO2 R M Z")),
-    Rule(re.compile(r"\bTSTM\b", re.IGNORECASE), _phoneme_x_cmu("TH AH1 N D ER0 S T AO2 R M")),
+    Rule(re.compile(r"\bthunderstorms\b", re.IGNORECASE), _phoneme_x_cmu("TH AH1 N D ER0 S T OW0 R M Z")),
+    Rule(re.compile(r"\bthunderstorm\b", re.IGNORECASE), _phoneme_x_cmu("TH AH1 N D ER0 S T OW0 R M")),
+    Rule(re.compile(r"\bTSTMS\b", re.IGNORECASE), _phoneme_x_cmu("TH AH1 N D ER0 S T OW0 R M Z")),
+    Rule(re.compile(r"\bTSTM\b", re.IGNORECASE), _phoneme_x_cmu("TH AH1 N D ER0 S T OW0 R M")),
 
     # Time zone abbreviations that may still appear in headers or time announcements
     Rule(re.compile(r"\bEST\b"), _sub_alias("Eastern Standard Time")),
@@ -240,6 +248,36 @@ _RULES: list[Rule] = [
     Rule(re.compile(r"\bMVFR\b"), _sub_alias("M V F R")),
     Rule(re.compile(r"\bIFR\b"),  _sub_alias("I F R")),
     Rule(re.compile(r"\bLIFR\b"), _sub_alias("L I F R")),
+
+    # --- Impact / Impacts ---
+    # Paul mispronounces the meteorological header "Impact:" (he stresses the wrong
+    # syllable as a verb).  The "impakt" / "impakts" alias spelling forces correct
+    # noun stress.  Source: VoiceText Paul Phoneme Guide + LWX TTS doc.
+    Rule(re.compile(r"\bimpacts\b", re.IGNORECASE), _sub_alias("impakts")),
+    Rule(re.compile(r"\bimpact\b",  re.IGNORECASE), _sub_alias("impakt")),
+
+    # --- Tornadic ---
+    # Paul defaults to an odd schwa-heavy reading.  Phoneme: "tor-NAY-dik".
+    # Variant 1 (generic / no office-specific quirks).
+    # Source: VoiceText Paul Phoneme Guide.
+    Rule(re.compile(r"\btornadic\b", re.IGNORECASE), _phoneme_x_cmu("T AO R N AE1 D IH K")),
+
+    # --- Projectiles ---
+    # Without this Paul places no stress on "-tiles", making it nearly
+    # unintelligible.  LWX-confirmed phoneme from VoiceText Paul Phoneme Guide.
+    Rule(re.compile(r"\bprojectiles\b", re.IGNORECASE), _phoneme_x_cmu("P R UH0 JH EH0 K T AY2 L Z")),
+
+    # --- Objects ---
+    # Paul reads "objects" with a weak initial vowel unless forced.
+    # Phoneme leads with AA (the "AH" in "father") for the NWR-correct "AHbjects" onset.
+    # Source: LWX TTS doc (x-CMU).
+    Rule(re.compile(r"\bobjects\b", re.IGNORECASE), _phoneme_x_cmu("AA AH0 B JH EH0 K T S")),
+
+    # --- Fog ---
+    # Paul tends to blend "fog" into the following word without a hard boundary.
+    # A zero-duration pause acts as a word-boundary separator without audible gap.
+    # Source: LWX TTS doc convention.
+    Rule(re.compile(r"\bfog\b", re.IGNORECASE), _word_with_trailing_pause(0)),
 ]
 
 def _user_rule_flags(spec: dict) -> int:
