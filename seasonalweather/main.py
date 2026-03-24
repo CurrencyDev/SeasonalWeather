@@ -2353,7 +2353,8 @@ class Orchestrator:
 
     def _fix_sps_preamble(self, script: str, official_text: str) -> str:
         """
-        SPS should sound like NWR-style: "And now, a Special Weather Statement..."
+        SPS should sound like LWX/NWR-style: "And now a Special Weather
+        Statement from your National Weather Service, issued at ..."
         We also try to include the issued time from the product header.
         """
         s = (script or "").strip()
@@ -2361,9 +2362,12 @@ class Orchestrator:
             return s
 
         issued = self._nws_header_issued_phrase(official_text)
-        lead = "And now, a Special Weather Statement."
+        lead = "And now a Special Weather Statement from your National Weather Service."
         if issued:
-            lead = f"And now, a Special Weather Statement, issued at {issued}."
+            lead = (
+                "And now a Special Weather Statement from your National Weather Service, "
+                f"issued at {issued}."
+            )
 
         s2 = _SPS_INTRO_LEAD_RE.sub(lead + "\n", s, count=1)
         if s2 == s:
@@ -2372,6 +2376,19 @@ class Orchestrator:
         # If the next line is literally "Special Weather Statement.", drop it to avoid double-intro.
         s2 = re.sub(r"(?im)^\s*Special Weather Statement\.\s*", "", s2, count=1)
         return s2.strip()
+
+    def _cap_sps_preamble(self, sent_iso: str | None) -> str:
+        """
+        CAP SPS should use the same NWR-style spoken preamble as NWWS SPS.
+        We prefer the CAP sent timestamp and speak it in local station time.
+        """
+        issued = self._fmt_local_from_utc_iso(sent_iso or "")
+        if issued:
+            return (
+                "And now a Special Weather Statement from your National Weather Service, "
+                f"issued at {issued}."
+            )
+        return "And now a Special Weather Statement from your National Weather Service."
 
     def _expiry_summary_script(self, official_text: str) -> str | None:
         """
@@ -5257,7 +5274,11 @@ class Orchestrator:
             if not summary_line and event:
                 summary_line = f'The {event} has been cancelled.'
 
-        lines: list[str] = ['This is a statement from the National Weather Service.']
+        lines: list[str] = []
+        if (event or '').strip().lower() == 'special weather statement':
+            lines.append(self._cap_sps_preamble(getattr(ev, 'sent', None)))
+        else:
+            lines.append('This is a statement from the National Weather Service.')
         area_line = _county_segs()
         if area_line:
             lines.append(f'For the following counties: {area_line}.')
@@ -5521,9 +5542,15 @@ class Orchestrator:
         desc = self._clean_cap_text(getattr(ev, "description", "") or "", limit=1200)
         instr = self._clean_cap_text(getattr(ev, "instruction", "") or "", limit=700)
 
+        if event.lower() == "special weather statement" and headline.lower().startswith("special weather statement"):
+            headline = ""
+
         lines: list[str] = []
         if event:
-            lines.append(f"{event}.")
+            if event.lower() == "special weather statement":
+                lines.append(self._cap_sps_preamble(getattr(ev, "sent", None)))
+            else:
+                lines.append(f"{event}.")
 
         if headline:
             lines.append(headline if headline.endswith((".", "!", "?")) else headline + ".")
@@ -5545,9 +5572,15 @@ class Orchestrator:
         desc = self._clean_cap_text(getattr(ev, "description", "") or "", limit=900)
         instr = self._clean_cap_text(getattr(ev, "instruction", "") or "", limit=500)
 
+        if event.lower() == "special weather statement" and headline.lower().startswith("special weather statement"):
+            headline = ""
+
         lines: list[str] = []
-        if event and event.lower() != "special weather statement":
-            lines.append(f"{event}.")
+        if event:
+            if event.lower() == "special weather statement":
+                lines.append(self._cap_sps_preamble(getattr(ev, "sent", None)))
+            else:
+                lines.append(f"{event}.")
         if headline:
             lines.append(headline if headline.endswith((".", "!", "?")) else headline + ".")
         if desc:
