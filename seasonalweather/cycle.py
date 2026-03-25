@@ -88,6 +88,37 @@ def _scrub_cwf_product_text(text: str) -> str:
     # Strips marine product boilerplate, expands period markers
     # (.SUN... -> 'Sunday.'), advisory banners, direction
     # abbreviations (NW -> northwest), and units (kt -> knots).
+    # Also injects spoken anchors for:
+    #   - .SYNOPSIS... section headers  -> "The synopsis for the coastal waters in our area."
+    #   - Zone name lines               -> "The forecast for {zone name}."
+
+    # --- Synopsis header pre-pass (text-level, before line loop) ---
+    # NWS WFOs write synopsis headers in three forms:
+    #   Single-line: ".SYNOPSIS FOR THE TIDAL POTOMAC...\n"
+    #   Two-line:    ".SYNOPSIS FOR THE COASTAL WATERS FROM SANDY HOOK NJ TO FENWICK\n"
+    #                "ISLAND DE AND FOR DELAWARE BAY...\n"
+    #   Non-standard two-line (MFL):
+    #                ".Synopsis for Jupiter Inlet to Ocean Reef FL out to 60 nm and for\n"
+    #                "East Cape Sable to Bonita Beach FL out to 60 nm...\n"
+    # The existing line-level drop_re only caught single-line all-caps forms.
+    # This pre-pass handles all variants: the continuation line is recognised by
+    # (a) starting with a non-. non-blank character, and (b) ending with '...'
+    _synopsis_hdr_re = re.compile(
+        r'^\.(SYNOPSIS\b[^\n]*)(?:\n(?![.\n])[^\n]*\.{3})?',
+        re.IGNORECASE | re.MULTILINE,
+    )
+    text = _synopsis_hdr_re.sub(
+        'The synopsis for the coastal and inland waters in our area.',
+        (text or ''),
+    )
+
+    # Zone name lines come in the form:
+    #   "Tidal Potomac from Key Bridge to Indian Head-"
+    #   "Coastal waters from Sandy Hook to Manasquan Inlet NJ out 20 nm-"
+    #   "Delaware Bay waters south of East Point NJ to Slaughter Beach DE-"
+    # Pattern: starts with a letter (not a digit → excludes "20 nm-" continuations),
+    # contains at least one internal space, ends with '-'.
+    _zone_name_re = re.compile(r'^[A-Za-z][A-Za-z0-9].*\s+\S.*-\s*$')
 
     _period_map = {
         'REST OF TONIGHT': 'Rest of tonight',
@@ -117,8 +148,7 @@ def _scrub_cwf_product_text(text: str) -> str:
         re.compile(r"^relative to tidal currents", re.IGNORECASE),
         re.compile(r"^blowing against the tidal", re.IGNORECASE),
         re.compile(r"^waves flat where waters are iced", re.IGNORECASE),
-        # .SYNOPSIS FOR THE ... section headers
-        re.compile(r"^\.[A-Z ]+for the [A-Z ]+\.{3}\s*$", re.IGNORECASE),
+        # NOTE: .SYNOPSIS headers are now handled by the text-level pre-pass above.
     ]
 
     # Inline advisory banners: ...SMALL CRAFT ADVISORY IN EFFECT...
@@ -150,6 +180,16 @@ def _scrub_cwf_product_text(text: str) -> str:
         m = _advisory_re.match(ln)
         if m:
             out.append(m.group(1).strip().title() + '.')
+            continue
+
+        # Zone name lines: e.g. "Tidal Potomac from Key Bridge to Indian Head-"
+        # Recognised by: starts with a letter (not digit, ruling out "20 nm-"
+        # continuations), contains at least one internal space, ends with '-'.
+        # Emits a spoken zone anchor before the forecast body.
+        m = _zone_name_re.match(ln)
+        if m:
+            zone = ln.rstrip('-').strip()
+            out.append(f'The forecast for {zone}.')
             continue
 
         # Expand .DAY... period markers.
