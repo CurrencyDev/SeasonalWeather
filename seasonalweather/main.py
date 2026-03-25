@@ -49,6 +49,10 @@ from .cycle import CycleBuilder, CycleContext, CycleSegment
 from .active_alerts import ActiveAlert, AlertTracker, _vtec_track_id
 from .discord_log import DiscordLogger
 
+# VTEC policy + SAME event code libraries — Orchestrator defers to these.
+from .vtec import toneout_policy as _vtec_toneout_policy
+from .same_events import label_or_code as _same_label_or_code
+
 # RWT/RMT scheduler
 from .rwt_rmt import RwtRmtSchedule, RwtRmtScheduler
 
@@ -4248,17 +4252,8 @@ class Orchestrator:
 
         if mt == "update":
             try:
-                vtec = self._cap_vtec_list(ev)
-                tracks = self._vtec_tracks(vtec)
-                full_actions = {"NEW", "UPG", "EXA", "EXB"}
-                vtec_actions = {act for (_t, act) in tracks} if tracks else set()
-
-                # If we have VTEC and none are FULL-worthy actions, treat as non-FULL.
-                if tracks and not (vtec_actions & full_actions):
-                    return False
-
-                # If update has no usable VTEC, be conservative: don't FULL-tone it.
-                if not tracks:
+                _cap_upd_policy = _vtec_toneout_policy(self._cap_vtec_list(ev))
+                if _cap_upd_policy.mode != "FULL":
                     return False
             except Exception:
                 # Parsing failed; be conservative on updates.
@@ -4452,7 +4447,7 @@ class Orchestrator:
         if not script.strip():
             return
 
-        same_code = self._cap_event_to_same_code(ev_event)
+        same_code = _vtec_toneout_policy(vtec).same_code or self._cap_event_to_same_code(ev_event)
         same_locs_raw = list(ev.same_fips) if getattr(ev, "same_fips", None) else []
         same_locs = self._filter_same_locations_to_service_area(same_locs_raw)
 
@@ -4615,7 +4610,7 @@ class Orchestrator:
         vtec = self._cap_vtec_list(ev)
         tracks = self._vtec_tracks(vtec)
 
-        same_code = self._cap_event_to_same_code((ev.event or "").strip())
+        same_code = _vtec_toneout_policy(vtec).same_code or self._cap_event_to_same_code((ev.event or "").strip())
         same_locs_raw = list(ev.same_fips) if getattr(ev, "same_fips", None) else []
         same_locs = self._filter_same_locations_to_service_area(same_locs_raw)
 
@@ -4671,7 +4666,7 @@ class Orchestrator:
                 if self.rebroadcast_enabled and self.rebroadcast_include_voice:
                     exp_utc = self._best_expiry_from_vtec(vtec)
                     expires_at = self._rebroadcast_clamp_expiry(now, exp_utc)
-                    same_code2 = self._cap_event_to_same_code((ev.event or "").strip())
+                    same_code2 = _vtec_toneout_policy(vtec).same_code or self._cap_event_to_same_code((ev.event or "").strip())
                     key_rb = self._rebroadcast_make_key(
                         source="CAP",
                         kind="VOICE",
@@ -5729,7 +5724,7 @@ class Orchestrator:
                     self.telnet.flush_cycle()
                 except Exception:
                     pass
-                event_label = _sf_eas_event_label_full(code)
+                event_label = _same_label_or_code(code)
                 title = self._np_alert_title("ern", event=event_label)
                 meta = self._np_meta(
                     title=title,
@@ -5757,7 +5752,7 @@ class Orchestrator:
             # _ERN_DL_
             self.discord.alert_aired(
                 code=code,
-                event=_sf_eas_event_label_full(code),
+                event=_same_label_or_code(code),
                 source=f"ERN/GWES ({(ev.sender or '').strip() or 'unknown'})",
                 mode="full",
                 is_ern=True,
@@ -5810,12 +5805,13 @@ class Orchestrator:
         tracks = self._vtec_tracks(vtec)
         exp_utc = self._best_expiry_from_vtec(vtec)
 
-        # Decide FULL vs voice-only based on VTEC action if present.
-        # FULL: NEW, UPG, EXA, EXB
-        # Voice-only: CON, EXT, COR, ROU, CAN, EXP (and other non-FULL actions)
-        full_actions = {"NEW", "UPG", "EXA", "EXB"}
+        # VTEC toneout policy — vtec.py is authoritative for FULL vs VOICE.
+        # This replaces the inline action-only check that ignored significance
+        # (e.g. CF.Y.NEW was incorrectly treated as FULL before this fix).
+        _nw_policy = _vtec_toneout_policy(vtec)
         vtec_actions = {act for (_t, act) in tracks} if tracks else set()
-        should_full = (not tracks) or bool(vtec_actions & full_actions)
+        should_full = (_nw_policy.mode == "FULL")
+        log.debug("NWWS vtec policy: %s", _nw_policy.reason)
 
         # Keep rebroadcast rotation in sync with VTEC lifecycle.
         if self.rebroadcast_enabled and tracks:
@@ -5980,7 +5976,7 @@ class Orchestrator:
                     extra={
                         "sw_alert_source": "nwws",
                         "sw_alert_mode": ("full" if should_full else "voice"),
-                        "sw_event_code": (parsed.product_type or "").strip().upper(),
+                        "sw_event_code": (_nw_policy.same_code or parsed.product_type or "").strip().upper(),
                         "sw_event": event_label,
                         "sw_wfo": (parsed.wfo or "").strip(),
                         "sw_awips": (parsed.awips_id or "").strip(),
@@ -6067,7 +6063,7 @@ class Orchestrator:
                 _nw_exp_utc = self._best_expiry_from_vtec(_nw_vtec)
                 _nw_expires_iso = _nw_exp_utc.isoformat() if _nw_exp_utc else (
                     dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=6)).isoformat()
-                _nw_same_code = _safe_event_code(parsed.product_type)
+                _nw_same_code = _nw_policy.same_code or _safe_event_code(parsed.product_type)
                 _nw_same_locs = list(in_area_same) if in_area_same else []
                 _nw_track_ids = {_vtec_track_id(v) for v in _nw_vtec if _vtec_track_id(v)}
                 _nw_event_label = sf_event_label
@@ -6119,7 +6115,7 @@ class Orchestrator:
                     key_rb = self._rebroadcast_make_key(
                         source="NWWS",
                         kind=kind_rb,
-                        event_code=_safe_event_code(parsed.product_type),
+                        event_code=_nw_policy.same_code or _safe_event_code(parsed.product_type),
                         tracks=tracks,
                         same_locs=in_area_same,
                         script=spoken.script,
