@@ -36,8 +36,8 @@ class ErnSameEvent:
 
 
 def _project_root() -> Path:
-    # /opt/seasonalweather/app/seasonalweather/ern_gwes.py -> parents[1] == /opt/seasonalweather/app
-    return Path(__file__).resolve().parents[1]
+    # /opt/seasonalweather/app/seasonalweather/broadcast/ern_gwes.py -> parents[2] == /opt/seasonalweather/app
+    return Path(__file__).resolve().parents[2]
 
 
 def _cfg_samedec_args() -> tuple[str, float, float]:
@@ -79,7 +79,7 @@ def _same_listen_module_cmd(
     return [
         sys.executable,
         "-m",
-        "seasonalweather.same_listen_samedec",
+        "seasonalweather.same.listen_samedec",
         "--url",
         url,
         "--sr",
