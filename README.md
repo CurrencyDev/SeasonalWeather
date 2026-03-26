@@ -76,8 +76,21 @@ config/
 docs/               — design notes, state machine documentation
 liquidsoap/         — Liquidsoap script(s)
 scripts/            — bootstrap + helper scripts
-seasonalweather/    — Python application
+tools/              — standalone dev/debug utilities
 systemd/            — systemd service unit files
+seasonalweather/    — Python application
+  main.py           — Orchestrator (hub, stays at root of package)
+  control.py        — API → Orchestrator bridge
+  config.py         — config loader
+  discord_log.py    — Discord embed logger
+  liquidsoap_telnet.py
+  cli/              — CLI tools (inject)
+  same/             — SAME/EAS subsystem (encoder, decoder, event codes, listeners)
+  alerts/           — alert lifecycle (CAP, NWWS products, VTEC, active registry)
+  broadcast/        — cycle content generation (cycle, RWR, RWT/RMT, ERN, station feed)
+  tts/              — speech synthesis (TTS engine, audio utils, VoiceText Paul VTML)
+  api/              — HTTP control API (routes, models, auth, server entrypoint)
+  nwws/             — NWWS-OI XMPP client and smoke-test
 ```
 
 ---
@@ -208,6 +221,6 @@ Generate a test alert WAV and optionally push it into the Liquidsoap queue:
 
 ## GWES-ERN SAME decoding
 
-SeasonalWeather uses `samedec` (Rust) for fast SAME decoding from the ERN stream by default. To switch back to the pure-Python decoder, edit `seasonalweather/ern_gwes.py` and find `_same_listen_module_cmd` — change `same_listen_samedec` to `same_listen` and restart.
+SeasonalWeather uses `samedec` (Rust) for fast SAME decoding from the ERN stream by default. To switch back to the pure-Python decoder, edit `seasonalweather/broadcast/ern_gwes.py` and find `_same_listen_module_cmd` — change `same.listen_samedec` to `same.listen` and restart.
 
 The `samedec` binary path and confidence threshold are configured in `config.yaml` under the `samedec:` section.

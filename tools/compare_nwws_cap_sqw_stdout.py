@@ -15,8 +15,8 @@ from urllib.error import URLError, HTTPError
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from seasonalweather.product import parse_product_text  # type: ignore
-from seasonalweather.alert_builder import build_spoken_alert  # type: ignore
+from seasonalweather.alerts.product import parse_product_text  # type: ignore
+from seasonalweather.alerts.builder import build_spoken_alert  # type: ignore
 
 
 def _ua() -> str:

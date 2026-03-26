@@ -36,29 +36,29 @@ from .config import load_config, AppConfig
 
 # Module-level config reference — set once at startup before Orchestrator is created.
 _APP_CFG: "AppConfig | None" = None
-from .nws_api import NWSApi
-from .nwws_client import NWWSClient
-from .product import parse_product_text, ParsedProduct
-from .alert_builder import build_spoken_alert, strip_nws_product_headers
-from .tts import TTS
-from .audio import write_sine_wav, write_silence_wav, concat_wavs, wav_duration_seconds
+from .alerts.nws_api import NWSApi
+from .nwws.client import NWWSClient
+from .alerts.product import parse_product_text, ParsedProduct
+from .alerts.builder import build_spoken_alert, strip_nws_product_headers
+from .tts.tts import TTS
+from .tts.audio import write_sine_wav, write_silence_wav, concat_wavs, wav_duration_seconds
 from .liquidsoap_telnet import LiquidsoapTelnet
-from .cycle import CycleBuilder, CycleContext, CycleSegment
+from .broadcast.cycle import CycleBuilder, CycleContext, CycleSegment
 
 # Active alert tracker (persistent cycle state across restarts)
-from .active_alerts import ActiveAlert, AlertTracker, _vtec_track_id
+from .alerts.active import ActiveAlert, AlertTracker, _vtec_track_id
 from .discord_log import DiscordLogger
 
 # VTEC policy + SAME event code libraries — Orchestrator defers to these.
-from .vtec import toneout_policy as _vtec_toneout_policy
-from .same_events import label_or_code as _same_label_or_code
+from .alerts.vtec import toneout_policy as _vtec_toneout_policy
+from .same.events import label_or_code as _same_label_or_code
 
 # RWT/RMT scheduler
-from .rwt_rmt import RwtRmtSchedule, RwtRmtScheduler
+from .broadcast.rwt_rmt import RwtRmtSchedule, RwtRmtScheduler
 
 # Optional SAME
 try:
-    from .same import SameHeader, chunk_locations, render_same_bursts_wav, render_same_eom_wav
+    from .same.same import SameHeader, chunk_locations, render_same_bursts_wav, render_same_eom_wav
 except Exception:  # pragma: no cover
     SameHeader = None  # type: ignore
     chunk_locations = None  # type: ignore
@@ -67,7 +67,7 @@ except Exception:  # pragma: no cover
 
 # Optional CAP (api.weather.gov/alerts/active)
 try:
-    from .cap_nws import NwsCapPoller, CapAlertEvent
+    from .alerts.cap_nws import NwsCapPoller, CapAlertEvent
 except Exception:  # pragma: no cover
     NwsCapPoller = None  # type: ignore
     CapAlertEvent = None  # type: ignore
@@ -75,7 +75,7 @@ except Exception:  # pragma: no cover
 
 # Optional Station Alert Feed (handled alerts JSON for radio UI)
 try:
-    from .station_feed import FeedSender, StationFeedAlert, atomic_write_json, build_station_feed_payload
+    from .broadcast.station_feed import FeedSender, StationFeedAlert, atomic_write_json, build_station_feed_payload
 except Exception:
     FeedSender = None  # type: ignore
     StationFeedAlert = None  # type: ignore
@@ -84,7 +84,7 @@ except Exception:
 
 # Optional ERN/GWES SAME monitor (Level 3 source)
 try:
-    from .ern_gwes import ErnGwesMonitor, ErnSameEvent
+    from .broadcast.ern_gwes import ErnGwesMonitor, ErnSameEvent
 except Exception:  # pragma: no cover
     ErnGwesMonitor = None  # type: ignore
     ErnSameEvent = None  # type: ignore
@@ -5494,8 +5494,8 @@ class Orchestrator:
         Extract clean broadcast text from a SEVERE WEATHER SAFETY RULES PNS.
         Uses the existing alert_builder strip-and-parse pipeline.
         """
-        from .alert_builder import strip_nws_product_headers, _unwrap_soft_wrap, _collapse_blank_lines, _clean_line
-        from .tts import clean_for_tts
+        from .alerts.builder import strip_nws_product_headers, _unwrap_soft_wrap, _collapse_blank_lines, _clean_line
+        from .tts.tts import clean_for_tts
         import re as _re
 
         text = strip_nws_product_headers(official_text or "")

@@ -23,10 +23,10 @@ from typing import Iterable, Optional
 
 from seasonalweather.config import load_config
 from seasonalweather.liquidsoap_telnet import LiquidsoapTelnet
-from seasonalweather.tts import TTS
-from seasonalweather.product import parse_product_text
-from seasonalweather.alert_builder import build_spoken_alert
-from seasonalweather.same import SameHeader, chunk_locations, render_same_bursts_wav, render_same_eom_wav
+from seasonalweather.tts.tts import TTS
+from seasonalweather.alerts.product import parse_product_text
+from seasonalweather.alerts.builder import build_spoken_alert
+from seasonalweather.same.same import SameHeader, chunk_locations, render_same_bursts_wav, render_same_eom_wav
 
 
 DEFAULT_CONFIG = "/etc/seasonalweather/config.yaml"
