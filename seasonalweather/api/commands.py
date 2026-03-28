@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from .api_models import CommandStatus
+from .models import CommandStatus
 
 
 class IdempotencyConflictError(Exception):

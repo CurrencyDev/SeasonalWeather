@@ -28,6 +28,9 @@ from typing import Any, Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 
 _SKY_SPOKEN: Dict[str, str] = {
+    # ------------------------------------------------------------------
+    # Sky condition only
+    # ------------------------------------------------------------------
     "CLOUDY":   "cloudy",
     "MOCLDY":   "mostly cloudy",
     "PTCLDY":   "partly cloudy",
@@ -37,22 +40,139 @@ _SKY_SPOKEN: Dict[str, str] = {
     "MOSUNNY":  "mostly sunny",
     "PTSUNNY":  "partly sunny",
     "OVERCAST": "overcast",
-    "FOG":      "fog",
-    "HAZE":     "haze",
-    "SMOKE":    "smoke",
-    "RAIN":     "rain",
-    "DRZL":     "drizzle",
-    "DRIZZLE":  "drizzle",
-    "SNOW":     "snow",
-    "FLRIES":   "snow flurries",
-    "SLEET":    "sleet",
-    "FZRAIN":   "freezing rain",
-    "FZDRZL":   "freezing drizzle",
-    "TSTRM":    "thunderstorms",
-    "TSTMS":    "thunderstorms",
-    "BLIZZD":   "blizzard conditions",
-    "BLGSNO":   "blowing snow",
+
+    # ------------------------------------------------------------------
+    # Obscurations / visibility phenomena
+    # ------------------------------------------------------------------
+    "FOG":          "fog",
+    "FZFOG":        "freezing fog",
+    "FOG/MIST":     "fog",                    # api.weather.gov composite
+    "FREEZINGFOG":  "freezing fog",           # ASOS space-stripped form
+    "MIST":         "mist",
+    "HAZE":         "haze",
+    "SMOKE":        "smoke",
+    "DUST":         "dust",
+    "BLDU":         "blowing dust",
+    "BLDS":         "blowing dust",
+    "BLGSNO":       "blowing snow",
+    "BLGSNO+":      "heavy blowing snow",
+
+    # ------------------------------------------------------------------
+    # Rain
+    # RWR spaced form | concatenated ASOS-path form | api.weather.gov form
+    # ------------------------------------------------------------------
+    "RAIN":             "rain",
+    "LGT RAIN":         "light rain",
+    "HVY RAIN":         "heavy rain",
+    "LGTRAIN":          "light rain",          # space-stripped RWR
+    "HVYRAIN":          "heavy rain",          # space-stripped RWR
+    "LIGHTRAIN":        "light rain",          # api.weather.gov
+    "HEAVYRAIN":        "heavy rain",          # api.weather.gov
+    "RAIN SHWRS":       "rain showers",
+    "RAINSHWRS":        "rain showers",
+    "RAINSHOWERS":      "rain showers",
+    "LGT RAIN SHWRS":   "light rain showers",
+    "HVY RAIN SHWRS":   "heavy rain showers",
+    "LIGHTRAINSHOWERS": "light rain showers",  # api.weather.gov
+    "HEAVYRAINSHOWERS": "heavy rain showers",  # api.weather.gov
+
+    # ------------------------------------------------------------------
+    # Drizzle
+    # ------------------------------------------------------------------
+    "DRZL":                 "drizzle",
+    "DRIZZLE":              "drizzle",
+    "LGT DRZL":             "light drizzle",
+    "HVY DRZL":             "heavy drizzle",
+    "LGTDRZL":              "light drizzle",
+    "HVYDRZL":              "heavy drizzle",
+    "LIGHTDRIZZLE":         "light drizzle",
+    "HEAVYDRIZZLE":         "heavy drizzle",
+
+    # ------------------------------------------------------------------
+    # Freezing rain
+    # ------------------------------------------------------------------
+    "FZRAIN":               "freezing rain",
+    "LGT FZRN":             "light freezing rain",
+    "HVY FZRN":             "heavy freezing rain",
+    "LGTFZRN":              "light freezing rain",
+    "HVYFZRN":              "heavy freezing rain",
+    "LIGHTFREEZINGRAIN":    "light freezing rain",
+    "HEAVYFREEZINGRAIN":    "heavy freezing rain",
+
+    # ------------------------------------------------------------------
+    # Freezing drizzle
+    # ------------------------------------------------------------------
+    "FZDRZL":               "freezing drizzle",
+    "LGT FZDRZL":           "light freezing drizzle",
+    "HVY FZDRZL":           "heavy freezing drizzle",
+    "LGTFZDRZL":            "light freezing drizzle",
+    "HVYFZDRZL":            "heavy freezing drizzle",
+    "LIGHTFREEZINGDRIZZLE": "light freezing drizzle",
+    "HEAVYFREEZINGDRIZZLE": "heavy freezing drizzle",
+
+    # ------------------------------------------------------------------
+    # Snow
+    # ------------------------------------------------------------------
+    "SNOW":             "snow",
+    "LGT SNOW":         "light snow",
+    "HVY SNOW":         "heavy snow",
+    "LGTSNOW":          "light snow",
+    "HVYSNOW":          "heavy snow",
+    "LIGHTSNOW":        "light snow",
+    "HEAVYSNOW":        "heavy snow",
+    "FLRIES":           "snow flurries",
+    "FLURRIES":         "snow flurries",
+    "SNOW SHWRS":       "snow showers",
+    "SNOWSHWRS":        "snow showers",
+    "SNOWSHOWERS":      "snow showers",
+    "LGT SNOW SHWRS":   "light snow showers",
+    "HVY SNOW SHWRS":   "heavy snow showers",
+    "LIGHTSNOWSHOWERS": "light snow showers",  # api.weather.gov
+    "LIGHTSNOWSHOWER":  "light snow showers",  # api.weather.gov variant
+    "HEAVYSNOWSHOWERS": "heavy snow showers",
+    "BLIZZD":           "blizzard conditions",
+    "BLGSNO":           "blowing snow",        # duplicate handled; last wins
+
+    # ------------------------------------------------------------------
+    # Sleet / ice pellets
+    # ------------------------------------------------------------------
+    "SLEET":            "sleet",
+    "LGT SLEET":        "light sleet",
+    "HVY SLEET":        "heavy sleet",
+    "LGTSLEET":         "light sleet",
+    "HVYSLEET":         "heavy sleet",
+    "LIGHTSLEET":       "light sleet",
+    "HEAVYSLEET":       "heavy sleet",
+    "ICEGRPL":          "ice and snow pellets",
+    "ICEPELLETS":       "ice pellets",
+    "LIGHTICEANDSNOWPELLETS": "light ice and snow pellets",
+    "LIGHTICE":         "light ice pellets",
+    "HEAVYICE":         "heavy ice pellets",
+
+    # ------------------------------------------------------------------
+    # Mixed precipitation
+    # ------------------------------------------------------------------
+    "RAINANDSNOW":      "rain and snow",
+    "SNOWANDRAIN":      "snow and rain",
+    "WINTRY MIX":       "wintry mix",
+    "WINTRYMIX":        "wintry mix",
+
+    # ------------------------------------------------------------------
+    # Thunderstorms
+    # ------------------------------------------------------------------
+    "TSTRM":            "thunderstorms",
+    "TSTMS":            "thunderstorms",
+    "TSRAIN":           "thunderstorms and rain",
+    "THUNDERSTORM":     "thunderstorm",
+    "THUNDERSTORMS":    "thunderstorms",
+    "LIGHTTHUNDERSTORMANDHEAVYRAIN": "thunderstorm with heavy rain",
+    "LIGHTTHUNDERSTORMANDRAIN":      "thunderstorm with rain",
+    "HEAVYTHUNDERSTORMANDRAIN":      "severe thunderstorm with rain",
+    "THUNDERSTORMWITHRAIN":          "thunderstorm with rain",
+    "THUNDERSTORMWITHHEAVYRAIN":     "thunderstorm with heavy rain",
+    "THUNDERSTORMWITHLIGHTRAIN":     "thunderstorm with light rain",
 }
+
 
 # Sky codes from ASOS textDescription -> normalise to lower-case spoken form
 # (ASOS already returns English text; we just lower-case and clean it up)

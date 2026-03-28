@@ -9,7 +9,7 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Resp
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .api_models import (
+from .models import (
     AudioUploadAccepted,
     ClearHeightenedModeRequest,
     CommandAccepted,
@@ -24,7 +24,7 @@ from .api_models import (
 )
 from .auth import ApiPrincipal, get_api_principal, require_scopes
 from .commands import CommandNotFoundError, CommandStore, IdempotencyConflictError
-from .control import ControlError, OrchestratorControl
+from ..control import ControlError, OrchestratorControl
 
 
 def _request_id() -> str:

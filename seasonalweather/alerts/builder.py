@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import List
 
 from .product import ParsedProduct
-from .tts import clean_for_tts
+from ..tts.tts import clean_for_tts
 
 _STAR_RE = re.compile(r"^\s*\*\s+")
 _SPACE_RE = re.compile(r"\s+")

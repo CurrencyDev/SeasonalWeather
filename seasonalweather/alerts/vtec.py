@@ -25,9 +25,9 @@ Usage (library):
     # ToneoutPolicy(mode='VOICE', same_code=None, reason='sig=Y:advisory:voice-only', ...)
 
 Usage (CLI — ask it what it thinks a string is):
-    python -m seasonalweather.vtec "/O.NEW.KLWX.CF.Y.0004.260325T1400Z-260325T1800Z/"
-    python -m seasonalweather.vtec "/O.NEW.KLWX.TO.W.0012.260325T1400Z-260325T1800Z/"
-    python -m seasonalweather.vtec  # runs built-in test vectors
+    python -m seasonalweather.alerts.vtec "/O.NEW.KLWX.CF.Y.0004.260325T1400Z-260325T1800Z/"
+    python -m seasonalweather.alerts.vtec "/O.NEW.KLWX.TO.W.0012.260325T1400Z-260325T1800Z/"
+    python -m seasonalweather.alerts.vtec  # runs built-in test vectors
 """
 from __future__ import annotations
 
@@ -545,13 +545,13 @@ def _cli() -> None:
     Ask vtec.py what it thinks a VTEC string (or list of strings) is.
 
     Usage:
-        python -m seasonalweather.vtec
+        python -m seasonalweather.alerts.vtec
             → runs built-in test vectors
 
-        python -m seasonalweather.vtec "/O.NEW.KLWX.CF.Y.0004.260325T1400Z-260325T1800Z/"
+        python -m seasonalweather.alerts.vtec "/O.NEW.KLWX.CF.Y.0004.260325T1400Z-260325T1800Z/"
             → prints full parse + policy for that string
 
-        python -m seasonalweather.vtec "STRING1" "STRING2"
+        python -m seasonalweather.alerts.vtec "STRING1" "STRING2"
             → treats all args as a multi-VTEC event (as CAP sometimes sends)
     """
     args = sys.argv[1:]

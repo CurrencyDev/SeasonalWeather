@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Iterator, Optional
 
-from .same_decode import HEADER_RE, SAME_MAX_LOCS
+from .decode import HEADER_RE, SAME_MAX_LOCS
 
 # ffmpeg emits s16le; samedec expects i16 native-endian. On x86/x64 (little-endian), this matches.
 BYTES_PER_SAMPLE = 2  # int16 mono

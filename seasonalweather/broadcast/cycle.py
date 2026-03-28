@@ -10,12 +10,12 @@ from typing import List, Optional, Tuple
 from typing import Any, Dict, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
-from .nws_api import NWSApi
+from ..alerts.nws_api import NWSApi
 from .rwr import (
     ObsPressureCache, parse_rwr, build_rwr_obs_text, build_asos_obs_text,
     asos_to_rwr_station,
 )
-from .tts import clean_for_tts
+from ..tts.tts import clean_for_tts
 
 
 def _fmt_time(now: dt.datetime) -> str:

@@ -23,7 +23,7 @@ from array import array
 from dataclasses import asdict
 from typing import Iterable, Iterator
 
-from . import same_decode as sd
+from . import decode as sd
 
 DecodedSAME = sd.DecodedSAME
 

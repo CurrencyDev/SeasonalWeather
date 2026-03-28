@@ -25,7 +25,7 @@ Design rules:
   - No side effects. All functions are pure / stateless.
 
 Usage (library):
-    from seasonalweather.same_events import label_for, urgency_for, is_known
+    from seasonalweather.same.events import label_for, urgency_for, is_known
 
     label_for("TOR")    # → "Tornado Warning"
     label_for("CFW")    # → "Coastal Flood Warning"
@@ -35,8 +35,8 @@ Usage (library):
     is_known("RWT")     # → True
 
 Usage (CLI):
-    python -m seasonalweather.same_events TOR CFW CFA
-    python -m seasonalweather.same_events          # prints full table
+    python -m seasonalweather.same.events TOR CFW CFA
+    python -m seasonalweather.same.events          # prints full table
 """
 from __future__ import annotations
 
@@ -264,10 +264,10 @@ def _cli() -> None:
     Look up one or more SAME/EAS event codes, or print the full table.
 
     Usage:
-        python -m seasonalweather.same_events
+        python -m seasonalweather.same.events
             → prints the full table (code, label, urgency)
 
-        python -m seasonalweather.same_events TOR CFW CFA RWT
+        python -m seasonalweather.same.events TOR CFW CFA RWT
             → looks up each code
     """
     args = [a.strip().upper() for a in sys.argv[1:] if a.strip()]

@@ -7,9 +7,9 @@ import logging
 import uvicorn
 
 from .api import create_app
-from .config import load_config
-from .control import OrchestratorControl
-from .main import Orchestrator, _setup_logging
+from ..config import load_config
+from ..control import OrchestratorControl
+from ..main import Orchestrator, _setup_logging
 
 
 log = logging.getLogger("seasonalweather.api")
