@@ -93,7 +93,7 @@ def build_station_feed_payload(
         d["severity"] = _clamp(d.get("severity"), 24) or "Unknown"
         d["urgency"] = _clamp(d.get("urgency"), 24) or "Unknown"
         d["certainty"] = _clamp(d.get("certainty"), 24) or "Unknown"
-        d["area"] = _clamp(d.get("area"), 320)
+        d["area"] = (d.get("area") or "")
         d["sameCodes"] = _uniq_strs(d.get("sameCodes"))
         out_alerts.append(d)
 
