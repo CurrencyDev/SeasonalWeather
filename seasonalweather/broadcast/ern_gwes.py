@@ -48,7 +48,7 @@ def _cfg_samedec_args() -> tuple[str, float, float]:
     Falls back to sane defaults if the app config is not available.
     """
     try:
-        from .main import _APP_CFG  # late import to avoid circular dependency
+        from ..main import _APP_CFG  # late import to avoid circular dependency
     except Exception:
         _APP_CFG = None
 

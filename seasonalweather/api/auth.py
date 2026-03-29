@@ -54,7 +54,7 @@ def _is_loopback(host: str | None) -> bool:
 
 
 def _load_token_map() -> dict[str, dict[str, Any]]:
-    from .main import _APP_CFG  # late import to avoid circular dependency
+    from ..main import _APP_CFG  # late import to avoid circular dependency
     secrets = _APP_CFG.secrets if _APP_CFG else None
 
     raw_json = (secrets.api_tokens_json if secrets else "") or ""
@@ -106,7 +106,7 @@ async def get_api_principal(
     request: Request,
     authorization: str | None = Header(default=None),
 ) -> ApiPrincipal:
-    from .main import _APP_CFG  # late import to avoid circular dependency
+    from ..main import _APP_CFG  # late import to avoid circular dependency
     allow_remote = (_APP_CFG.api.allow_remote if _APP_CFG else False)
     client_host = request.client.host if request.client else None
     if not allow_remote and not _is_loopback(client_host):
