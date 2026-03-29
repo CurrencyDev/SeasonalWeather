@@ -309,6 +309,7 @@ class TestsScheduleConfig:
     weekday: int
     hour: int
     minute: int
+    script_lines: tuple[str, ...]  # spoken text lines; empty = use built-in default
 
 
 @dataclass(frozen=True)
@@ -317,6 +318,7 @@ class TestsRmtConfig:
     weekday: int
     hour: int
     minute: int
+    script_lines: tuple[str, ...]  # spoken text lines; empty = use built-in default
 
 
 @dataclass(frozen=True)
@@ -847,12 +849,14 @@ def load_config(path: str) -> AppConfig:
             weekday=int(rwt_raw.get("weekday", 2)),
             hour=int(rwt_raw.get("hour", 11)),
             minute=int(rwt_raw.get("minute", 0)),
+            script_lines=tuple(str(x) for x in rwt_raw.get("script_lines", []) if str(x).strip()),
         ),
         rmt=TestsRmtConfig(
             nth=int(rmt_raw.get("nth", 1)),
             weekday=int(rmt_raw.get("weekday", 2)),
             hour=int(rmt_raw.get("hour", 11)),
             minute=int(rmt_raw.get("minute", 0)),
+            script_lines=tuple(str(x) for x in rmt_raw.get("script_lines", []) if str(x).strip()),
         ),
     )
 
