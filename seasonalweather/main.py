@@ -1231,7 +1231,7 @@ def _station_feed_note_ern(ev, *, same_locations, out_wav: str) -> None:
             sender_name = parsed.get("sender")
         sender_name = sender_name or getattr(ev, "sender", None) or "ERN"
         # Keep this "unknown" so the UI doesn't auto-append "(relay)" if it uses sender.kind in labels
-        sender = FeedSender(name=str(sender_name), kind="unknown") if FeedSender else None
+        sender = FeedSender(name=str(sender_name), kind="relay") if FeedSender else None
 
         # Event text: prefer ev.event if already human-readable, else map from SAME event code
         ev_event = (getattr(ev, "event", None) or "").strip()
@@ -1338,7 +1338,7 @@ def _station_feed_note_nwws(
 
         key = f"nwws:{prod_type}:{awips}:{wfo}:{issued_at or getattr(parsed, 'issued', None)}"
         alert_id = vtec_tracks[0] if vtec_tracks else _sf_sha1_12(key)
-        sender = FeedSender(name="NWWS-OI", kind="relay") if FeedSender else None
+        sender = FeedSender(name="NWWS-OI", kind="origin") if FeedSender else None
 
         issued_dt = _sf_parse_dt(issued_at) if issued_at is not None else _sf_nwws_best_issued_dt(parsed, base_text)
         if issued_dt is not None and issued_dt.tzinfo is None:
@@ -3437,6 +3437,61 @@ class Orchestrator:
         return touched
 
 
+    async def _rebroadcast_update_script_by_tracks(
+        self, *, tracks: list[tuple[str, str]] | None, script: str, expires_at: dt.datetime, reason: str
+    ) -> int:
+        """
+        For NWWS-OI CON/EXT voice-only products: update the script (and re-render audio)
+        for any existing rebroadcast rotation item that matches the given VTEC track ids.
+        Creates no new rotation entries — only updates existing ones.
+        """
+        if not self.rebroadcast_enabled or not tracks:
+            return 0
+        track_ids: set[str] = {str(t[0]).strip() for t in tracks if t and str(t[0]).strip()}
+        if not track_ids or not (script or "").strip():
+            return 0
+
+        now = dt.datetime.now(self.local_tz)
+        updated = 0
+
+        # Collect keys to update without holding the lock during rendering.
+        async with self._rebroadcast_lock:
+            await self._rebroadcast_prune_locked(now)
+            keys_to_update = [
+                k for k, it in self._rebroadcast_items.items()
+                if ":TRK:" in k and any(tid in k for tid in track_ids)
+                and getattr(it, "script_hash", "") != self._sha1_12(script[:4000])
+            ]
+
+        for k in keys_to_update:
+            new_wav = await self._render_voice_only_audio(script, prefix="rebcast")
+            async with self._rebroadcast_lock:
+                it = self._rebroadcast_items.get(k)
+                if not it:
+                    try:
+                        Path(new_wav).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    continue
+                old_wav = Path(str(getattr(it, "audio_path", "") or ""))
+                it.audio_path = str(new_wav)
+                it.script_hash = self._sha1_12(script[:4000])
+                it.expires_at = max(getattr(it, "expires_at", now), expires_at)
+                it.next_due_at = min(getattr(it, "next_due_at", now), now + dt.timedelta(seconds=60))
+                if old_wav and old_wav.exists():
+                    try:
+                        old_wav.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                updated += 1
+
+        if updated:
+            self.log.info(
+                "Rebroadcast: updated script for %d item(s) tracks=%s reason=%s",
+                updated, ",".join(sorted(track_ids)), reason,
+            )
+        return updated
+
     def _rebroadcast_pick_due_locked(self, now: dt.datetime) -> SimpleNamespace | None:
         due: list[SimpleNamespace] = []
         for it in self._rebroadcast_items.values():
@@ -3485,10 +3540,22 @@ class Orchestrator:
 
             it2 = self._rebroadcast_items.get(key)
             if it2:
-                try:
-                    Path(out_wav).unlink(missing_ok=True)
-                except Exception:
-                    pass
+                if getattr(it2, "script_hash", "") != script_hash:
+                    # Script changed (e.g. CON replaced NEW): swap to the updated audio.
+                    old_wav = Path(str(getattr(it2, "audio_path", "") or ""))
+                    it2.audio_path = str(out_wav)
+                    it2.script_hash = script_hash
+                    if old_wav and old_wav.exists():
+                        try:
+                            old_wav.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                else:
+                    # Identical script — no audio swap needed; discard the new render.
+                    try:
+                        Path(out_wav).unlink(missing_ok=True)
+                    except Exception:
+                        pass
                 it2.desc = desc
                 it2.expires_at = max(getattr(it2, "expires_at", now), expires_at)
                 it2.next_due_at = min(getattr(it2, "next_due_at", now), now + dt.timedelta(seconds=60))
@@ -3787,8 +3854,13 @@ class Orchestrator:
         if code not in {"RWT", "RMT"}:
             return
 
-        # KEEP YOUR LONG FORM WORDING (unchanged)
-        if code == "RWT":
+        # Script: use config override when provided, else fall back to built-in default.
+        _cfg_lines: tuple[str, ...] = (
+            self.cfg.tests.rwt.script_lines if code == "RWT" else self.cfg.tests.rmt.script_lines
+        )
+        if _cfg_lines:
+            lines = list(_cfg_lines)
+        elif code == "RWT":
             lines = [
                 "This is a required weekly test of the SeasonalWeather alert stream. This is only a test.",
                 "SeasonalWeather is an internet delivered weather broadcast stream. It does not transmit over the air.",
@@ -6108,20 +6180,38 @@ class Orchestrator:
 
             # Rebroadcast rotation (no re-tone)
             try:
-                if self.rebroadcast_enabled and (should_full or self.rebroadcast_include_voice):
+                if self.rebroadcast_enabled:
                     exp_utc = self._best_expiry_from_vtec(vtec)
                     expires_at = self._rebroadcast_clamp_expiry(now, exp_utc)
-                    kind_rb = "FULL" if should_full else "VOICE"
-                    key_rb = self._rebroadcast_make_key(
-                        source="NWWS",
-                        kind=kind_rb,
-                        event_code=_nw_policy.same_code or _safe_event_code(parsed.product_type),
-                        tracks=tracks,
-                        same_locs=in_area_same,
-                        script=spoken.script,
+                    _rb_vtec_acts = {act for (_t, act) in tracks} if tracks else set()
+                    _rb_is_con_ext = bool(
+                        not should_full
+                        and tracks
+                        and _rb_vtec_acts & {"CON", "EXT", "EXA", "EXB"}
                     )
-                    desc_rb = f"NWWS {kind_rb} {parsed.product_type} {parsed.wfo} {parsed.awips_id or ''}".strip()
-                    await self._rebroadcast_add(key=key_rb, desc=desc_rb, script=spoken.script, expires_at=expires_at)
+                    if _rb_is_con_ext:
+                        # CON/EXT on a VTEC-tracked product: update the script text of
+                        # any existing rotation entry for this track rather than adding
+                        # a duplicate slot alongside the original NEW entry.
+                        desc_rb = f"NWWS VOICE {parsed.product_type} {parsed.wfo} {parsed.awips_id or ''}".strip()
+                        await self._rebroadcast_update_script_by_tracks(
+                            tracks=tracks,
+                            script=spoken.script,
+                            expires_at=expires_at,
+                            reason=f"nwws-con-ext:{parsed.product_type}:{parsed.wfo}",
+                        )
+                    elif should_full or self.rebroadcast_include_voice:
+                        kind_rb = "FULL" if should_full else "VOICE"
+                        key_rb = self._rebroadcast_make_key(
+                            source="NWWS",
+                            kind=kind_rb,
+                            event_code=_nw_policy.same_code or _safe_event_code(parsed.product_type),
+                            tracks=tracks,
+                            same_locs=in_area_same,
+                            script=spoken.script,
+                        )
+                        desc_rb = f"NWWS {kind_rb} {parsed.product_type} {parsed.wfo} {parsed.awips_id or ''}".strip()
+                        await self._rebroadcast_add(key=key_rb, desc=desc_rb, script=spoken.script, expires_at=expires_at)
             except Exception:
                 log.exception("Rebroadcast: failed to add NWWS item")
         except Exception:
