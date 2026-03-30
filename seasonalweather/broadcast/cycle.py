@@ -1237,8 +1237,8 @@ class CycleBuilder:
         ctx: CycleContext,
     ) -> List[CycleSegment]:
         now = dt.datetime.now(tz=self.tz)
-        time_str = _fmt_time(now)
-        tz_short = _short_tz(now)
+        # time_str / tz_short removed — time is now spoken by CycleConductor's
+        # live 'time' segment and no longer embedded in the station ID.
 
         # --- Active alerts (filter to our SAME/FIPS list) ---
         alerts = await self.api.active_alerts(self.alert_areas)
@@ -1473,16 +1473,18 @@ class CycleBuilder:
                 f"with station programming and streaming facilities originating from SeasonalNet, "
                 f"providing weather information for {service_area_name}. "
                 f"Due to severe weather affecting the service area, normal broadcasts have been curtailed to bring you the latest severe weather information. "
-                f"The current time is, {time_str}, {tz_short}. "
                 f"{disclaimer}"
+                # Time is announced by the live 'time' segment in CycleConductor,
+                # synthesised at push time so it is always accurate.
             )
         else:
             station_id = (
                 f"This is the SeasonalNet I P Weather Radio Station, {station_name}, "
                 f"with station programming and streaming facilities originating from SeasonalNet, "
                 f"providing weather information for {service_area_name}. "
-                f"The current time is, {time_str}, {tz_short}. "
                 f"{disclaimer}"
+                # Time is announced by the live 'time' segment in CycleConductor,
+                # synthesised at push time so it is always accurate.
             )
         # --- Status ---
         status_bits: List[str] = []

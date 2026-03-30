@@ -44,6 +44,9 @@ from .tts.tts import TTS
 from .tts.audio import write_sine_wav, write_silence_wav, concat_wavs, wav_duration_seconds
 from .liquidsoap_telnet import LiquidsoapTelnet
 from .broadcast.cycle import CycleBuilder, CycleContext, CycleSegment
+from .broadcast.segment_store import SegmentStore
+from .broadcast.conductor import CycleConductor
+from .broadcast.segment_refresher import SegmentRefresher
 
 # Active alert tracker (persistent cycle state across restarts)
 from .alerts.active import ActiveAlert, AlertTracker, _vtec_track_id
@@ -1623,17 +1626,13 @@ class Orchestrator:
         # Prevent concurrent cycle flush/push from overlapping
         self._cycle_lock = asyncio.Lock()
 
-        # Debounced cycle refill task (prevents rebuild spam on bursts of CAP voice cut-ins)
-        self._cycle_refill_task: asyncio.Task | None = None
+        # _cycle_refill_task and _last_cycle_seq_dur retired —
+        # CycleConductor handles continuous buffering; call
+        # self.conductor.notify_flush() instead.
 
-        # Duration (seconds) of the last fully-built cycle audio train.
-        # Used by _cycle_loop to schedule the next rebuild based on actual audio length
-        # rather than the fixed scheduling interval, preventing mid-broadcast chops.
-        self._last_cycle_seq_dur: float = 0.0
-
-        # Live time WAV (drift killer)
-        self.live_time_enabled = cfg.live_time.enabled
-        self.live_time_interval_seconds = cfg.live_time.interval_seconds
+        # Live time handled by CycleConductor ("time" segment synthesised at
+        # push time — no cached WAV, no drift).  Config keys are kept in
+        # config.yaml for backwards compatibility but are no longer read here.
 
         # --- Cross-source dedupe (NWWS vs CAP) ---
         self._dedupe_ttl_seconds = cfg.dedupe.ttl_seconds
@@ -1691,6 +1690,45 @@ class Orchestrator:
 
         # Discord webhook logger (fire-and-forget; starts its drain task in run())
         self.discord = DiscordLogger.from_config(cfg.logs.discord)
+
+        # SegmentStore: persistent per-segment audio cache.
+        # Placed last so alert_tracker and all other attributes are available.
+        self._seg_store = SegmentStore(
+            work_dir=Path(cfg.paths.work_dir),
+            audio_dir=Path(cfg.paths.audio_dir),
+        )
+        self._seg_store.load()
+
+        # SegmentRefresher: keeps each segment's text + audio up to date
+        # independently on its own cadence.
+        self.refresher = SegmentRefresher(
+            store=self._seg_store,
+            cycle_builder=self.cycle_builder,
+            tts=self.tts,
+            alert_tracker=self.alert_tracker,
+            ctx_fn=self._make_cycle_ctx,
+            station_name=cfg.station.name,
+            service_area_name=cfg.station.service_area_name,
+            disclaimer=cfg.station.disclaimer,
+            tz=self._tz,
+            sample_rate=cfg.audio.sample_rate,
+        )
+
+        # CycleConductor: continuous cycle driver — replaces _cycle_loop
+        # and _queue_cycle_once.  Call conductor.notify_flush() anywhere
+        # that previously called _schedule_cycle_refill().
+        self.conductor = CycleConductor(
+            store=self._seg_store,
+            telnet=self.telnet,
+            tts=self.tts,
+            alert_tracker=self.alert_tracker,
+            tz=self._tz,
+            audio_dir=Path(cfg.paths.audio_dir),
+            sample_rate=cfg.audio.sample_rate,
+            np_meta_fn=self._np_meta,
+            discord_fn=self.discord.cycle_rebuilt,
+            active_alerts_fn=lambda: len(self.alert_tracker.get_cycle_alerts()),
+        )
 
     def _station_feed_seed_from_alert_tracker(self) -> int:
         """
@@ -1954,6 +1992,17 @@ class Orchestrator:
             await asyncio.sleep(1)
         raise RuntimeError("Liquidsoap telnet did not become reachable (is seasonalweather-liquidsoap running?)")
 
+    def _make_cycle_ctx(self) -> "CycleContext":
+        """Return a CycleContext reflecting current station state.
+        Used by SegmentRefresher so it can build segments without holding
+        a reference to the full Orchestrator.
+        """
+        return CycleContext(
+            mode=self.mode,
+            last_heightened_ago=self._heightened_ago_str(),
+            last_product_desc=self.last_product_desc,
+        )
+
     def _update_mode(self) -> None:
         _prev_mode = getattr(self, "mode", "normal")
         now = dt.datetime.now(tz=self._tz)
@@ -1966,6 +2015,12 @@ class Orchestrator:
                 self.discord.mode_changed(old_mode=_prev_mode, new_mode=self.mode)
             except Exception:
                 pass
+            # Trigger immediate id segment refresh so heightened/normal
+            # station ID goes on air on the next cycle rotation.
+            try:
+                self.refresher.trigger_immediate("id")
+            except AttributeError:
+                pass  # refresher not yet initialised
 
     def _heightened_ago_str(self) -> str | None:
         if not self.last_heightened_at:
@@ -1986,19 +2041,14 @@ class Orchestrator:
         return self.cfg.cycle.normal_interval_seconds
 
     def _schedule_cycle_refill(self, reason: str) -> None:
+        """Shim: delegates to CycleConductor.notify_flush(). Retained so that
+        any call-sites not yet migrated continue to compile and behave correctly.
+        The *reason* argument is accepted but ignored.
         """
-        Debounce cycle rebuilds. If multiple events ask for a cycle refill in quick succession
-        (CAP burst, back-to-back voice cut-ins, etc.), collapse them into ONE rebuild.
-        """
-        if self._cycle_refill_task and not self._cycle_refill_task.done():
-            return
-
-        async def _runner() -> None:
-            await asyncio.sleep(2)
-            await self._queue_cycle_once(reason=reason)
-
-        safe_reason = "".join(ch for ch in reason if ch.isalnum() or ch in {"_", "-"}).strip() or "refill"
-        self._cycle_refill_task = asyncio.create_task(_runner(), name=f"cycle_refill_{safe_reason}")
+        try:
+            self.conductor.notify_flush()
+        except AttributeError:
+            pass  # conductor not yet initialised (startup edge case)
 
     # ---- dedupe helpers ----
     def _sha1_12(self, s: str) -> str:
@@ -4018,8 +4068,10 @@ class Orchestrator:
 
         tasks: list[asyncio.Task] = []
 
-        if self.live_time_enabled:
-            tasks.append(asyncio.create_task(self._live_time_loop(), name="live_time_wav"))
+        # CycleConductor + SegmentRefresher replace _cycle_loop,
+        # _queue_cycle_once, and the old live_time_loop.
+        tasks.append(asyncio.create_task(self.conductor.run(), name="conductor"))
+        tasks.append(asyncio.create_task(self.refresher.run(), name="segment_refresher"))
 
         xmpp = NWWSClient(
             self.jid, self.password, self.nwws_server, self.nwws_port, self.nwws_queue,
@@ -4034,7 +4086,7 @@ class Orchestrator:
         )
         tasks.append(asyncio.create_task(xmpp.run_forever(), name="nwws_xmpp"))
         tasks.append(asyncio.create_task(self._consume_nwws(), name="nwws_consumer"))
-        tasks.append(asyncio.create_task(self._cycle_loop(), name="cycle_loop"))
+        # _cycle_loop retired — CycleConductor runs the cycle continuously.
 
         if self.rebroadcast_enabled:
             tasks.append(asyncio.create_task(self._rebroadcast_loop(), name="rebroadcast_loop"))
@@ -4186,6 +4238,23 @@ class Orchestrator:
                 )
 
             self.last_product_desc = f"{parsed.product_type} ({parsed.awips_id or ''})"
+
+            # Trigger out-of-band segment refreshes for products whose content
+            # feeds specific cycle segments so listeners hear fresh data sooner.
+            try:
+                _pt = (parsed.product_type or "").strip().upper()
+                if _pt == "HWO":
+                    self.refresher.trigger_immediate("hwo")
+                elif _pt in {"RWS", "AFD", "SYN"}:
+                    self.refresher.trigger_immediate("zfp")
+                elif _pt == "RWR":
+                    self.refresher.trigger_immediate("obs")
+                elif _pt in {"CWF", "CWA"}:
+                    self.refresher.trigger_immediate("cwf")
+                elif _pt in {"SWO", "SWS"}:
+                    self.refresher.trigger_immediate("spc")
+            except AttributeError:
+                pass  # refresher not yet initialised
 
             if not allowed_wfo:
                 continue
@@ -6836,6 +6905,19 @@ class Orchestrator:
                 log.exception("Segmented cycle build failed (%s): %s", reason, e)
 
     async def _cycle_loop(self) -> None:
+        """Retired — CycleConductor.run() handles the broadcast cycle.
+        This stub is kept so any remaining references compile; it exits
+        immediately if somehow called.
+        """
+        log.warning("_cycle_loop called but is retired — CycleConductor is active")
+        return
+        # Original body preserved below for reference during transition.
+        # fmt: off  # noqa: E999
+        _RETIRED = True
+        if _RETIRED:
+            return
+        # fmt: on
+        _unused_loop_start = True  # type: ignore[unreachable]
         while True:
             self._update_mode()
             interval = self._cycle_interval_seconds()
