@@ -55,6 +55,7 @@ from .discord_log import DiscordLogger
 # VTEC policy + SAME event code libraries — Orchestrator defers to these.
 from .alerts.vtec import toneout_policy as _vtec_toneout_policy
 from .same.events import label_or_code as _same_label_or_code
+from .same import ugc as _ugc
 
 # RWT/RMT scheduler
 from .broadcast.rwt_rmt import RwtRmtSchedule, RwtRmtScheduler
@@ -1425,73 +1426,6 @@ _VTEC_PARSE_RE = re.compile(
     r"/(?P<prod>[A-Z])\.(?P<act>[A-Z]{3})\.(?P<office>[A-Z]{4})\.(?P<phen>[A-Z0-9]{2})\.(?P<sig>[A-Z])\.(?P<etn>\d{4})\.(?P<start>(?:\d{8}|\d{6})T\d{4}Z)-(?P<end>(?:\d{8}|\d{6})T\d{4}Z)/"
 )
 
-# UGC targeting helpers (NWWS-only)
-_UGC_EXPIRES_RE = re.compile(r"\b\d{6}-\s*$")
-_UGC_ANY_CODE_RE = re.compile(r"\b[A-Z]{2}[CZ]\d{3}(?:>\d{3})?\b|\b[A-Z]{2}Z\d{3}(?:>\d{3})?\b|\b[A-Z]{3}\d{3}(?:>\d{3})?\b")
-
-# Minimal-but-solid state FIPS mapping for SAME conversion (county codes)
-# (Includes all states + DC + major territories for safety.)
-_STATE_ABBR_TO_FIPS: dict[str, str] = {
-    "AL": "01",
-    "AK": "02",
-    "AZ": "04",
-    "AR": "05",
-    "CA": "06",
-    "CO": "08",
-    "CT": "09",
-    "DE": "10",
-    "DC": "11",
-    "FL": "12",
-    "GA": "13",
-    "HI": "15",
-    "ID": "16",
-    "IL": "17",
-    "IN": "18",
-    "IA": "19",
-    "KS": "20",
-    "KY": "21",
-    "LA": "22",
-    "ME": "23",
-    "MD": "24",
-    "MA": "25",
-    "MI": "26",
-    "MN": "27",
-    "MS": "28",
-    "MO": "29",
-    "MT": "30",
-    "NE": "31",
-    "NV": "32",
-    "NH": "33",
-    "NJ": "34",
-    "NM": "35",
-    "NY": "36",
-    "NC": "37",
-    "ND": "38",
-    "OH": "39",
-    "OK": "40",
-    "OR": "41",
-    "PA": "42",
-    "RI": "44",
-    "SC": "45",
-    "SD": "46",
-    "TN": "47",
-    "TX": "48",
-    "UT": "49",
-    "VT": "50",
-    "VA": "51",
-    "WA": "53",
-    "WV": "54",
-    "WI": "55",
-    "WY": "56",
-    "PR": "72",
-    "VI": "78",
-    "GU": "66",
-    "AS": "60",
-    "MP": "69",
-}
-
-# Reverse lookup (FIPS2 -> state abbr) for SAME->county name mapping
-_FIPS2_TO_STATE_ABBR: dict[str, str] = {v: k for (k, v) in _STATE_ABBR_TO_FIPS.items()}
 
 
 
@@ -2508,14 +2442,16 @@ class Orchestrator:
         s = (st or "").strip().upper()
         if not s:
             return None
-        return _STATE_ABBR_TO_FIPS.get(s)
+        return _ugc.STATE_ABBR_TO_FIPS.get(s)
 
     def _same_from_state_county(self, state_abbr: str, county3: str) -> str | None:
-        f2 = self._state_to_fips2(state_abbr)
-        c3 = "".join(ch for ch in (county3 or "") if ch.isdigit())
-        if not f2 or len(c3) != 3:
+        # Delegates to ugc library; retains signature for existing callers.
+        c3 = "".join(ch for ch in (county3 or "") if ch.isdigit()).zfill(3)
+        if len(c3) != 3:
             return None
-        return f"0{f2}{c3}"
+        return _ugc.same_from_county_zone(
+            f"{(state_abbr or '').strip().upper()}C{c3}"
+        )
 
     # ---- Station-feed helpers: SAME(6) -> County names (ERN relays) ----
     def _same6_to_county_zone_id(self, same6: str) -> tuple[str | None, str | None]:
@@ -2525,7 +2461,7 @@ class Orchestrator:
             return (None, None)
         st_fips2 = s[1:3]  # ignore partition
         cty3 = s[3:6]
-        st = _FIPS2_TO_STATE_ABBR.get(st_fips2)
+        st = _ugc.FIPS_TO_STATE_ABBR.get(st_fips2)
         if not st:
             return (None, None)
         return (f"{st}C{cty3}", st)
@@ -2588,131 +2524,6 @@ class Orchestrator:
             out.append(s)
         return "; ".join(out)
 
-    def _extract_ugc_block(self, text: str) -> str:
-        """
-        Extracts the UGC block (the hyphen-continued zone list ending with the 6-digit expiration)
-        from an NWS text product. Returns a *flattened* string with no whitespace.
-        """
-        if not text:
-            return ""
-        lines = (text or "").splitlines()
-        # Only scan early header region; UGC is always near the top.
-        scan = lines[:120]
-
-        end_idx: int | None = None
-        for i, ln in enumerate(scan):
-            s = (ln or "").strip()
-            if not s:
-                continue
-            if _UGC_EXPIRES_RE.search(s) and _UGC_ANY_CODE_RE.search(s):
-                end_idx = i
-                break
-
-        if end_idx is None:
-            return ""
-
-        start_idx = end_idx
-        while start_idx > 0:
-            prev = (scan[start_idx - 1] or "").strip()
-            if not prev:
-                break
-            # UGC lines are hyphen-continuations too
-            if prev.endswith("-") and _UGC_ANY_CODE_RE.search(prev):
-                start_idx -= 1
-                continue
-            break
-
-        # Flatten (UGC lines are usually already dense; we strip whitespace just in case)
-        block = "".join((scan[j] or "").strip() for j in range(start_idx, end_idx + 1))
-        block = re.sub(r"\s+", "", block)
-        return block.strip()
-
-    def _expand_ugc_tokens(self, ugc_block: str) -> list[str]:
-        """
-        Takes a flattened UGC block like:
-          "MDZ008-011-VAZ...-251200-"
-        and returns expanded zone ids:
-          ["MDZ008", "MDZ011", ...]
-        Supports NNN>NNN ranges and prefix-carry.
-        """
-        if not ugc_block:
-            return []
-
-        # Split on hyphens; last piece is usually the 6-digit expiration.
-        parts = [p.strip().strip(".") for p in ugc_block.split("-") if p.strip().strip(".")]
-
-        # Drop the trailing expiration token if present
-        if parts and re.fullmatch(r"\d{6}", parts[-1]):
-            parts = parts[:-1]
-
-        out: list[str] = []
-        seen: set[str] = set()
-
-        prefix: str | None = None  # e.g., "MDZ", "PAC", "ANZ"
-        for raw in parts:
-            tok = raw.strip().strip(".")
-            if not tok:
-                continue
-
-            # Normalize weird trailing punctuation
-            tok = tok.rstrip(",;")
-
-            # Case A: full token with prefix+number, optionally range
-            m_full = re.fullmatch(r"(?P<pfx>[A-Z]{2,3}[CZ]?)?(?P<num>\d{3})(?:>(?P<end>\d{3}))?", tok)
-            if m_full:
-                pfx = (m_full.group("pfx") or "").upper()
-                num = m_full.group("num")
-                end = m_full.group("end")
-
-                # If pfx is present and contains letters, lock prefix.
-                if pfx and any(ch.isalpha() for ch in pfx):
-                    prefix = pfx
-                if not prefix:
-                    continue
-
-                def emit(n: int) -> None:
-                    z = f"{prefix}{n:03d}"
-                    if z not in seen:
-                        seen.add(z)
-                        out.append(z)
-
-                if end:
-                    a = int(num)
-                    b = int(end)
-                    step = 1 if b >= a else -1
-                    for n in range(a, b + step, step):
-                        emit(n)
-                else:
-                    emit(int(num))
-                continue
-
-            # Case B: explicit prefix+number in other shape (rare)
-            m2 = re.fullmatch(r"(?P<pfx>[A-Z]{3})(?P<num>\d{3})(?:>(?P<end>\d{3}))?", tok)
-            if m2:
-                prefix = m2.group("pfx").upper()
-                num = int(m2.group("num"))
-                end_s = m2.group("end")
-                if end_s:
-                    end_n = int(end_s)
-                    step = 1 if end_n >= num else -1
-                    for n in range(num, end_n + step, step):
-                        z = f"{prefix}{n:03d}"
-                        if z not in seen:
-                            seen.add(z)
-                            out.append(z)
-                else:
-                    z = f"{prefix}{num:03d}"
-                    if z not in seen:
-                        seen.add(z)
-                        out.append(z)
-                continue
-
-        return out
-
-    def _extract_ugc_zones(self, text: str) -> list[str]:
-        blk = self._extract_ugc_block(text)
-        return self._expand_ugc_tokens(blk)
-
     # ---- ZoneCounty crosswalk (NOAA/NWS recommended: zone -> county FIPS -> SAME) ----
     def _zonecounty_enabled(self) -> bool:
         return self.cfg.zonecounty.enabled
@@ -2726,48 +2537,6 @@ class Orchestrator:
     def _zonecounty_dbx_path(self) -> Path:
         _, _audio, cache_dir, _logs = self._paths()
         return cache_dir / "zonecounty.dbx"
-
-    def _parse_zonecounty_dbx(self, path: Path) -> dict[str, list[str]]:
-        """
-        Parses the NWS ZoneCounty 'bp*.dbx' pipe-delimited file.
-
-        Common schema (NWS):
-          STATE | ZONE | ... | FIPS | ...
-        We only need STATE (2), ZONE (digits), FIPS (5).
-
-        Returns:
-          { "MDZ501": ["024031","024033", ...], ... }  (SAME codes, 6 digits)
-        """
-        m: dict[str, list[str]] = {}
-        seen: dict[str, set[str]] = {}
-
-        with path.open("r", encoding="utf-8", errors="ignore") as f:
-            for ln in f:
-                if "|" not in ln:
-                    continue
-                parts = [p.strip() for p in ln.split("|")]
-                if len(parts) < 7:
-                    continue
-
-                st = (parts[0] or "").strip().upper()
-                zn = "".join(ch for ch in (parts[1] or "") if ch.isdigit())
-                fips = "".join(ch for ch in (parts[6] or "") if ch.isdigit())
-
-                if len(st) != 2 or not zn or len(fips) != 5:
-                    continue
-
-                ugc = f"{st}Z{zn.zfill(3)}"
-                same = "0" + fips  # SAME is 6 digits: 0 + (state2+county3)
-
-                if ugc not in seen:
-                    seen[ugc] = set()
-                    m[ugc] = []
-                if same in seen[ugc]:
-                    continue
-                seen[ugc].add(same)
-                m[ugc].append(same)
-
-        return m
 
     async def _ensure_zonecounty_loaded(self) -> None:
         # ZONECOUNTY_DBX_DISCOVERY_PATCH_v1
@@ -2816,7 +2585,7 @@ class Orchestrator:
 
                     # Write to temp then validate by parsing.
                     tmp_path.write_bytes(r.content)
-                    parsed = await asyncio.to_thread(self._parse_zonecounty_dbx, tmp_path)
+                    parsed = await asyncio.to_thread(_ugc.parse_zonecounty_dbx, tmp_path)
 
                     if not parsed:
                         log.warning("ZoneCounty DBX candidate parsed 0 zones (url=%s).", candidate_url)
@@ -2843,7 +2612,7 @@ class Orchestrator:
             # If cache is fresh, just load it and bail early.
             if _cache_is_fresh():
                 try:
-                    self._zonecounty_map = await asyncio.to_thread(self._parse_zonecounty_dbx, dbx_path)
+                    self._zonecounty_map = await asyncio.to_thread(_ugc.parse_zonecounty_dbx, dbx_path)
                     log.info("ZoneCounty loaded: zones=%d file=%s", len(self._zonecounty_map), dbx_path)
                 except Exception:
                     log.exception("ZoneCounty parse failed; disabling ZoneCounty mapping for this run")
@@ -2910,7 +2679,7 @@ class Orchestrator:
                 return
 
             try:
-                self._zonecounty_map = await asyncio.to_thread(self._parse_zonecounty_dbx, dbx_path)
+                self._zonecounty_map = await asyncio.to_thread(_ugc.parse_zonecounty_dbx, dbx_path)
                 log.info("ZoneCounty loaded: zones=%d file=%s", len(self._zonecounty_map), dbx_path)
             except Exception:
                 log.exception("ZoneCounty parse failed; disabling ZoneCounty mapping for this run")
@@ -2931,87 +2700,6 @@ class Orchestrator:
     def _mareas_path(self) -> Path:
         _, _audio, cache_dir, _logs = self._paths()
         return cache_dir / "mareas.txt"
-
-    def _parse_mareas_txt(self, path: Path) -> dict[str, list[str]]:
-        """
-        Parse official NWS mareas*.txt files and a legacy fallback format.
-
-        Supported inputs:
-
-          1) Official NWS format:
-               AN|73535|Tidal Potomac from Key Bridge to Indian Head MD|38.7406|-77.0712
-             -> zone ANZ535, SAME 073535
-
-          2) Legacy/free-form lines already containing ANZ535 plus 5-digit or 6-digit codes.
-
-        Returns:
-          dict like { "ANZ535": ["073535"], ... }
-        """
-        import re
-
-        pipe_alpha_re = re.compile(r"^[A-Z]{2}$")
-        pipe_num_re = re.compile(r"^\d{5}$")
-
-        zone_re = re.compile(r"\b([A-Z]{3}\d{3})\b")
-        fips5_re = re.compile(r"\b(\d{5})\b")
-        same6_re = re.compile(r"\b(\d{6})\b")
-
-        out: dict[str, list[str]] = {}
-        seen: dict[str, set[str]] = {}
-
-        def add(zone: str, same_code: str) -> None:
-            z = "".join(ch for ch in str(zone).upper() if ch.isalnum())
-            s = "".join(ch for ch in str(same_code) if ch.isdigit()).zfill(6)
-            if len(z) != 6 or len(s) != 6:
-                return
-            if z not in out:
-                out[z] = []
-                seen[z] = set()
-            if s in seen[z]:
-                return
-            seen[z].add(s)
-            out[z].append(s)
-
-        with path.open("r", encoding="utf-8", errors="ignore") as f:
-            for ln in f:
-                s0 = (ln or "").strip()
-                if not s0 or s0.startswith("#"):
-                    continue
-
-                # Official NWS mareas*.txt pipe format:
-                #   SSALPHA|SSNUM|ZONENAME|LON|LAT
-                parts = [p.strip() for p in s0.split("|")]
-                if len(parts) >= 2 and pipe_alpha_re.fullmatch(parts[0].upper()) and pipe_num_re.fullmatch(parts[1]):
-                    ssalpha = parts[0].upper()        # e.g. AN
-                    ssnum = parts[1]                  # e.g. 73535
-                    zone = f"{ssalpha}Z{ssnum[-3:]}"  # -> ANZ535
-                    same = f"0{ssnum}"                # -> 073535
-                    add(zone, same)
-                    continue
-
-                # Legacy/free-form fallback
-                s = s0.upper()
-                zm = zone_re.search(s)
-                if not zm:
-                    continue
-                zone = zm.group(1).upper()
-
-                codes: list[str] = []
-
-                for x in same6_re.findall(s):
-                    d = "".join(ch for ch in x if ch.isdigit())
-                    if len(d) == 6:
-                        codes.append(d)
-
-                for x in fips5_re.findall(s):
-                    d = "".join(ch for ch in x if ch.isdigit())
-                    if len(d) == 5:
-                        codes.append("0" + d)
-
-                for c in codes:
-                    add(zone, c)
-
-        return out
 
     async def _ensure_mareas_loaded(self) -> None:
         if self._mareas_loaded:
@@ -3062,7 +2750,7 @@ class Orchestrator:
                 return
 
             try:
-                self._mareas_map = await asyncio.to_thread(self._parse_mareas_txt, path)
+                self._mareas_map = await asyncio.to_thread(_ugc.parse_mareas_txt, path)
                 log.info("Marine areas loaded: zones=%d file=%s", len(self._mareas_map), path)
             except Exception:
                 log.exception("Marine areas parse failed; disabling marine mapping for this run")
@@ -3236,20 +2924,26 @@ class Orchestrator:
             self._zone_cache_fail[zid] = dt.datetime.now(tz=self._tz)
             return []
 
-    async def _nwws_same_targets_from_texts(self, primary_text: str, secondary_text: str) -> tuple[list[str], list[str], str, bool]:
+    async def _nwws_same_targets_from_texts(self, primary_text: str, secondary_text: str) -> tuple[list[str], list[str], str, bool, "dt.datetime | None"]:
         """
         Returns:
-          zones_found, in_area_same, source_label, mapping_success
+          zones_found, in_area_same, source_label, mapping_success, ugc_expires_utc
         mapping_success indicates we successfully derived at least one SAME from zones.
+        ugc_expires_utc is the product's UGC expiry as an aware UTC datetime, or None.
         """
-        zones = self._extract_ugc_zones(primary_text)
+        zones = _ugc.extract_ugc_zones(primary_text)
         src = "raw"
         if not zones:
-            zones = self._extract_ugc_zones(secondary_text)
+            zones = _ugc.extract_ugc_zones(secondary_text)
             src = "official" if zones else "none"
 
+        # Capture UGC expiry for downstream use (AlertTracker, cycle scheduling).
+        # parse_ugc_block tries primary text first, falls back to secondary.
+        _ugc_blk = _ugc.parse_ugc_block(primary_text or secondary_text or "")
+        ugc_expires_utc: dt.datetime | None = _ugc_blk.expires_utc if _ugc_blk else None
+
         if not zones:
-            return ([], [], src, False)
+            return ([], [], src, False, ugc_expires_utc)
 
         # Map zones -> SAME
         all_same: list[str] = []
@@ -3271,7 +2965,7 @@ class Orchestrator:
             dedup.append(s2)
 
         in_area = self._filter_same_locations_to_service_area(dedup)
-        return (zones, in_area, src, any_mapped)
+        return (zones, in_area, src, any_mapped, ugc_expires_utc)
 
 
     # ---- Rebroadcast rotation (no re-tone) ----
@@ -5920,7 +5614,7 @@ class Orchestrator:
         official_text, pid = await self._resolve_nwws_official_text(parsed)
 
         # --- NEW: derive SAME targeting from UGC zones (NWWS-only) ---
-        zones, in_area_same, src, mapped_ok = await self._nwws_same_targets_from_texts(parsed.raw_text or "", official_text or "")
+        zones, in_area_same, src, mapped_ok, ugc_expires_utc = await self._nwws_same_targets_from_texts(parsed.raw_text or "", official_text or "")
 
         if zones:
             log.info(
