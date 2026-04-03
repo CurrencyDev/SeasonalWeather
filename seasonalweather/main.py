@@ -47,6 +47,12 @@ from .broadcast.cycle import CycleBuilder, CycleContext, CycleSegment
 from .broadcast.segment_store import SegmentStore
 from .broadcast.conductor import CycleConductor
 from .broadcast.segment_refresher import SegmentRefresher
+from .broadcast.product_text import (
+    cap_full_opening_line as _cap_full_opening_line,
+    cap_normalize_nws_headline as _cap_normalize_nws_headline,
+    cap_statement_area_noun as _cap_statement_area_noun,
+    cap_statement_intro as _cap_statement_intro,
+)
 
 # Active alert tracker (persistent cycle state across restarts)
 from .alerts.active import ActiveAlert, AlertTracker, _vtec_track_id
@@ -5141,13 +5147,22 @@ class Orchestrator:
                 summary_line = f'The {event} has been cancelled.'
 
         lines: list[str] = []
-        if (event or '').strip().lower() == 'special weather statement':
-            lines.append(self._cap_sps_preamble(getattr(ev, 'sent', None)))
-        else:
-            lines.append('This is a statement from the National Weather Service.')
+        lines.append(
+            _cap_statement_intro(
+                event=event,
+                sent_iso=getattr(ev, 'sent', None),
+                sps_preamble=self._cap_sps_preamble,
+            )
+        )
         area_line = _county_segs()
         if area_line:
-            lines.append(f'For the following counties: {area_line}.')
+            area_noun = _cap_statement_area_noun(
+                event=event,
+                area_desc=area_desc,
+                parameters=getattr(ev, 'parameters', {}) or {},
+                vtec=self._cap_vtec_list(ev),
+            )
+            lines.append(f'For the following {area_noun}: {area_line}.')
         if summary_line:
             lines.append(summary_line)
         elif event:
@@ -5171,7 +5186,6 @@ class Orchestrator:
         UPG      →  handled by _build_cap_full_script (new warning issued)
         """
         event = self._clean_cap_text(ev.event or "", limit=120)
-        area_desc = self._clean_cap_text(getattr(ev, "area_desc", "") or "", limit=400)
         headline = self._clean_cap_text(ev.headline or "", limit=280)
         desc = self._clean_cap_text(getattr(ev, "description", "") or "", limit=800)
         instr = self._clean_cap_text(getattr(ev, "instruction", "") or "", limit=400)
@@ -5413,23 +5427,16 @@ class Orchestrator:
         # is the correct thing to read.  Never use the raw CAP headline field —
         # it's always the bland "… issued <date> by NWS <office>" string.
         params = getattr(ev, "parameters", {}) or {}
-        nws_hl_list = params.get("NWSheadline") or []
-        nws_hl = (nws_hl_list[0] if nws_hl_list else "").strip()
-        if nws_hl and nws_hl.isupper():
-            nws_hl = nws_hl.capitalize()
 
         lines: list[str] = []
-        if event:
-            if event.lower() == "special weather statement":
-                lines.append(self._cap_sps_preamble(getattr(ev, "sent", None)))
-            elif nws_hl:
-                # Area extension (EXA/EXB) or other case where NWS provided a
-                # concise human-readable summary line.
-                lines.append(nws_hl if nws_hl.endswith((".", "!", "?")) else nws_hl + ".")
-            else:
-                # New warning: open with the event name; description follows with
-                # the full NWS narrative including hazard details.
-                lines.append(f"{event}.")
+        opening = _cap_full_opening_line(
+            event=event,
+            sent_iso=getattr(ev, "sent", None),
+            parameters=params,
+            sps_preamble=self._cap_sps_preamble,
+        )
+        if opening:
+            lines.append(opening)
 
         if desc:
             lines.append(desc)
@@ -5443,6 +5450,7 @@ class Orchestrator:
 
     def _build_cap_voice_script(self, ev: "CapAlertEvent") -> str:  # type: ignore[name-defined]
         event = self._clean_cap_text(ev.event or "", limit=120)
+        area_desc = self._clean_cap_text(getattr(ev, "area_desc", "") or "", limit=400)
         desc = self._clean_cap_text(getattr(ev, "description", "") or "", limit=900)
         instr = self._clean_cap_text(getattr(ev, "instruction", "") or "", limit=500)
 
@@ -5450,20 +5458,19 @@ class Orchestrator:
         # in properties.parameters.NWSheadline — over the bland CAP headline field
         # ("Dense Fog Advisory issued April 2 at 7:44PM EDT … by NWS Baltimore …").
         params = getattr(ev, "parameters", {}) or {}
-        nws_hl_list = params.get("NWSheadline") or []
-        nws_hl = (nws_hl_list[0] if nws_hl_list else "").strip()
-        if nws_hl and nws_hl.isupper():
-            # Convert from SCREAMING CAPS to Sentence case for natural TTS delivery.
-            nws_hl = nws_hl.capitalize()
+        nws_hl = _cap_normalize_nws_headline(params)
 
-        is_sps = event.lower() == "special weather statement"
+        is_sps = (event or "").strip().lower() == "special weather statement"
 
         lines: list[str] = []
         if event:
-            # NWR-style preamble for all CAP voice advisories/statements.
-            # _cap_sps_preamble already generates the right "Statement from your
-            # National Weather Service [, issued at HH:MM TZ]." text.
-            lines.append(self._cap_sps_preamble(getattr(ev, "sent", None)))
+            lines.append(
+                _cap_statement_intro(
+                    event=event,
+                    sent_iso=getattr(ev, "sent", None),
+                    sps_preamble=self._cap_sps_preamble,
+                )
+            )
 
             if not is_sps:
                 # NWSheadline is the concise, human-readable summary (e.g.
