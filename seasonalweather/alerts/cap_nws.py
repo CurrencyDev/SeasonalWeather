@@ -15,6 +15,7 @@ import asyncio
 import logging
 import os
 import random
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +26,26 @@ import httpx
 from .cap_ledger import CapLedger
 
 log = logging.getLogger("seasonalweather.cap")
+
+# Marine SAME FIPS "SS" (digits 1-2 of PSSCCC) that do not map to a state
+# abbreviation. These are translated into NWS marine UGC zone ids for ?zone=
+# requests. Do NOT feed these into ?area= — api.weather.gov rejects that with
+# HTTP 400.
+_MARINE_SAME_SS_TO_UGC_PREFIX: dict[str, str] = {
+    "73": "ANZ",  # Atlantic coastal north of ~31°N (Chesapeake Bay, Mid-Atlantic, New England)
+    "74": "AMZ",  # Atlantic coastal south of 31°N
+    "71": "GMZ",  # Gulf of Mexico
+    "75": "PZZ",  # Pacific coastal California
+    "76": "PZZ",  # Pacific coastal Oregon/Washington
+    "77": "PKZ",  # Alaska coastal
+    "78": "PHZ",  # Hawaii coastal
+    "79": "PMZ",  # Pacific Islands
+    # Great Lakes
+    "70": "LSZ",  # Lake Superior
+    "81": "LOZ",  # Lake Ontario
+    "82": "LHZ",  # Lake Huron
+    "83": "LEZ",  # Lake Erie
+}
 
 
 _STATE_FIPS_TO_ABBR: dict[str, str] = {
@@ -115,14 +136,20 @@ def _same_state_fips(same6: str) -> str | None:
     return same6[1:3]
 
 
-def _derive_area_states(same_fips_allow: Iterable[Any]) -> list[str]:
+def _derive_query_filters(same_fips_allow: Iterable[Any]) -> tuple[list[str], list[str]]:
     """
-    Derive NWS CAP ?area= state list from SAME allow list.
+    Derive alert query filters from the SAME allow list.
 
-    Important: state code is SAME[1:3], NOT [:2].
+    Returns:
+      - area_states: state abbreviations for use with ?area=
+      - marine_zones: marine UGC zone ids for use with ?zone=
+
+    Important: SAME is PSSCCC; state code is SAME[1:3], NOT [:2].
     """
     states: list[str] = []
-    seen: set[str] = set()
+    marine_zones: list[str] = []
+    seen_states: set[str] = set()
+    seen_marine: set[str] = set()
 
     for raw in same_fips_allow:
         s6 = _norm_same(str(raw))
@@ -131,22 +158,29 @@ def _derive_area_states(same_fips_allow: Iterable[Any]) -> list[str]:
         ss = _same_state_fips(s6)
         if not ss:
             continue
+
         abbr = _STATE_FIPS_TO_ABBR.get(ss)
-        if not abbr:
+        if abbr:
+            if abbr not in seen_states:
+                seen_states.add(abbr)
+                states.append(abbr)
             continue
-        if abbr in seen:
-            continue
-        seen.add(abbr)
-        states.append(abbr)
 
-    # Stable ordering helps debugging/log comparisons
+        ugc_prefix = _MARINE_SAME_SS_TO_UGC_PREFIX.get(ss)
+        if ugc_prefix:
+            zone_num = s6[3:]  # last 3 digits of PSSCCC
+            ugc_zone = f"{ugc_prefix}{zone_num}"
+            if ugc_zone not in seen_marine:
+                seen_marine.add(ugc_zone)
+                marine_zones.append(ugc_zone)
+
     states.sort()
+    marine_zones.sort()
 
-    # If derivation fails, fall back to your historical default region.
     if not states:
         states = ["DC", "MD", "VA", "WV"]
 
-    return states
+    return states, marine_zones
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,11 +251,25 @@ class NwsCapPoller:
                 allow_set.add(s6)
         self.allow_set = allow_set
 
-        self.area_states = _derive_area_states(same_fips_allow)
+        self.area_states, self.marine_zones = _derive_query_filters(same_fips_allow)
 
         # If caller provides a full URL, use it as-is. Otherwise build params.
         self.url = (url or "").strip() or "https://api.weather.gov/alerts/active"
         self._use_params = (url is None) or (not url.strip())
+        if self._use_params:
+            self._request_params_list: list[dict[str, str]] = []
+            if self.area_states:
+                self._request_params_list.append(
+                    {"area": ",".join(self.area_states), "status": "actual"}
+                )
+            if self.marine_zones:
+                self._request_params_list.append(
+                    {"zone": ",".join(self.marine_zones), "status": "actual"}
+                )
+            if not self._request_params_list:
+                self._request_params_list.append({"status": "actual"})
+        else:
+            self._request_params_list = []
         self._params = {"area": ",".join(self.area_states), "status": "actual"} if self._use_params else None
 
         # In-memory dedupe (fast path within one process lifetime)
@@ -248,6 +296,12 @@ class NwsCapPoller:
     async def _fetch_json(self) -> dict[str, Any]:
         """
         Fetch JSON with mild retry/backoff for transient NWS hiccups.
+
+        When using auto-built params, we may issue multiple requests:
+          - one ?area=... request for state coverage
+          - one ?zone=... request for marine-zone coverage
+
+        Their feature lists are merged and deduped by alert id.
         """
         tries = 0
         backoff = 1.0
@@ -255,22 +309,53 @@ class NwsCapPoller:
         while True:
             tries += 1
             try:
-                r = await self._client.get(self.url, params=self._params)
-                # Respect rate limiting a bit
-                if r.status_code in (429, 500, 502, 503, 504):
-                    raise httpx.HTTPStatusError(f"HTTP {r.status_code}", request=r.request, response=r)
-                r.raise_for_status()
-                data = r.json()
-                if not isinstance(data, dict):
-                    raise ValueError("CAP response JSON was not an object")
-                return data
+                if not self._use_params:
+                    r = await self._client.get(self.url)
+                    if r.status_code in (429, 500, 502, 503, 504):
+                        raise httpx.HTTPStatusError(f"HTTP {r.status_code}", request=r.request, response=r)
+                    r.raise_for_status()
+                    data = r.json()
+                    if not isinstance(data, dict):
+                        raise ValueError("CAP response JSON was not an object")
+                    return data
+
+                merged_features: list[dict[str, Any]] = []
+                seen_ids: set[str] = set()
+
+                for params in self._request_params_list:
+                    r = await self._client.get(self.url, params=params)
+                    if r.status_code in (429, 500, 502, 503, 504):
+                        raise httpx.HTTPStatusError(f"HTTP {r.status_code}", request=r.request, response=r)
+                    r.raise_for_status()
+                    data = r.json()
+                    if not isinstance(data, dict):
+                        raise ValueError("CAP response JSON was not an object")
+
+                    feats = data.get("features")
+                    if not isinstance(feats, list):
+                        continue
+
+                    for feat in feats:
+                        if not isinstance(feat, dict):
+                            continue
+                        props = feat.get("properties")
+                        if not isinstance(props, dict):
+                            continue
+                        alert_id = str(props.get("id") or props.get("@id") or feat.get("id") or "").strip()
+                        dedupe_key = alert_id or repr(feat)
+                        if dedupe_key in seen_ids:
+                            continue
+                        seen_ids.add(dedupe_key)
+                        merged_features.append(feat)
+
+                return {"features": merged_features}
             except Exception as e:
                 if tries >= 5:
                     raise
-                # jittery exponential backoff
                 sleep_s = min(20.0, backoff) + random.random() * 0.25
                 log.warning("CAP fetch failed (try %d/5): %s; sleeping %.2fs", tries, e, sleep_s)
                 await asyncio.sleep(sleep_s)
+                backoff *= 2.0
                 backoff *= 2.0
 
     def _extract_same_list(self, props: dict[str, Any]) -> list[str]:
@@ -431,10 +516,11 @@ class NwsCapPoller:
         try:
             if self._use_params:
                 log.info(
-                    "NWS CAP poller starting (poll=%ss url=%s area=%s)",
+                    "NWS CAP poller starting (poll=%ss url=%s area=%s marine_zones=%s)",
                     self.poll_seconds,
                     self.url,
                     ",".join(self.area_states),
+                    ",".join(self.marine_zones) if self.marine_zones else "-",
                 )
             else:
                 log.info(
