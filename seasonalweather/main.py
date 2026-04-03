@@ -3448,6 +3448,8 @@ class Orchestrator:
             "Wind Chill Watch",
             "Winter Weather Advisory",
             "Snow Squall Warning",
+            # Marine
+            "Special Marine Warning",
         }
 
     def _cap_full_cooldown_seconds(self) -> int:
@@ -3955,6 +3957,35 @@ class Orchestrator:
 
             if toneout:
                 await self._handle_toneout(parsed)
+
+            # MWS (Marine Weather Statement) — Special Marine Warning lifecycle VTEC carrier.
+            # SM.W (Special Marine Warning) is only issued ONCE by the NWS; all subsequent
+            # lifecycle actions (CON, EXT, CAN, EXP) come through MWS products carrying
+            # MA.W VTEC.  Routine MWSs without VTEC are silently ignored to avoid flooding
+            # the schedule with routine marine text.
+            elif (parsed.product_type or "").strip().upper() == "MWS":
+                try:
+                    _mws_vtec = self._extract_vtec(parsed.raw_text or "")
+                    _mws_has_marine = any(
+                        ".MA.W." in v or ".MA.A." in v
+                        for v in _mws_vtec
+                    )
+                    if _mws_has_marine:
+                        log.info(
+                            "NWWS MWS: marine VTEC detected (%s), routing to toneout handler wfo=%s awips=%s",
+                            ",".join(_mws_vtec[:3]),
+                            parsed.wfo,
+                            parsed.awips_id or "",
+                        )
+                        await self._handle_toneout(parsed)
+                    else:
+                        log.debug(
+                            "NWWS MWS: no marine VTEC, ignoring wfo=%s awips=%s",
+                            parsed.wfo,
+                            parsed.awips_id or "",
+                        )
+                except Exception:
+                    log.exception("NWWS MWS VTEC check failed wfo=%s awips=%s", parsed.wfo, parsed.awips_id or "")
 
             # PNS cycle injection — SEVERE WEATHER SAFETY RULES bulletins go into
             # the broadcast cycle as a voice-only segment (no cut-in, no tones).
@@ -4698,6 +4729,11 @@ class Orchestrator:
         s2 = (s or "").replace("\r", " ").replace("\n", " ")
         s2 = re.sub(r"\s+", " ", s2).strip()
         s2 = s2.replace("...", ". ").replace("..", ".")
+        # Strip a bare AWIPS product identifier that NWS sometimes embeds at the
+        # start of the description field (e.g. "SVRLOT The National Weather…").
+        # Pattern: 5–8 uppercase letters/digits at the very beginning, followed by
+        # whitespace, with no punctuation — not legitimate narrative text.
+        s2 = re.sub(r"^[A-Z][A-Z0-9]{4,7}\s+", "", s2)
         if len(s2) > limit:
             s2 = s2[:limit].rstrip() + "..."
         return s2
@@ -5367,23 +5403,33 @@ class Orchestrator:
 
     def _build_cap_full_script(self, ev: "CapAlertEvent") -> str:  # type: ignore[name-defined]
         event = self._clean_cap_text(ev.event or "", limit=120)
-        headline = self._clean_cap_text(ev.headline or "", limit=280)
-        area = self._clean_cap_text(getattr(ev, "area_desc", "") or "", limit=320)
         desc = self._clean_cap_text(getattr(ev, "description", "") or "", limit=1200)
         instr = self._clean_cap_text(getattr(ev, "instruction", "") or "", limit=700)
 
-        if event.lower() == "special weather statement" and headline.lower().startswith("special weather statement"):
-            headline = ""
+        # Use NWSheadline when the NWS provides one (e.g. area-extension updates
+        # where NWSheadline says "… EXPANDED TO INCLUDE …").
+        # For new-issuance warnings (NEW/UPG), NWSheadline is absent; the
+        # description already contains the full, well-formatted NWS narrative and
+        # is the correct thing to read.  Never use the raw CAP headline field —
+        # it's always the bland "… issued <date> by NWS <office>" string.
+        params = getattr(ev, "parameters", {}) or {}
+        nws_hl_list = params.get("NWSheadline") or []
+        nws_hl = (nws_hl_list[0] if nws_hl_list else "").strip()
+        if nws_hl and nws_hl.isupper():
+            nws_hl = nws_hl.capitalize()
 
         lines: list[str] = []
         if event:
             if event.lower() == "special weather statement":
                 lines.append(self._cap_sps_preamble(getattr(ev, "sent", None)))
+            elif nws_hl:
+                # Area extension (EXA/EXB) or other case where NWS provided a
+                # concise human-readable summary line.
+                lines.append(nws_hl if nws_hl.endswith((".", "!", "?")) else nws_hl + ".")
             else:
+                # New warning: open with the event name; description follows with
+                # the full NWS narrative including hazard details.
                 lines.append(f"{event}.")
-
-        if headline:
-            lines.append(headline if headline.endswith((".", "!", "?")) else headline + ".")
 
         if desc:
             lines.append(desc)
@@ -5397,22 +5443,37 @@ class Orchestrator:
 
     def _build_cap_voice_script(self, ev: "CapAlertEvent") -> str:  # type: ignore[name-defined]
         event = self._clean_cap_text(ev.event or "", limit=120)
-        headline = self._clean_cap_text(ev.headline or "", limit=240)
-        area = self._clean_cap_text(getattr(ev, "area_desc", "") or "", limit=260)
         desc = self._clean_cap_text(getattr(ev, "description", "") or "", limit=900)
         instr = self._clean_cap_text(getattr(ev, "instruction", "") or "", limit=500)
 
-        if event.lower() == "special weather statement" and headline.lower().startswith("special weather statement"):
-            headline = ""
+        # Prefer NWSheadline — the NWR-friendly "in effect until …" line present
+        # in properties.parameters.NWSheadline — over the bland CAP headline field
+        # ("Dense Fog Advisory issued April 2 at 7:44PM EDT … by NWS Baltimore …").
+        params = getattr(ev, "parameters", {}) or {}
+        nws_hl_list = params.get("NWSheadline") or []
+        nws_hl = (nws_hl_list[0] if nws_hl_list else "").strip()
+        if nws_hl and nws_hl.isupper():
+            # Convert from SCREAMING CAPS to Sentence case for natural TTS delivery.
+            nws_hl = nws_hl.capitalize()
+
+        is_sps = event.lower() == "special weather statement"
 
         lines: list[str] = []
         if event:
-            if event.lower() == "special weather statement":
-                lines.append(self._cap_sps_preamble(getattr(ev, "sent", None)))
-            else:
-                lines.append(f"{event}.")
-        if headline:
-            lines.append(headline if headline.endswith((".", "!", "?")) else headline + ".")
+            # NWR-style preamble for all CAP voice advisories/statements.
+            # _cap_sps_preamble already generates the right "Statement from your
+            # National Weather Service [, issued at HH:MM TZ]." text.
+            lines.append(self._cap_sps_preamble(getattr(ev, "sent", None)))
+
+            if not is_sps:
+                # NWSheadline is the concise, human-readable summary (e.g.
+                # "Dense fog advisory in effect until 5 AM EDT Friday").
+                # If absent, fall back to the event name as a plain header.
+                if nws_hl:
+                    lines.append(nws_hl if nws_hl.endswith((".", "!", "?")) else nws_hl + ".")
+                else:
+                    lines.append(f"{event}.")
+
         if desc:
             lines.append(desc)
         if instr:
