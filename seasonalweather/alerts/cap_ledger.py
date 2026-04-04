@@ -18,6 +18,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
 
+from ..database.alerts import CapLedgerRepository
+from ..database.core import SeasonalDatabase
+
 
 def _utcnow() -> dt.datetime:
     return dt.datetime.now(tz=dt.timezone.utc)
@@ -50,16 +53,15 @@ class CapLedger:
     """
     path: Path
     max_age_days: int = 14
+    database: SeasonalDatabase | None = None
 
     _seen: Dict[str, str] = None  # type: ignore[assignment]
     _loaded: bool = False
 
-    def _load(self) -> None:
-        if self._loaded:
-            return
-        self._loaded = True
-        self._seen = {}
+    def __post_init__(self) -> None:
+        self._repo = CapLedgerRepository(self.database) if self.database is not None else None
 
+    def _load_legacy_json(self) -> None:
         try:
             if not self.path.exists():
                 return
@@ -69,12 +71,38 @@ class CapLedger:
             if isinstance(seen, dict):
                 self._seen = {str(k): str(v) for k, v in seen.items()}
         except Exception:
-            # If ledger corrupt, start fresh (but don't explode your service)
             self._seen = {}
+
+    def _load(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        self._seen = {}
+
+        if self._repo is not None:
+            try:
+                self._seen = self._repo.load_entries()
+            except Exception:
+                self._seen = {}
+
+        if not self._seen:
+            self._load_legacy_json()
+            if self._seen and self._repo is not None:
+                try:
+                    self._repo.replace_entries(self._seen)
+                except Exception:
+                    pass
 
         self.cleanup()
 
     def _save(self) -> None:
+        if self._repo is not None:
+            try:
+                self._repo.replace_entries(self._seen)
+                return
+            except Exception:
+                pass
+
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
 

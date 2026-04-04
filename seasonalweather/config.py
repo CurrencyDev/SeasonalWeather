@@ -515,6 +515,25 @@ class PathsConfig:
 
 
 @dataclass(frozen=True)
+class DatabaseHousekeepingConfig:
+    enabled: bool
+    interval_seconds: int
+    startup_delay_seconds: int
+    api_command_retention_days: int
+    audio_asset_grace_seconds: int
+    wal_checkpoint: bool
+
+
+@dataclass(frozen=True)
+class DatabaseConfig:
+    enabled: bool
+    path: str
+    busy_timeout_ms: int
+    journal_mode: str
+    housekeeping: DatabaseHousekeepingConfig
+
+
+@dataclass(frozen=True)
 class ServiceAreaConfig:
     same_fips_all: List[str]
     transmitters: Dict[str, List[Dict[str, str]]]
@@ -559,6 +578,7 @@ class AppConfig:
     tts: TTSConfig
     audio: AudioConfig
     paths: PathsConfig
+    database: DatabaseConfig
     service_area: ServiceAreaConfig
 
     # subsystems
@@ -1009,6 +1029,27 @@ def load_config(path: str) -> AppConfig:
     paths = PathsConfig(**raw["paths"])
 
     # ------------------------------------------------------------------
+    # database
+    # ------------------------------------------------------------------
+    db_raw = raw.get("database", {})
+    db_path = str(db_raw.get("path", "")).strip() or str(Path(paths.work_dir) / "seasonalweather.sqlite3")
+    db_hk_raw = db_raw.get("housekeeping", {})
+    database = DatabaseConfig(
+        enabled=bool(db_raw.get("enabled", True)),
+        path=db_path,
+        busy_timeout_ms=int(db_raw.get("busy_timeout_ms", 5000)),
+        journal_mode=str(db_raw.get("journal_mode", "WAL") or "WAL").strip().upper(),
+        housekeeping=DatabaseHousekeepingConfig(
+            enabled=bool(db_hk_raw.get("enabled", True)),
+            interval_seconds=int(db_hk_raw.get("interval_seconds", 900)),
+            startup_delay_seconds=int(db_hk_raw.get("startup_delay_seconds", 45)),
+            api_command_retention_days=int(db_hk_raw.get("api_command_retention_days", 14)),
+            audio_asset_grace_seconds=int(db_hk_raw.get("audio_asset_grace_seconds", 900)),
+            wal_checkpoint=bool(db_hk_raw.get("wal_checkpoint", True)),
+        ),
+    )
+
+    # ------------------------------------------------------------------
     # service_area
     # ------------------------------------------------------------------
     transmitters = raw["service_area"]["transmitters"]
@@ -1073,6 +1114,7 @@ def load_config(path: str) -> AppConfig:
         tts=tts,
         audio=audio,
         paths=paths,
+        database=database,
         service_area=service_area,
         same=same,
         cap=cap,

@@ -10,6 +10,9 @@ from pathlib import Path
 from typing import Awaitable, Callable, Optional
 from zoneinfo import ZoneInfo
 
+from ..database.core import SeasonalDatabase
+from ..database.scheduler import SchedulerStateRepository
+
 
 @dataclass(frozen=True)
 class RwtRmtSchedule:
@@ -32,6 +35,7 @@ class RwtRmtSchedule:
     max_postpone_hours: int
 
     state_path: str
+    state_key: str = "rwt_rmt"
 
 
 @dataclass
@@ -40,33 +44,80 @@ class TestState:
     last_rmt_period: str = ""
 
     @staticmethod
-    def load(path: str) -> "TestState":
+    def _payload_from_obj(obj: object) -> "TestState":
+        if not isinstance(obj, dict):
+            return TestState()
+        return TestState(
+            last_rwt_period=str(obj.get("last_rwt_period", "")),
+            last_rmt_period=str(obj.get("last_rmt_period", "")),
+        )
+
+    @staticmethod
+    def load(
+        path: str,
+        *,
+        repository: SchedulerStateRepository | None = None,
+        state_key: str = "rwt_rmt",
+    ) -> "TestState":
+        if repository is not None:
+            try:
+                row = repository.get_state(state_key)
+                if row is not None:
+                    return TestState._payload_from_obj(row.get("state") or {})
+            except Exception:
+                pass
+
         try:
             with open(path, "r", encoding="utf-8") as f:
                 obj = json.load(f) or {}
-            return TestState(
-                last_rwt_period=str(obj.get("last_rwt_period", "")),
-                last_rmt_period=str(obj.get("last_rmt_period", "")),
-            )
+            state = TestState._payload_from_obj(obj)
+            if repository is not None:
+                try:
+                    repository.upsert_state(
+                        state_key,
+                        state={
+                            "last_rwt_period": state.last_rwt_period,
+                            "last_rmt_period": state.last_rmt_period,
+                        },
+                    )
+                except Exception:
+                    pass
+            return state
         except FileNotFoundError:
             return TestState()
         except Exception:
             # never crash the station because of a bad state file
             return TestState()
 
-    def save(self, path: str) -> None:
+    def save(
+        self,
+        path: str,
+        *,
+        repository: SchedulerStateRepository | None = None,
+        state_key: str = "rwt_rmt",
+        last_run_at: str | None = None,
+        next_run_at: str | None = None,
+    ) -> None:
+        payload = {
+            "last_rwt_period": self.last_rwt_period,
+            "last_rmt_period": self.last_rmt_period,
+        }
+        if repository is not None:
+            try:
+                repository.upsert_state(
+                    state_key,
+                    last_run_at=last_run_at,
+                    next_run_at=next_run_at,
+                    state=payload,
+                )
+                return
+            except Exception:
+                pass
+
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "last_rwt_period": self.last_rwt_period,
-                    "last_rmt_period": self.last_rmt_period,
-                },
-                f,
-                indent=2,
-                sort_keys=True,
-            )
+            json.dump(payload, f, indent=2, sort_keys=True)
         os.replace(tmp, path)
 
 
@@ -129,13 +180,22 @@ LogFn = Callable[[str], None]
 
 
 class RwtRmtScheduler:
-    def __init__(self, schedule: RwtRmtSchedule, gate_fn: GateFn, fire_fn: FireFn, log_fn: LogFn):
+    def __init__(
+        self,
+        schedule: RwtRmtSchedule,
+        gate_fn: GateFn,
+        fire_fn: FireFn,
+        log_fn: LogFn,
+        *,
+        database: SeasonalDatabase | None = None,
+    ):
         self.s = schedule
         self.gate_fn = gate_fn
         self.fire_fn = fire_fn
         self.log = log_fn
         self.tz = ZoneInfo(self.s.tz_name)
-        self.state = TestState.load(self.s.state_path)
+        self._repo = SchedulerStateRepository(database) if database is not None else None
+        self.state = TestState.load(self.s.state_path, repository=self._repo, state_key=self.s.state_key)
         self._stop = asyncio.Event()
 
     def stop(self) -> None:
@@ -176,6 +236,12 @@ class RwtRmtScheduler:
 
             event_code, due = min(next_events, key=lambda x: (x[1], 0 if x[0] == "RMT" else 1))  # PATCH: prefer RMT on tie
             self.log(f"[RWT/RMT] next={event_code} at {due.isoformat()}")
+            self.state.save(
+                self.s.state_path,
+                repository=self._repo,
+                state_key=self.s.state_key,
+                next_run_at=due.astimezone(dt.timezone.utc).replace(microsecond=0).isoformat(),
+            )
 
             # wait in chunks so stop is responsive
             while not self._stop.is_set():
@@ -226,10 +292,16 @@ class RwtRmtScheduler:
         self.log(f"[RWT/RMT] firing {event_code}")
         await self.fire_fn(event_code)
 
-        # write state after success
+        completed_at = self._now().astimezone(dt.timezone.utc).replace(microsecond=0).isoformat()
         if event_code == "RWT":
             self.state.last_rwt_period = _weekly_period_key(self._now())
         else:
             self.state.last_rmt_period = _monthly_period_key(self._now())
-        self.state.save(self.s.state_path)
+        self.state.save(
+            self.s.state_path,
+            repository=self._repo,
+            state_key=self.s.state_key,
+            last_run_at=completed_at,
+            next_run_at=None,
+        )
         self.log(f"[RWT/RMT] completed {event_code}")

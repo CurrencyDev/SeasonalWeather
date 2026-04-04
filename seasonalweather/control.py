@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 from .api.models import InterruptPolicy, OriginateAudioRequest, OriginateTextRequest, VoiceMode
 from .config import AppConfig, load_config
 from .broadcast.cycle import CycleBuilder
+from .database.assets import AudioAssetRepository
 from .tts.tts import TTS
 
 
@@ -53,6 +54,8 @@ class OrchestratorControl:
         self.config_path = str(config_path)
         self._assets_lock = asyncio.Lock()
         self._supported_interrupt_policies = {InterruptPolicy.INTERRUPT_THEN_REFILL.value}
+        db = getattr(self.orch, "database", None)
+        self._audio_asset_repo = AudioAssetRepository(db) if db is not None else None
 
     def _now_utc(self) -> dt.datetime:
         return dt.datetime.now(dt.timezone.utc)
@@ -467,7 +470,13 @@ class OrchestratorControl:
             "path": str(wav_path),
             "actor": actor,
         }
-        meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
+        if self._audio_asset_repo is not None:
+            try:
+                self._audio_asset_repo.upsert_asset(meta)
+            except Exception:
+                meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
+        else:
+            meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
         return {
             "asset_id": asset_id,
             "filename": filename_clean,
@@ -486,9 +495,23 @@ class OrchestratorControl:
 
     def _load_audio_asset(self, asset_id: str) -> dict[str, Any]:
         meta_path = self._audio_asset_dir() / f"{asset_id}.json"
-        if not meta_path.exists():
-            raise NotFoundError("audio_asset_not_found", "Audio asset was not found.", details={"audio_asset_id": asset_id})
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta: dict[str, Any] | None = None
+        if self._audio_asset_repo is not None:
+            try:
+                meta = self._audio_asset_repo.get_asset(asset_id)
+            except Exception:
+                meta = None
+
+        if meta is None:
+            if not meta_path.exists():
+                raise NotFoundError("audio_asset_not_found", "Audio asset was not found.", details={"audio_asset_id": asset_id})
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if self._audio_asset_repo is not None:
+                try:
+                    self._audio_asset_repo.upsert_asset(meta)
+                except Exception:
+                    pass
+
         expires_at = dt.datetime.fromisoformat(meta["expires_at"])
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=dt.timezone.utc)

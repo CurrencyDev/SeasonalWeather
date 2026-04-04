@@ -24,6 +24,7 @@ from typing import Any, Iterable
 import httpx
 
 from .cap_ledger import CapLedger
+from ..database.core import SeasonalDatabase
 
 log = logging.getLogger("seasonalweather.cap")
 
@@ -239,6 +240,7 @@ class NwsCapPoller:
         url: str | None = None,
         ledger_path: str = "/var/lib/seasonalweather/cap_ledger.json",
         ledger_max_age_days: int = 14,
+        database: SeasonalDatabase | None = None,
     ) -> None:
         self.out_queue = out_queue
         self.poll_seconds = max(15, int(poll_seconds))
@@ -276,7 +278,7 @@ class NwsCapPoller:
         self._seen_keys: set[str] = set()
 
         # Persistent dedupe (prevents restart spam)
-        self._ledger = CapLedger(path=Path(ledger_path), max_age_days=ledger_max_age_days)
+        self._ledger = CapLedger(path=Path(ledger_path), max_age_days=ledger_max_age_days, database=database)
 
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(15.0, connect=10.0),

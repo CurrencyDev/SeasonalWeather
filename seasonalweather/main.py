@@ -56,6 +56,8 @@ from .broadcast.product_text import (
 
 # Active alert tracker (persistent cycle state across restarts)
 from .alerts.active import ActiveAlert, AlertTracker, _vtec_track_id
+from .database.bootstrap import bootstrap_database_from_config
+from .database.housekeeping import DatabaseHousekeeper
 from .discord_log import DiscordLogger
 
 # VTEC policy + SAME event code libraries — Orchestrator defers to these.
@@ -1623,10 +1625,14 @@ class Orchestrator:
         self._same_name_fail: dict[str, dt.datetime] = {}
         self._same_name_lock = asyncio.Lock()
 
+        # --- Embedded SQLite runtime state ---
+        self.database = bootstrap_database_from_config(cfg) if getattr(cfg.database, "enabled", True) else None
+        self.db_housekeeper = DatabaseHousekeeper(cfg, self.database) if self.database is not None else None
+
         # --- Persistent active alert tracker ---
         # Survives restarts: active watches/warnings are re-queued as cycle segments.
         _tracker_path = Path(cfg.paths.work_dir) / "alert_state.json"
-        self.alert_tracker = AlertTracker(_tracker_path)
+        self.alert_tracker = AlertTracker(_tracker_path, database=self.database)
 
         # Discord webhook logger (fire-and-forget; starts its drain task in run())
         self.discord = DiscordLogger.from_config(cfg.logs.discord)
@@ -1636,6 +1642,7 @@ class Orchestrator:
         self._seg_store = SegmentStore(
             work_dir=Path(cfg.paths.work_dir),
             audio_dir=Path(cfg.paths.audio_dir),
+            database=self.database,
         )
         self._seg_store.load()
 
@@ -1672,27 +1679,17 @@ class Orchestrator:
 
     def _station_feed_seed_from_alert_tracker(self) -> int:
         """
-        Restore active alerts from alert_state.json into the in-memory station-feed
-        cache on startup. This makes StationFeed survive restarts even when the
-        next write comes from a totally different source.
+        Restore active alerts from the live AlertTracker state on startup.
+        This works whether the tracker is backed by SQLite or the legacy JSON file.
         """
         if not _sf_enabled() or StationFeedAlert is None:
             return 0
 
-        tracker_path = Path(self.cfg.paths.work_dir) / "alert_state.json"
-        try:
-            payload = json.loads(tracker_path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return 0
-        except Exception:
-            log.exception("Station feed: failed loading AlertTracker state for startup seed")
-            return 0
-
-        items = payload.get("active_alerts") if isinstance(payload, dict) else None
-        if not isinstance(items, list):
-            return 0
-
         now_ts = time.time()
+        items = self.alert_tracker.get_cycle_alerts()
+        if not items:
+            return 0
+
         existing_ids = set(_STATION_FEED_STATE.keys())
         existing_wavs: set[str] = set()
         for _alert_obj, _exp_ts in _STATION_FEED_STATE.values():
@@ -1717,10 +1714,7 @@ class Orchestrator:
 
         seeded = 0
         for item in items:
-            if not isinstance(item, dict):
-                continue
-
-            expires_raw = item.get("expires")
+            expires_raw = item.expires
             exp_dt = _sf_parse_dt(expires_raw)
             if exp_dt is None:
                 continue
@@ -1731,20 +1725,20 @@ class Orchestrator:
             if exp_ts <= now_ts:
                 continue
 
-            audio_path = str(item.get("audio_path") or "").strip()
-            tracker_id = str(item.get("id") or "").strip()
+            audio_path = str(item.audio_path or "").strip()
+            tracker_id = str(item.id or "").strip()
             if tracker_id and tracker_id in existing_ids:
                 continue
             if audio_path and audio_path in existing_wavs:
                 continue
 
-            source = str(item.get("source") or "").strip().upper()
+            source = str(item.source or "").strip().upper()
             if _sf_is_non_alert_station_item(
                 alert_id=tracker_id,
                 source=source,
-                event=item.get("event"),
-                headline=item.get("headline"),
-                cycle_only=bool(item.get("cycle_only", False)),
+                event=item.event,
+                headline=item.headline,
+                cycle_only=bool(item.cycle_only),
             ):
                 continue
 
@@ -1758,12 +1752,7 @@ class Orchestrator:
                 sender_name, sender_kind = source or "SeasonalWeather", "unknown"
 
             sender = FeedSender(name=sender_name, kind=sender_kind) if FeedSender else None
-
-            vtec_list = item.get("vtec") or []
-            if not isinstance(vtec_list, list):
-                vtec_list = [vtec_list] if vtec_list else []
-            vtec_list = [str(x) for x in vtec_list if str(x).strip()]
-
+            vtec_list = [str(x) for x in (item.vtec or []) if str(x).strip()]
             tracker_vtec_tracks = {_vtec_track_id(v) for v in vtec_list if _vtec_track_id(v)}
             if tracker_vtec_tracks and (tracker_vtec_tracks & existing_vtec_tracks):
                 continue
@@ -1776,13 +1765,13 @@ class Orchestrator:
                     if area:
                         break
 
-            script_text = str(item.get("script_text") or "")
-            event = str(item.get("event") or item.get("code") or "Alert")
-            headline = str(item.get("headline") or event)
-            issued_raw = item.get("issued")
-            cycle_only = bool(item.get("cycle_only", False))
-            same_locs = [str(x) for x in (item.get("same_locs") or []) if str(x).strip()]
-            code = str(item.get("code") or "").strip()
+            script_text = str(item.script_text or "")
+            event = str(item.event or item.code or "Alert")
+            headline = str(item.headline or event)
+            issued_raw = item.issued
+            cycle_only = bool(item.cycle_only)
+            same_locs = [str(x) for x in (item.same_locs or []) if str(x).strip()]
+            code = str(item.code or "").strip()
 
             if source == "NWWS":
                 event = _sf_nwws_event_label(code or event, vtec_list=vtec_list, text=script_text or headline)
@@ -3811,6 +3800,7 @@ class Orchestrator:
                     user_agent=self._cap_user_agent(),
                     ledger_path=self.cfg.cap.ledger_path,
                     ledger_max_age_days=self.cfg.cap.ledger_max_age_days,
+                    database=self.database,
                 )
                 url = self._cap_url().strip()
                 if url:
@@ -3877,6 +3867,7 @@ class Orchestrator:
                     postpone_minutes=self._tests_postpone_minutes(),
                     max_postpone_hours=self._tests_max_postpone_hours(),
                     state_path=state_path,
+                    state_key="rwt_rmt",
                 )
 
                 def _rlog(s: str) -> None:
@@ -3887,6 +3878,7 @@ class Orchestrator:
                     gate_fn=self._tests_gate,
                     fire_fn=self._originate_required_test,
                     log_fn=_rlog,
+                    database=self.database,
                 )
                 tasks.append(asyncio.create_task(rsch.run_forever(), name="rwt_rmt_scheduler"))
                 log.info("RWT/RMT scheduler enabled (state=%s)", state_path)
@@ -3894,6 +3886,9 @@ class Orchestrator:
                 log.exception("Failed to start RWT/RMT scheduler")
         else:
             log.info("RWT/RMT scheduler disabled (set tests.enabled: true in config.yaml to enable)")
+
+        if self.db_housekeeper is not None:
+            tasks.append(asyncio.create_task(self.db_housekeeper.run_forever(), name="database_housekeeping"))
 
         tasks.append(asyncio.create_task(self.discord.start(), name="discord_log_drain"))
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)

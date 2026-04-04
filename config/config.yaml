@@ -397,6 +397,19 @@ paths:
   config_dir: "/etc/seasonalweather"
   log_dir: "/var/log/seasonalweather"
 
+database:
+  enabled: true
+  path: "/var/lib/seasonalweather/seasonalweather.sqlite3"
+  busy_timeout_ms: 5000
+  journal_mode: "WAL"
+  housekeeping:
+    enabled: true
+    interval_seconds: 900        # 15m periodic DB cleanup / reconciliation
+    startup_delay_seconds: 45    # give startup/import a moment before first pass
+    api_command_retention_days: 14
+    audio_asset_grace_seconds: 900
+    wal_checkpoint: true
+
 # Service area = union of these 4 KLWX transmitters
 # Source: https://www.weather.gov/lwx/nwrtables (transmitter county SAME/FIPS lists)
 service_area:

@@ -26,6 +26,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from ..database.alerts import AlertStateRepository
+from ..database.core import SeasonalDatabase
+
 log = logging.getLogger("seasonalweather.active_alerts")
 
 _SCHEMA_VERSION = 2
@@ -159,9 +162,11 @@ class AlertTracker:
     is required (Python GIL + single-threaded asyncio protect the dict).
     """
 
-    def __init__(self, state_path: str | Path) -> None:
+    def __init__(self, state_path: str | Path, database: SeasonalDatabase | None = None) -> None:
         self._path = Path(state_path)
         self._alerts: dict[str, ActiveAlert] = {}
+        self._db = database
+        self._repo = AlertStateRepository(database) if database is not None else None
 
     # ------------------------------------------------------------------ #
     #  Mutation                                                            #
@@ -280,8 +285,7 @@ class AlertTracker:
     #  Persistence                                                         #
     # ------------------------------------------------------------------ #
 
-    def load(self) -> int:
-        """Load state from disk. Returns number of entries loaded (0 = nothing)."""
+    def _load_from_legacy_json(self) -> int:
         if not self._path.exists():
             return 0
         try:
@@ -301,21 +305,54 @@ class AlertTracker:
                     self._alerts[a.id] = a
                     loaded += 1
                 except Exception:
-                    log.debug("AlertTracker: skipped malformed entry: %s", raw)
-            log.info(
-                "AlertTracker: loaded %d entries from %s", loaded, self._path
-            )
+                    log.debug("AlertTracker: skipped malformed legacy entry: %s", raw)
             return loaded
         except FileNotFoundError:
             return 0
         except Exception:
-            log.exception(
-                "AlertTracker: load failed (starting empty) path=%s", self._path
-            )
+            log.exception("AlertTracker: legacy JSON load failed path=%s", self._path)
             return 0
 
+    def load(self) -> int:
+        """Load state from SQLite when enabled, otherwise from the legacy JSON file."""
+        self._alerts = {}
+        if self._repo is not None:
+            try:
+                rows = self._repo.load_active_alerts()
+                for raw in rows:
+                    self._alerts[str(raw["id"])] = ActiveAlert(**raw)  # type: ignore[arg-type]
+                if self._alerts:
+                    log.info("AlertTracker: loaded %d entries from SQLite", len(self._alerts))
+                    return len(self._alerts)
+            except Exception:
+                log.exception("AlertTracker: SQLite load failed; falling back to legacy JSON")
+
+        loaded = self._load_from_legacy_json()
+        if loaded and self._repo is not None:
+            try:
+                self._persist()
+                log.info("AlertTracker: imported %d legacy entries into SQLite", loaded)
+            except Exception:
+                log.exception("AlertTracker: failed importing legacy JSON state into SQLite")
+        elif loaded:
+            log.info("AlertTracker: loaded %d entries from %s", loaded, self._path)
+        return loaded
+
     def _persist(self) -> None:
-        """Atomically write current state. Crash-safe via tmp + os.replace."""
+        if self._repo is not None:
+            try:
+                now_iso = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+                payload = []
+                for alert in self._alerts.values():
+                    raw = asdict(alert)
+                    raw.setdefault("created_at", alert.issued or now_iso)
+                    raw["updated_at"] = now_iso
+                    payload.append(raw)
+                self._repo.replace_active_alerts(payload)
+                return
+            except Exception:
+                log.exception("AlertTracker: SQLite persist failed; attempting legacy JSON fallback path=%s", self._path)
+
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._path.with_suffix(".tmp")

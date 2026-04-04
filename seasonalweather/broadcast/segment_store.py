@@ -27,6 +27,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from ..database.core import SeasonalDatabase
+from ..database.segments import SegmentRepository
 from ..tts.audio import concat_wavs, wav_duration_seconds, write_silence_wav
 from ..tts.tts import TTS
 
@@ -125,12 +127,13 @@ class SegmentStore:
 
     INDEX_FILENAME = "segment_store.json"
 
-    def __init__(self, work_dir: Path, audio_dir: Path) -> None:
+    def __init__(self, work_dir: Path, audio_dir: Path, database: SeasonalDatabase | None = None) -> None:
         self._work_dir = Path(work_dir)
         self._audio_dir = Path(audio_dir)
         self._index_path = self._work_dir / self.INDEX_FILENAME
         self._entries: Dict[str, SegmentEntry] = {}
         self._lock = asyncio.Lock()
+        self._repo = SegmentRepository(database) if database is not None else None
 
     # ------------------------------------------------------------------
     #  Stable path derivation
@@ -147,38 +150,63 @@ class SegmentStore:
 
     def load(self) -> int:
         """
-        Load index from disk at startup.  Missing audio files are flagged
-        as placeholders so the refresher re-synthesises them.
+        Load index at startup.  Missing audio files are flagged as placeholders
+        so the refresher re-synthesises them.
         Returns the number of entries restored.
         """
+        if self._repo is not None:
+            try:
+                raw_entries = self._repo.load_entries()
+                if raw_entries:
+                    loaded = self._load_entries_from_payload(raw_entries)
+                    log.info("segment_store: loaded %d entries from SQLite", loaded)
+                    return loaded
+            except Exception:
+                log.exception("segment_store: failed to load entries from SQLite")
+
         if not self._index_path.exists():
             return 0
         try:
             raw = json.loads(self._index_path.read_text(encoding="utf-8"))
-            loaded = 0
-            for item in raw.get("entries") or []:
-                try:
-                    e = SegmentEntry(**item)
-                    if not Path(e.audio_path).exists():
-                        e.is_placeholder = True
-                    self._entries[e.key] = e
-                    loaded += 1
-                except Exception:
-                    log.warning("segment_store: skipped malformed index entry: %s", item)
+            loaded = self._load_entries_from_payload(raw.get("entries") or [])
             log.info(
-                "segment_store: loaded %d entries from %s",
+                "segment_store: loaded %d legacy entries from %s",
                 loaded, self._index_path,
             )
+            if loaded and self._repo is not None:
+                try:
+                    self._repo.replace_entries(asdict(e) for e in self._entries.values())
+                    log.info("segment_store: imported %d legacy entries into SQLite", loaded)
+                except Exception:
+                    log.exception("segment_store: failed to import legacy segment index into SQLite")
             return loaded
         except Exception:
             log.exception("segment_store: failed to load index from %s", self._index_path)
             return 0
 
+    def _load_entries_from_payload(self, items: List[dict]) -> int:
+        loaded = 0
+        for item in items:
+            try:
+                e = SegmentEntry(**item)
+                if not Path(e.audio_path).exists():
+                    e.is_placeholder = True
+                self._entries[e.key] = e
+                loaded += 1
+            except Exception:
+                log.warning("segment_store: skipped malformed index entry: %s", item)
+        return loaded
+
     def _persist_unlocked(self) -> None:
         """
-        Write index JSON.  Must be called with ``_lock`` held (or at init
-        before any async tasks run).  Uses write-then-replace for safety.
+        Persist the store.  SQLite is the source of truth when enabled; the
+        JSON index is only written in legacy file-backed mode.
         """
+        if self._repo is not None:
+            for entry in self._entries.values():
+                self._repo.upsert_entry(asdict(entry))
+            return
+
         self._work_dir.mkdir(parents=True, exist_ok=True)
         tmp = self._index_path.with_suffix(".tmp")
         payload = {"entries": [asdict(e) for e in self._entries.values()]}

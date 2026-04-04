@@ -7,8 +7,10 @@ import logging
 import uvicorn
 
 from .api import create_app
+from .commands import CommandStore
 from ..config import load_config
 from ..control import OrchestratorControl
+from ..database.bootstrap import bootstrap_database_from_config
 from ..main import Orchestrator, _setup_logging
 
 
@@ -19,7 +21,8 @@ async def run_api_server(*, config_path: str, host: str, port: int) -> None:
     cfg = load_config(config_path)
     orch = Orchestrator(cfg)
     control = OrchestratorControl(orch, config_path=config_path)
-    app = create_app(control)
+    db = bootstrap_database_from_config(cfg) if getattr(cfg.database, "enabled", True) else None
+    app = create_app(control, store=CommandStore(database=db))
 
     server = uvicorn.Server(
         uvicorn.Config(
