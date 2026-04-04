@@ -268,6 +268,25 @@ class CapConfig:
     voice: CapVoiceConfig
 
 
+# --- ipaws ---
+
+@dataclass(frozen=True)
+class IpawsConfig:
+    enabled: bool
+    dryrun: bool
+    poll_seconds: int
+    user_agent: str
+    url: str
+    ledger_path: str
+    ledger_max_age_days: int
+    # SAME event codes to air with full SAME tones (must also be in policy.toneout_product_types)
+    full_events: List[str]
+    # SAME event codes to air voice-only (no tones)
+    voice_events: List[str]
+    # Functional dedupe TTL (seconds) shared with ERN to prevent double-air
+    ern_dedup_ttl_seconds: int
+
+
 # --- ern ---
 
 @dataclass(frozen=True)
@@ -584,6 +603,7 @@ class AppConfig:
     # subsystems
     same: SameConfig
     cap: CapConfig
+    ipaws: IpawsConfig
     ern: ErnConfig
     samedec: SameDecConfig
     tests: TestsConfig
@@ -813,6 +833,24 @@ def load_config(path: str) -> AppConfig:
             events=[str(e) for e in cap_voice_raw.get("events", ["Special Weather Statement"])],
             cooldown_seconds=int(cap_voice_raw.get("cooldown_seconds", 600)),
         ),
+    )
+
+    # ------------------------------------------------------------------
+    # ipaws
+    # ------------------------------------------------------------------
+    ipaws_raw = raw.get("ipaws", {})
+    _ipaws_default_full = ["CEM", "LAE", "CDW", "EAN", "EVI", "NUW", "RHW", "LEW"]
+    ipaws = IpawsConfig(
+        enabled=bool(ipaws_raw.get("enabled", False)),
+        dryrun=bool(ipaws_raw.get("dryrun", True)),
+        poll_seconds=int(ipaws_raw.get("poll_seconds", 90)),
+        user_agent=str(ipaws_raw.get("user_agent", "SeasonalWeather (IPAWS monitor)")),
+        url=str(ipaws_raw.get("url", "")),
+        ledger_path=str(ipaws_raw.get("ledger_path", "/var/lib/seasonalweather/ipaws_ledger.json")),
+        ledger_max_age_days=int(ipaws_raw.get("ledger_max_age_days", 14)),
+        full_events=[str(e) for e in ipaws_raw.get("full_events", _ipaws_default_full)],
+        voice_events=[str(e) for e in ipaws_raw.get("voice_events", [])],
+        ern_dedup_ttl_seconds=int(ipaws_raw.get("ern_dedup_ttl_seconds", 600)),
     )
 
     # ------------------------------------------------------------------
@@ -1118,6 +1156,7 @@ def load_config(path: str) -> AppConfig:
         service_area=service_area,
         same=same,
         cap=cap,
+        ipaws=ipaws,
         ern=ern,
         samedec=samedec,
         tests=tests,
