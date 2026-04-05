@@ -311,11 +311,27 @@ class RwrSection:
 
 
 @dataclass
+class RwrMarineStation:
+    """One station row from the RWR MARINE OBSERVATIONS section."""
+    name: str               # spoken-ready name (from name_map or title-cased raw)
+    name_raw: str           # upper-case original from product, e.g. "THOMAS PT LIGHT"
+    obs_time_utc: Optional[str]   # HHMM UTC string, e.g. "1800"
+    air_temp_f: Optional[int]
+    sea_temp_f: Optional[int]
+    wind_dir_deg: Optional[int]   # degrees true (0-359)
+    wind_spd_kt: Optional[int]
+    wind_gust_kt: Optional[int]
+    pres_mb: Optional[float]
+    pres_trend: Optional[str]     # 'R'=rising / 'F'=falling / 'S'=steady / None
+
+
+@dataclass
 class RwrProduct:
     issuance_time_str: Optional[str]  # e.g. "1:00 AM Eastern Daylight Time"
     issuance_dt: Optional[dt.datetime]
     office: str
     sections: List[RwrSection]
+    marine_stations: List[RwrMarineStation] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +406,11 @@ _RWR_CITY_HEADER_RE = re.compile(r'^CITY\s+SKY/WX')
 _RWR_DATA_SKIP_RE = re.compile(
     r'^(?:\$\$|={3,}|Note:|TC=|\*\s*=|STATION/POSITION|AIR SEA)'
 )
+
+# Marine observations section: "DDD/ SS/ GG" wind anchor and pressure
+_MARINE_WIND_RE = re.compile(r'\b(\d{3})/\s*(\d{1,3})/\s*(\d{1,3})\b')
+_MARINE_PRES_RE = re.compile(r'(\d{4}\.\d)([RFS]?)')
+_MARINE_TIME_RE = re.compile(r'\b(\d{4})\b')
 
 
 def _find_cols(header: str) -> Dict[str, int]:
@@ -539,6 +560,108 @@ def _parse_data_row(
 
 
 # ---------------------------------------------------------------------------
+# Marine observations section parser (phase 2)
+# ---------------------------------------------------------------------------
+
+def _parse_marine_data_row(
+    line: str,
+    name_map: Dict[str, str],
+) -> Optional[RwrMarineStation]:
+    """
+    Parse one RWR MARINE OBSERVATIONS data row.
+
+    Format (station name fixed 16-char field, then regex-anchored fields):
+      THOMAS PT LIGHT  1800   75     150/ 13/ 13 1020.7F
+      TOLCHESTER       1730   73 55  220/  9/ 10 1019.8F
+      PINEY POINT      1730          130/  7/  8   N/A
+
+    Wind "DDD/ SS/ GG" is the reliable column anchor; everything before it
+    contains the time and optional air/sea temp values.
+    """
+    line = (line or "").rstrip()
+    if len(line) < 20:
+        return None
+
+    stripped = line.strip().upper()
+    if not stripped or stripped == "$$":
+        return None
+    # Skip the 3-line inner header block
+    if (stripped.startswith("STATION") or stripped.startswith("AIR ")
+            or stripped.startswith("(UTC")):
+        return None
+
+    # Wind field is the reliable anchor: "DDD/ SS/ GG"
+    wind_m = _MARINE_WIND_RE.search(line)
+    if not wind_m:
+        return None
+
+    wind_dir_deg = int(wind_m.group(1))
+    wind_spd_kt  = int(wind_m.group(2))
+    wind_gust_kt = int(wind_m.group(3))
+
+    # Station name: fixed 16-char field at start of line
+    name_raw = line[:16].strip().upper()
+    if not name_raw:
+        return None
+
+    # Time: first 4-digit HHMM in cols 16-26
+    time_region = line[16:26] if len(line) > 16 else ""
+    time_m = _MARINE_TIME_RE.search(time_region)
+    obs_time_utc = time_m.group(1) if time_m else None
+
+    # Temperatures: any 2-3 digit integers between end-of-time and start-of-wind
+    time_end_in_line = (16 + time_m.end()) if time_m else 21
+    temp_region = line[time_end_in_line:wind_m.start()]
+    temp_nums = re.findall(r'\d{2,3}', temp_region)
+    air_temp_f: Optional[int] = int(temp_nums[0]) if len(temp_nums) >= 1 else None
+    sea_temp_f: Optional[int] = int(temp_nums[1]) if len(temp_nums) >= 2 else None
+
+    # Pressure: after wind field; N/A is silently absent
+    after_wind = line[wind_m.end():]
+    pres_m = _MARINE_PRES_RE.search(after_wind)
+    pres_mb:    Optional[float] = float(pres_m.group(1)) if pres_m else None
+    pres_trend: Optional[str]  = (pres_m.group(2) or None) if pres_m else None
+
+    spoken = name_map.get(name_raw) or name_raw.title()
+
+    return RwrMarineStation(
+        name=spoken,
+        name_raw=name_raw,
+        obs_time_utc=obs_time_utc,
+        air_temp_f=air_temp_f,
+        sea_temp_f=sea_temp_f,
+        wind_dir_deg=wind_dir_deg,
+        wind_spd_kt=wind_spd_kt,
+        wind_gust_kt=wind_gust_kt,
+        pres_mb=pres_mb,
+        pres_trend=pres_trend,
+    )
+
+
+def _parse_marine_section(
+    lines: List[str],
+    i: int,
+    n: int,
+    name_map: Dict[str, str],
+) -> Tuple[List[RwrMarineStation], int]:
+    """
+    Consume a marine-obs section from lines[i:] up to and including $$.
+    Returns (parsed_stations, new_i).
+    """
+    stations: List[RwrMarineStation] = []
+    while i < n:
+        ln = lines[i]
+        if ln.strip() == "$$":
+            i += 1
+            break
+        st = _parse_marine_data_row(ln, name_map)
+        if st:
+            stations.append(st)
+        i += 1
+    return stations, i
+
+
+# ---------------------------------------------------------------------------
 # Top-level RWR product parser
 # ---------------------------------------------------------------------------
 
@@ -563,6 +686,7 @@ def parse_rwr(text: str, name_map: Optional[Dict[str, str]] = None) -> Optional[
             break
 
     sections: List[RwrSection] = []
+    all_marine: List[RwrMarineStation] = []
     i = 0
     n = len(lines)
 
@@ -582,10 +706,17 @@ def parse_rwr(text: str, name_map: Optional[Dict[str, str]] = None) -> Optional[
                 section_title = lines[i].strip()
                 i += 1
 
-            # Is this a marine section? Skip for phase 1.
+            # Is this a marine observations section?
             is_marine = bool(re.search(r'MARINE|BUOY|OFFSHORE', section_title, re.IGNORECASE))
 
-            # Find the CITY/SKY header line
+            if is_marine:
+                # Marine sections use a completely different fixed-width format.
+                # Hand off to the dedicated parser (phase 2).
+                parsed, i = _parse_marine_section(lines, i, n, nm)
+                all_marine.extend(parsed)
+                continue
+
+            # Find the CITY/SKY header line (land sections only)
             cols: Dict[str, int] = {}
             while i < n:
                 ln2 = lines[i]
@@ -627,7 +758,7 @@ def parse_rwr(text: str, name_map: Optional[Dict[str, str]] = None) -> Optional[
 
         i += 1
 
-    if not sections:
+    if not sections and not all_marine:
         return None
 
     return RwrProduct(
@@ -635,6 +766,7 @@ def parse_rwr(text: str, name_map: Optional[Dict[str, str]] = None) -> Optional[
         issuance_dt=issuance_dt,
         office=office,
         sections=sections,
+        marine_stations=all_marine,
     )
 
 
@@ -1096,5 +1228,172 @@ def build_asos_obs_text(
         parts.append("Now for some observations from the surrounding area.")
         for st in compact_stns[:max_compact]:
             parts.append(format_station_compact(st))
+
+    return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Marine observations text builder
+# ---------------------------------------------------------------------------
+
+_MARINE_PRES_TREND_SPOKEN: Dict[str, str] = {
+    "R": "rising",
+    "F": "falling",
+    "S": "steady",
+}
+
+
+def _format_marine_wind(st: RwrMarineStation) -> Optional[str]:
+    """Return NWR-style wind phrase, or None if no wind data."""
+    if st.wind_dir_deg is None or st.wind_spd_kt is None:
+        return None
+    compass = _degrees_to_compass(float(st.wind_dir_deg))
+    compass_spoken = _COMPASS_SPOKEN.get(compass, compass.lower())
+    if st.wind_spd_kt == 0:
+        return "the wind was calm"
+    if st.wind_gust_kt is not None and st.wind_gust_kt > st.wind_spd_kt:
+        return (
+            f"the wind was {compass_spoken} at {st.wind_spd_kt} knots,"
+            f" gusting to {st.wind_gust_kt}"
+        )
+    return f"the wind was {compass_spoken} at {st.wind_spd_kt} knots"
+
+
+def _format_marine_station_full(st: RwrMarineStation) -> str:
+    """
+    Full NWR-style marine obs for an anchor station.
+    Includes wind, both temperatures where available, and pressure.
+    """
+    bits: List[str] = []
+
+    wind = _format_marine_wind(st)
+    if wind:
+        bits.append(f"At {st.name}, {wind}.")
+    else:
+        bits.append(f"At {st.name}.")
+
+    # Temperatures — speak both when available, single "temperature" when only one
+    if st.air_temp_f is not None and st.sea_temp_f is not None:
+        bits.append(
+            f"The air temperature was {st.air_temp_f}"
+            f" and the water temperature was {st.sea_temp_f}."
+        )
+    elif st.air_temp_f is not None:
+        bits.append(f"The temperature was {st.air_temp_f}.")
+    elif st.sea_temp_f is not None:
+        bits.append(f"The water temperature was {st.sea_temp_f}.")
+
+    # Pressure with trend — anchor stations only
+    if st.pres_mb is not None:
+        trend_word = _MARINE_PRES_TREND_SPOKEN.get((st.pres_trend or "").upper(), "")
+        pres_bit = f"Barometric pressure {st.pres_mb:.1f} millibars"
+        if trend_word:
+            pres_bit += f" and {trend_word}"
+        bits.append(pres_bit + ".")
+
+    return " ".join(bits)
+
+
+def _format_marine_station_compact(st: RwrMarineStation) -> str:
+    """
+    Compact NWR-style marine obs for surrounding stations.
+    Wind and temperatures only — no pressure.
+    """
+    wind = _format_marine_wind(st)
+
+    if wind:
+        intro = f"At {st.name}, {wind}."
+    else:
+        intro = f"At {st.name}."
+
+    if st.air_temp_f is not None and st.sea_temp_f is not None:
+        temp = (
+            f"The air temperature was {st.air_temp_f}"
+            f" and the water temperature was {st.sea_temp_f}."
+        )
+    elif st.air_temp_f is not None:
+        temp = f"The temperature was {st.air_temp_f}."
+    elif st.sea_temp_f is not None:
+        temp = f"The water temperature was {st.sea_temp_f}."
+    else:
+        temp = ""
+
+    return f"{intro} {temp}".strip() if temp else intro
+
+
+def build_marine_obs_text(
+    product: RwrProduct,
+    max_stations: int = 0,
+    anchor_names: Optional[List[str]] = None,
+    intro_prefix: str = "Marine observations for the service area",
+    name_map: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
+    """
+    Assemble NWR-style spoken marine observations segment from
+    RwrProduct.marine_stations (populated by parse_rwr's phase-2 marine parser).
+
+    Anchor stations (named in anchor_names) get full detail: wind, both
+    temperatures, and barometric pressure.  All other stations get compact
+    treatment: wind and temperatures only, matching real NWR marine obs style.
+
+    anchor_names: raw upper-case station names to speak first with full detail,
+                  e.g. ["THOMAS PT LIGHT"].  Others follow in product order.
+    max_stations: cap on total stations spoken (0 = all).
+    name_map:     optional spoken-name overrides applied on top of any names
+                  already baked in by parse_rwr.
+    """
+    if not product or not product.marine_stations:
+        return None
+
+    stations = list(product.marine_stations)
+    nm = {k.upper(): v for k, v in (name_map or {}).items()}
+    anchors = {a.strip().upper() for a in (anchor_names or []) if a.strip()}
+
+    # Apply any name-map overrides from this call
+    resolved: List[RwrMarineStation] = []
+    for st in stations:
+        override = nm.get(st.name_raw)
+        if override and override != st.name:
+            resolved.append(RwrMarineStation(
+                name=override,
+                name_raw=st.name_raw,
+                obs_time_utc=st.obs_time_utc,
+                air_temp_f=st.air_temp_f,
+                sea_temp_f=st.sea_temp_f,
+                wind_dir_deg=st.wind_dir_deg,
+                wind_spd_kt=st.wind_spd_kt,
+                wind_gust_kt=st.wind_gust_kt,
+                pres_mb=st.pres_mb,
+                pres_trend=st.pres_trend,
+            ))
+        else:
+            resolved.append(st)
+
+    # Anchors first (full detail), then the rest in product order (compact)
+    anchor_list = [s for s in resolved if s.name_raw in anchors]
+    compact_list = [s for s in resolved if s.name_raw not in anchors]
+
+    ordered = anchor_list + compact_list
+    cap = max_stations if max_stations > 0 else len(ordered)
+    ordered = ordered[:cap]
+
+    if not ordered:
+        return None
+
+    parts: List[str] = []
+
+    time_str = product.issuance_time_str or ""
+    if time_str:
+        parts.append(f"{intro_prefix} as of {time_str}.")
+    else:
+        parts.append(f"{intro_prefix}.")
+
+    anchor_done: set = set()
+    for st in ordered:
+        if st.name_raw in anchors and st.name_raw not in anchor_done:
+            parts.append(_format_marine_station_full(st))
+            anchor_done.add(st.name_raw)
+        else:
+            parts.append(_format_marine_station_compact(st))
 
     return " ".join(parts)

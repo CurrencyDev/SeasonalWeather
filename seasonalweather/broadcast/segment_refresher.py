@@ -71,14 +71,15 @@ log = logging.getLogger("seasonalweather.segment_refresher")
 
 # Default refresh intervals (seconds).  Override via refresh_intervals kwarg.
 _DEFAULT_INTERVALS: Dict[str, int] = {
-    "id":     60,
-    "status": 180,
-    "hwo":    3600,
-    "spc":    1800,
-    "zfp":    3600,
-    "fcst":   1800,
-    "cwf":    7200,
-    "obs":    900,
+    "id":         60,
+    "status":     180,
+    "hwo":        3600,
+    "spc":        1800,
+    "zfp":        3600,
+    "fcst":       1800,
+    "cwf":        7200,
+    "marine_obs": 900,   # same cadence as land obs — RWR updates hourly
+    "obs":        900,
 }
 
 # How often the refresher polls for stale segments (regardless of events).
@@ -91,18 +92,19 @@ _BUILD_CACHE_TTL_S: float = 20.0
 # All segment keys managed by the refresher (excluding live "time" and
 # dynamic "_alert_*" keys which have their own paths).
 _ALL_CONTENT_KEYS: List[str] = [
-    "id", "status", "hwo", "spc", "zfp", "fcst", "cwf", "obs",
+    "id", "status", "hwo", "spc", "zfp", "fcst", "cwf", "obs", "marine_obs",
 ]
 
 _SEGMENT_TITLES: Dict[str, str] = {
-    "id":     "Station identification.",
-    "status": "Overall station status and alerts.",
-    "hwo":    "Hazardous weather outlook for the service area.",
-    "spc":    "Severe weather outlook for the service area.",
-    "zfp":    "Weather synopsis for the area.",
-    "fcst":   "The forecast for the service area.",
-    "cwf":    "Coastal and marine weather forecast.",
-    "obs":    "Current conditions in our area.",
+    "id":         "Station identification.",
+    "status":     "Overall station status and alerts.",
+    "hwo":        "Hazardous weather outlook for the service area.",
+    "spc":        "Severe weather outlook for the service area.",
+    "zfp":        "Weather synopsis for the area.",
+    "fcst":       "The forecast for the service area.",
+    "cwf":        "Coastal and marine weather forecast.",
+    "marine_obs": "Marine observations for the service area.",
+    "obs":        "Current conditions in our area.",
 }
 
 
@@ -251,6 +253,8 @@ class SegmentRefresher:
                 await self._refresh_via_build("fcst")
             elif key == "cwf":
                 await self._refresh_via_build("cwf")
+            elif key == "marine_obs":
+                await self._refresh_via_build("marine_obs")
             elif key == "obs":
                 await self._refresh_via_build("obs")
             else:

@@ -4006,6 +4006,7 @@ class Orchestrator:
                     self.refresher.trigger_immediate("zfp")
                 elif _pt == "RWR":
                     self.refresher.trigger_immediate("obs")
+                    self.refresher.trigger_immediate("marine_obs")
                 elif _pt in {"CWF", "CWA"}:
                     self.refresher.trigger_immediate("cwf")
                 elif _pt in {"SWO", "SWS"}:

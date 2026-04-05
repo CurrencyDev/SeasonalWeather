@@ -167,6 +167,18 @@ class CycleRwrConfig:
 
 
 @dataclass(frozen=True)
+class CycleMarineObsConfig:
+    # Marine observations segment — sourced from the MARINE OBSERVATIONS
+    # section already present in the RWR product (no extra API call).
+    enabled: bool
+    max_stations: int           # 0 = read all available marine stations
+    # Raw upper-case station names to always list first, e.g. "THOMAS PT LIGHT"
+    anchor_stations: List[str]
+    # Optional spoken-name overrides: {RAW_UPPER: spoken_name}
+    station_names: Dict[str, str]
+
+
+@dataclass(frozen=True)
 class CycleConfig:
     normal_interval_seconds: int
     heightened_interval_seconds: int
@@ -182,6 +194,7 @@ class CycleConfig:
     syn: CycleProductConfig
     cwf: CycleCwfConfig
     rwr: CycleRwrConfig
+    marine_obs: CycleMarineObsConfig
 
 
 @dataclass(frozen=True)
@@ -668,6 +681,7 @@ def load_config(path: str) -> AppConfig:
     syn_raw = cy.get("syn", {})
     cwf_raw = cy.get("cwf", {})
     rwr_raw = cy.get("rwr", {})
+    marine_obs_raw = cy.get("marine_obs", {})
 
     cycle = CycleConfig(
         normal_interval_seconds=int(cy["normal_interval_seconds"]),
@@ -749,6 +763,20 @@ def load_config(path: str) -> AppConfig:
             station_names={
                 str(k).upper().strip(): str(v).strip()
                 for k, v in (rwr_raw.get("station_names") or {}).items()
+                if str(k).strip() and str(v).strip()
+            },
+        ),
+        marine_obs=CycleMarineObsConfig(
+            enabled=bool(marine_obs_raw.get("enabled", False)),
+            max_stations=int(marine_obs_raw.get("max_stations", 0)),
+            anchor_stations=[
+                str(s).upper().strip()
+                for s in (marine_obs_raw.get("anchor_stations") or [])
+                if str(s).strip()
+            ],
+            station_names={
+                str(k).upper().strip(): str(v).strip()
+                for k, v in (marine_obs_raw.get("station_names") or {}).items()
                 if str(k).strip() and str(v).strip()
             },
         ),

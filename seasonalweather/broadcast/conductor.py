@@ -80,19 +80,20 @@ _TIME_BUF_COUNT: int = 2
 _MAX_PUSHES_PER_TICK: int = 30
 
 # Fixed base content order — alert segments are injected after "time".
-_BASE_CONTENT: List[str] = ["hwo", "spc", "zfp", "fcst", "cwf", "obs"]
+_BASE_CONTENT: List[str] = ["hwo", "spc", "zfp", "fcst", "cwf", "obs", "marine_obs"]
 
 # Metadata titles for the Now-Playing / IP-RDS display.
 _NP_TITLES: Dict[str, str] = {
-    "id":     "Station identification.",
-    "time":   "The current time in our service area.",
-    "status": "Overall station status and alerts.",
-    "hwo":    "Hazardous weather outlook for the service area.",
-    "spc":    "Severe weather outlook for the service area.",
-    "zfp":    "Weather synopsis for the area.",
-    "fcst":   "The forecast for the service area.",
-    "cwf":    "Coastal and marine weather forecast.",
-    "obs":    "Current conditions in our area.",
+    "id":         "Station identification.",
+    "time":       "The current time in our service area.",
+    "status":     "Overall station status and alerts.",
+    "hwo":        "Hazardous weather outlook for the service area.",
+    "spc":        "Severe weather outlook for the service area.",
+    "zfp":        "Weather synopsis for the area.",
+    "fcst":       "The forecast for the service area.",
+    "cwf":        "Coastal and marine weather forecast.",
+    "marine_obs": "Marine observations for the service area.",
+    "obs":        "Current conditions in our area.",
 }
 
 

@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 from ..alerts.nws_api import NWSApi
 from .rwr import (
     ObsPressureCache, parse_rwr, build_rwr_obs_text, build_asos_obs_text,
-    asos_to_rwr_station,
+    asos_to_rwr_station, RwrProduct, build_marine_obs_text,
 )
 from ..tts.tts import clean_for_tts
 
@@ -1140,10 +1140,12 @@ class CycleBuilder:
                 continue
         return None
 
-    async def _build_obs_rwr_segment(self, ctx: CycleContext) -> Optional[str]:
+    async def _build_obs_rwr_segment(self, ctx: CycleContext) -> Tuple[Optional[str], Optional[RwrProduct]]:
         # Build the observations segment using RWR as primary source,
         # falling back to ASOS when RWR is stale or unavailable.
-        # Returns the spoken text string or None.
+        # Returns (spoken_text_or_None, parsed_RwrProduct_or_None).
+        # The parsed product is returned alongside the text so that callers
+        # (e.g. _build_marine_obs_segment) can reuse it without a second fetch.
         import datetime as _dt
         rwr_cfg = self._cycle_cfg.rwr if self._cycle_cfg else None
         rwr_enabled = rwr_cfg and rwr_cfg.enabled
@@ -1177,7 +1179,9 @@ class CycleBuilder:
                             cache=self._pressure_cache,
                         )
                         if text:
-                            return text
+                            # Return the parsed product alongside text so
+                            # _build_marine_obs_segment can reuse it for free.
+                            return text, product
             except Exception:
                 pass  # fall through to ASOS
 
@@ -1188,7 +1192,7 @@ class CycleBuilder:
             else list(self.obs_stations)
         )
         if not fallback_ids:
-            return None
+            return None, None
 
         # Height-aware station count
         max_obs = 1 if ctx.mode == "heightened" else (
@@ -1218,7 +1222,7 @@ class CycleBuilder:
                 continue
 
         if not station_obs:
-            return None
+            return None, None
 
         return build_asos_obs_text(
             stations=station_obs,
@@ -1227,6 +1231,28 @@ class CycleBuilder:
             intro_prefix=intro,
             cache=self._pressure_cache,
             name_map=name_map,
+        ), None
+
+    async def _build_marine_obs_segment(
+        self,
+        ctx: CycleContext,
+        rwr_product: Optional[RwrProduct],
+    ) -> Optional[str]:
+        """
+        Build the marine observations segment from the already-parsed RWR product.
+        No extra API call — marine obs are a section inside the same RWR we fetched
+        for land obs.  Enabled via cycle.marine_obs.enabled = true in config.
+        """
+        if not (self._cycle_cfg and self._cycle_cfg.marine_obs.enabled):
+            return None
+        if not rwr_product or not rwr_product.marine_stations:
+            return None
+        cfg = self._cycle_cfg.marine_obs
+        return build_marine_obs_text(
+            product=rwr_product,
+            max_stations=cfg.max_stations,
+            anchor_names=list(cfg.anchor_stations),
+            name_map=dict(cfg.station_names),
         )
 
     async def build_segments(
@@ -1463,7 +1489,8 @@ class CycleBuilder:
         # --- Observations (RWR primary / ASOS fallback) ---
         # obs_text is assembled here but appended to segments below,
         # after the forecast + CWF segments (correct NWR cycle order).
-        obs_text_rwr = await self._build_obs_rwr_segment(ctx)
+        obs_text_rwr, _rwr_product = await self._build_obs_rwr_segment(ctx)
+        marine_obs_text = await self._build_marine_obs_segment(ctx, _rwr_product)
 
         # --- Station ID ---
         # --- Station ID ---
@@ -1573,6 +1600,19 @@ class CycleBuilder:
         # --- Observations ---
         if obs_text_rwr:
             segments.append(CycleSegment(key="obs", title="Observations", text=obs_text_rwr))
+
+        # --- Marine Observations ---
+        if marine_obs_text:
+            segments.append(
+                CycleSegment(
+                    key="marine_obs",
+                    title="Marine Observations",
+                    text=(
+                        "And now for the marine observations in the service area. "
+                        + marine_obs_text
+                    ),
+                )
+            )
 
         segments.append(
             CycleSegment(
