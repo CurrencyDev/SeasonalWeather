@@ -5245,6 +5245,7 @@ class Orchestrator:
         headline = self._clean_cap_text(ev.headline or "", limit=280)
         desc = self._clean_cap_text(getattr(ev, "description", "") or "", limit=800)
         instr = self._clean_cap_text(getattr(ev, "instruction", "") or "", limit=400)
+        area_desc = (getattr(ev, "area_desc", "") or "").strip()
 
         vtec = self._cap_vtec_list(ev)
         exp_utc = self._best_expiry_from_vtec(vtec)
