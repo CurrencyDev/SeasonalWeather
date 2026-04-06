@@ -180,6 +180,125 @@ _PHEN_SIG_TO_SAME: dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
+# phen.sig → human-readable event label
+#
+# The authoritative label table for VTEC phen.sig pairs.  Callers needing a
+# display name (NWWS ingestion, AlertTracker, station feed, etc.) should call
+# phen_sig_label() rather than maintaining separate mini-maps in main.py or
+# elsewhere.
+#
+# Significance codes used:
+#   W = Warning   A = Watch   Y = Advisory   S = Statement
+#   F = Forecast  O = Outlook  N = Synopsis
+# ---------------------------------------------------------------------------
+_PHEN_SIG_TO_LABEL: dict[str, str] = {
+    # Convective
+    "TO.W": "Tornado Warning",             "TO.A": "Tornado Watch",
+    "SV.W": "Severe Thunderstorm Warning", "SV.A": "Severe Thunderstorm Watch",
+    "EW.W": "Extreme Wind Warning",
+    # Flash / Areal Flood
+    "FF.W": "Flash Flood Warning",         "FF.A": "Flash Flood Watch",
+    "FF.Y": "Flash Flood Advisory",
+    "FA.W": "Flood Warning",               "FA.A": "Flood Watch",             "FA.Y": "Flood Advisory",
+    "FL.W": "Flood Warning",               "FL.A": "Flood Watch",             "FL.Y": "Flood Advisory",
+    # Coastal / Storm Surge
+    "CF.W": "Coastal Flood Warning",       "CF.A": "Coastal Flood Watch",     "CF.Y": "Coastal Flood Advisory",
+    "SS.W": "Storm Surge Warning",         "SS.A": "Storm Surge Watch",
+    "SU.W": "High Surf Warning",           "SU.Y": "High Surf Advisory",
+    "BH.S": "Beach Hazards Statement",
+    "RP.S": "Rip Current Statement",
+    # Tropical
+    "HU.W": "Hurricane Warning",           "HU.A": "Hurricane Watch",
+    "HU.S": "Hurricane Local Statement",
+    "TR.W": "Tropical Storm Warning",      "TR.A": "Tropical Storm Watch",
+    "TY.W": "Typhoon Warning",             "TY.A": "Typhoon Watch",
+    # Marine
+    "MA.W": "Special Marine Warning",
+    "SC.Y": "Small Craft Advisory",
+    "SE.W": "Hazardous Seas Warning",      "SE.A": "Hazardous Seas Watch",
+    "GL.W": "Gale Warning",                "GL.A": "Gale Watch",
+    "SR.W": "Storm Warning",               "SR.A": "Storm Watch",
+    "HF.W": "Hurricane Force Wind Warning","HF.A": "Hurricane Force Wind Watch",
+    "MH.W": "Marine Hurricane Force Wind Warning",
+    "MH.Y": "Marine Hurricane Force Wind Advisory",
+    "UP.W": "Ice Accretion Warning",       "UP.Y": "Freezing Spray Advisory",
+    "RB.Y": "Small Craft Advisory for Rough Bar",
+    "SI.Y": "Small Craft Advisory for Rough Bar",
+    "SW.Y": "Small Craft Advisory for Winds",
+    "LO.Y": "Lake Wind Advisory",
+    "MS.Y": "Dense Fog Advisory for Mariners",
+    # Tsunami
+    "TS.W": "Tsunami Warning",             "TS.A": "Tsunami Watch",           "TS.Y": "Tsunami Advisory",
+    # Winter
+    "BZ.W": "Blizzard Warning",            "BZ.A": "Blizzard Watch",
+    "IS.W": "Ice Storm Warning",
+    "WS.W": "Winter Storm Warning",        "WS.A": "Winter Storm Watch",
+    "WW.Y": "Winter Weather Advisory",
+    "LE.W": "Lake Effect Snow Warning",    "LE.A": "Lake Effect Snow Watch",  "LE.Y": "Lake Effect Snow Advisory",
+    "SQ.W": "Snow Squall Warning",
+    "IP.Y": "Sleet Advisory",
+    # Wind
+    "HW.W": "High Wind Warning",           "HW.A": "High Wind Watch",
+    "WI.Y": "Wind Advisory",
+    "LW.Y": "Lake Wind Advisory",
+    # Heat / Cold
+    "EH.W": "Excessive Heat Warning",      "EH.A": "Excessive Heat Watch",
+    "HT.Y": "Heat Advisory",
+    "HZ.W": "Hard Freeze Warning",         "HZ.A": "Hard Freeze Watch",
+    "FZ.W": "Freeze Warning",              "FZ.A": "Freeze Watch",
+    "FR.Y": "Frost Advisory",
+    "WC.W": "Wind Chill Warning",          "WC.A": "Wind Chill Watch",        "WC.Y": "Wind Chill Advisory",
+    "EC.W": "Extreme Cold Warning",        "EC.A": "Extreme Cold Watch",
+    # Fire
+    "FW.W": "Red Flag Warning",            "FW.A": "Fire Weather Watch",
+    # Fog / Smoke / Dust
+    "FG.Y": "Dense Fog Advisory",
+    "ZF.Y": "Freezing Fog Advisory",
+    "SM.Y": "Dense Smoke Advisory",
+    "DU.W": "Blowing Dust Warning",        "DU.Y": "Blowing Dust Advisory",
+    "DS.W": "Dust Storm Warning",
+    "BS.Y": "Blowing Snow Advisory",
+    # Geophysical
+    "AV.W": "Avalanche Warning",           "AV.A": "Avalanche Watch",         "AV.Y": "Avalanche Advisory",
+    "EQ.W": "Earthquake Warning",
+    "VO.W": "Volcano Warning",
+    # Non-met (VTEC-issued)
+    "CD.W": "Civil Danger Warning",
+    "NU.W": "Nuclear Power Plant Warning",
+    "SP.W": "Shelter in Place Warning",
+    "RH.W": "Radiological Hazard Warning",
+}
+
+
+def phen_sig_label(phen_sig: str) -> str | None:
+    """
+    Return the human-readable event label for a VTEC phen.sig pair.
+
+    Returns None when the pair is not in the table — callers should fall back
+    to text extraction or the raw AWIPS product type.
+
+        phen_sig_label("TO.W")   # → "Tornado Warning"
+        phen_sig_label("MA.W")   # → "Special Marine Warning"
+        phen_sig_label("CF.Y")   # → "Coastal Flood Advisory"
+        phen_sig_label("ZZ.Z")   # → None
+    """
+    return _PHEN_SIG_TO_LABEL.get((phen_sig or "").strip().upper())
+
+
+# ---------------------------------------------------------------------------
+# Exported regex aliases
+# These are the canonical VTEC regexes for the whole codebase.  Callers
+# should import from here rather than defining their own copies.
+# ---------------------------------------------------------------------------
+VTEC_FIND_RE = re.compile(
+    r"/[A-Z]\.[A-Z]{3}\.[A-Z]{4}\.[A-Z0-9]{2}\.[A-Z]\.\d{4}\.(?:\d{8}|\d{6})T\d{4}Z-(?:\d{8}|\d{6})T\d{4}Z/"
+)
+VTEC_PARSE_RE = re.compile(
+    r"/(?P<prod>[A-Z])\.(?P<act>[A-Z]{3})\.(?P<office>[A-Z]{4})\.(?P<phen>[A-Z0-9]{2})\.(?P<sig>[A-Z])\.(?P<etn>\d{4})\.(?P<start>(?:\d{8}|\d{6})T\d{4}Z)-(?P<end>(?:\d{8}|\d{6})T\d{4}Z)/"
+)
+
+
+# ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
 

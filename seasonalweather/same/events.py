@@ -173,6 +173,29 @@ _TABLE["LEW"] = ("Law Enforcement Warning", "Immediate")
 
 
 # ---------------------------------------------------------------------------
+# EAS originator (ORG) broadcast prefix strings
+# Used by station-feed headline builders to form the spoken preamble.
+# ---------------------------------------------------------------------------
+_ORG_PREFIX: dict[str, str] = {
+    "WXR": "The National Weather Service has issued",
+    "CIV": "A civil authority has issued",
+    "EAS": "An EAS participant has issued",
+    "PEP": "A primary entry point station has issued",
+}
+
+
+def org_broadcast_prefix(org: str) -> str:
+    """
+    Return the broadcast preamble sentence fragment for a SAME/EAS org code.
+
+        org_broadcast_prefix("WXR")  # → "The National Weather Service has issued"
+        org_broadcast_prefix("CIV")  # → "A civil authority has issued"
+        org_broadcast_prefix("ZZZ")  # → "An alert originator has issued"
+    """
+    return _ORG_PREFIX.get(str(org or "").strip().upper(), "An alert originator has issued")
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 

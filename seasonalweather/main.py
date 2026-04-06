@@ -48,10 +48,23 @@ from .broadcast.segment_store import SegmentStore
 from .broadcast.conductor import CycleConductor
 from .broadcast.segment_refresher import SegmentRefresher
 from .broadcast.product_text import (
+    # pre-existing helpers
     cap_full_opening_line as _cap_full_opening_line,
     cap_normalize_nws_headline as _cap_normalize_nws_headline,
     cap_statement_area_noun as _cap_statement_area_noun,
     cap_statement_intro as _cap_statement_intro,
+    # newly moved / newly added
+    STATE_NAME_FULL as _STATE_NAME_FULL_MAP,
+    cap_expiry_summary_line as _cap_expiry_summary_line,
+    cap_prefers_statement_update_script as _cap_prefers_statement_update_script_fn,
+    clean_cap_text as _pt_clean_cap_text,
+    expiry_summary_script as _expiry_summary_script_fn,
+    join_oxford as _pt_join_oxford,
+    parse_cap_area_by_state as _pt_parse_cap_area_by_state,
+    build_statement_vtec_action_script as _build_statement_vtec_action_script_fn,
+    build_warning_vtec_action_script as _build_warning_vtec_action_script_fn,
+    build_nwws_partial_cancel_script as _build_nwws_partial_cancel_script,
+    parse_nwws_product_segments as _parse_nwws_product_segments,
 )
 
 # Active alert tracker (persistent cycle state across restarts)
@@ -61,8 +74,17 @@ from .database.housekeeping import DatabaseHousekeeper
 from .discord_log import DiscordLogger
 
 # VTEC policy + SAME event code libraries — Orchestrator defers to these.
-from .alerts.vtec import toneout_policy as _vtec_toneout_policy
-from .same.events import label_or_code as _same_label_or_code
+from .alerts.vtec import (
+    toneout_policy as _vtec_toneout_policy,
+    phen_sig_label as _vtec_phen_sig_label,
+    VTEC_FIND_RE as _VTEC_FIND_RE,
+    VTEC_PARSE_RE as _VTEC_PARSE_RE,
+)
+from .same.events import (
+    label_or_code as _same_label_or_code,
+    label_for as _same_label_for,
+    org_broadcast_prefix as _eas_org_broadcast_prefix,
+)
 from .same import ugc as _ugc
 
 # RWT/RMT scheduler
@@ -298,14 +320,13 @@ def _sf_eas_article(word: str) -> str:
     return "an" if (w[:1].lower() in "aeiou") else "a"
 
 
-_SF_EAS_ORG_PREFIX = {
-    "WXR": "The National Weather Service has issued",
-    "CIV": "A civil authority has issued",
-    "EAS": "An EAS participant has issued",
-    "PEP": "A primary entry point station has issued",
-}
+# EAS org prefix and event labels are now authoritative in:
+#   .same.events  → _eas_org_broadcast_prefix(), _same_label_for(), _same_label_or_code()
+# The shim below keeps _sf_make_eas_headline() working without further changes.
+_SF_EAS_ORG_PREFIX = None  # unused sentinel; callers use _eas_org_broadcast_prefix()
 
-# Minimal event map; unknown codes fall back to the code itself
+# Minimal SAME/ERN relay event map (retained for ERN relay path only).
+# For all other label lookups use _same_label_or_code() / _same_label_for().
 _SF_EAS_EVENT_LABELS = {
     "RWT": "Required Weekly Test",
     "RMT": "Required Monthly Test",
@@ -321,6 +342,7 @@ _SF_EAS_EVENT_LABELS = {
     "SMW": "Special Marine Warning",
     "SPS": "Special Weather Statement",
 }
+
 
 # ZCZC-ORG-EEE-LLLLLL-LLLLLL+TTTT-JJJHHMM-SENDER-
 _SF_ZCZC_RE = re.compile(
@@ -386,7 +408,7 @@ def _sf_fmt_local(dt_obj):
             return str(dt_obj)
 
 def _sf_make_eas_headline(*, org, event_text, area_text, start_utc, end_utc, sender):
-    prefix = _SF_EAS_ORG_PREFIX.get(str(org or "").upper(), "An alert originator has issued")
+    prefix = _eas_org_broadcast_prefix(org)
     event_text = str(event_text or "Alert").strip() or "Alert"
     area_text = str(area_text or "").strip() or "Unknown area"
     article = _sf_eas_article(event_text)
@@ -398,46 +420,10 @@ def _sf_make_eas_headline(*, org, event_text, area_text, start_utc, end_utc, sen
 
 
 
-_DEFAULT_SF_NWWS_VTEC_EVENT_LABELS: dict[str, str] = {
-    "TO.W": "Tornado Warning",
-    "TO.A": "Tornado Watch",
-    "SV.W": "Severe Thunderstorm Warning",
-    "SV.A": "Severe Thunderstorm Watch",
-    "FF.W": "Flash Flood Warning",
-    "FF.A": "Flash Flood Watch",
-    "FA.Y": "Flood Advisory",
-    "FA.W": "Flood Warning",
-    "FA.A": "Flood Watch",
-    "FL.Y": "Flood Advisory",
-    "FL.W": "Flood Warning",
-    "FL.A": "Flood Watch",
-    "CF.Y": "Coastal Flood Advisory",
-    "CF.W": "Coastal Flood Warning",
-    "CF.A": "Coastal Flood Watch",
-    "HU.W": "Hurricane Warning",
-    "HU.A": "Hurricane Watch",
-    "TR.W": "Tropical Storm Warning",
-    "TR.A": "Tropical Storm Watch",
-    "BZ.W": "Blizzard Warning",
-    "BZ.A": "Blizzard Watch",
-    "IS.W": "Ice Storm Warning",
-    "HW.W": "High Wind Warning",
-    "HW.A": "High Wind Watch",
-    "WI.Y": "Wind Advisory",
-    "EH.W": "Excessive Heat Warning",
-    "EH.A": "Excessive Heat Watch",
-    "HT.Y": "Heat Advisory",
-    "FR.Y": "Frost Advisory",
-    "HZ.W": "Hard Freeze Warning",
-    "HZ.A": "Hard Freeze Watch",
-    "FW.W": "Red Flag Warning",
-    "LE.W": "Lake Effect Snow Warning",
-    "LE.A": "Lake Effect Snow Watch",
-    "LE.Y": "Lake Effect Snow Advisory",
-    "WS.W": "Winter Storm Warning",
-    "WS.A": "Winter Storm Watch",
-    "WW.Y": "Winter Weather Advisory",
-}
+# VTEC phen.sig → event label lookup is now authoritative in:
+#   .alerts.vtec.phen_sig_label()  (imported as _vtec_phen_sig_label)
+# Config-level overrides are merged in _sf_nwws_event_label() below.
+
 
 _DEFAULT_SF_NWWS_TZ_OFFSETS: dict[str, dt.tzinfo] = {
     "UTC": dt.timezone.utc,
@@ -502,20 +488,46 @@ def _sf_nwws_tz_offsets() -> dict[str, dt.tzinfo]:
     return out
 
 
-def _sf_nwws_vtec_event_labels() -> dict[str, str]:
-    out = dict(_DEFAULT_SF_NWWS_VTEC_EVENT_LABELS)
+def _sf_nwws_event_label(prod_type: str, *, vtec_list=None, text: str = "") -> str:
+    """
+    Resolve an NWWS product to a human-readable event label.
+
+    Priority:
+      1. Config-level vtec_event_labels overrides (if any)
+      2. vtec.phen_sig_label() — authoritative table in vtec.py
+      3. _sf_nwws_event_from_text() — product body text extraction
+      4. EAS event code via events.label_or_code() as last resort
+    """
+    # Load any config-level overrides
+    config_overrides: dict[str, str] = {}
     try:
         cfg = getattr(getattr(_APP_CFG, "station_feed", None), "nwws", None)
-        overrides = getattr(cfg, "vtec_event_labels", {}) if cfg is not None else {}
-        if isinstance(overrides, dict):
-            for raw_key, raw_val in overrides.items():
+        raw_ovr = getattr(cfg, "vtec_event_labels", {}) if cfg is not None else {}
+        if isinstance(raw_ovr, dict):
+            for raw_key, raw_val in raw_ovr.items():
                 key = str(raw_key or "").strip().upper()
                 val = str(raw_val or "").strip()
                 if key and val:
-                    out[key] = val
+                    config_overrides[key] = val
     except Exception:
         pass
-    return out
+
+    for raw in (vtec_list or []):
+        m = _VTEC_PARSE_RE.search(str(raw or ""))
+        if not m:
+            continue
+        phen_sig = f"{m.group('phen')}.{m.group('sig')}"
+        # Config overrides take highest priority
+        if phen_sig in config_overrides:
+            return config_overrides[phen_sig]
+        label = _vtec_phen_sig_label(phen_sig)
+        if label:
+            return label
+
+    text_label = _sf_nwws_event_from_text(text)
+    if text_label:
+        return text_label
+    return _same_label_or_code(prod_type)
 
 
 def _sf_nwws_titlecase_event(text: str) -> str:
@@ -588,20 +600,6 @@ def _sf_nwws_event_from_text(text: str) -> str:
     return ""
 
 
-def _sf_nwws_event_label(prod_type: str, *, vtec_list=None, text: str = "") -> str:
-    label_map = _sf_nwws_vtec_event_labels()
-    for raw in (vtec_list or []):
-        m = _VTEC_PARSE_RE.search(str(raw or ""))
-        if not m:
-            continue
-        label = label_map.get(f"{m.group('phen')}.{m.group('sig')}")
-        if label:
-            return label
-    text_label = _sf_nwws_event_from_text(text)
-    if text_label:
-        return text_label
-    return _sf_eas_event_label_full(prod_type)
-
 
 def _sf_nwws_area_from_text(text: str) -> str:
     lines = [re.sub(r"\s+", " ", (ln or "").strip()) for ln in (strip_nws_product_headers(text or "") or "").splitlines()]
@@ -656,142 +654,6 @@ def _sf_nwws_make_headline(event_text: str, *, issued_dt=None, end_dt=None, issu
     ev = str(event_text or "Alert").strip() or "Alert"
     suffix = _sf_fmt_issued_until(issued_dt, end_dt, issuer)
     return f"{ev} {suffix}".strip() if suffix else ev
-
-
-### STATION_FEED_EAS_LABELS_FULL_PATCH ###
-# Full current FCC EAS event-code labels (47 CFR §11.31 Table 2 to paragraph (e), incl. MEP)
-# This block is intentionally additive and tries to patch whatever helper/dict names your prior patch used.
-
-_SF_EAS_EVENT_LABELS_FULL = {
-    # National (required)
-    "EAN": "Emergency Action Notification",
-    "NIC": "National Information Center",
-    "NPT": "National Periodic Test",
-    "RMT": "Required Monthly Test",
-    "RWT": "Required Weekly Test",
-
-    # State / local (optional)
-    "ADR": "Administrative Message",
-    "AVW": "Avalanche Warning",
-    "AVA": "Avalanche Watch",
-    "BZW": "Blizzard Warning",
-    "BLU": "Blue Alert",
-    "CAE": "Child Abduction Emergency",
-    "CDW": "Civil Danger Warning",
-    "CEM": "Civil Emergency Message",
-    "CFW": "Coastal Flood Warning",
-    "CFA": "Coastal Flood Watch",
-    "DSW": "Dust Storm Warning",
-    "EQW": "Earthquake Warning",
-    "EVI": "Evacuation Immediate",
-    "EWW": "Extreme Wind Warning",
-    "FRW": "Fire Warning",
-    "FFW": "Flash Flood Warning",
-    "FFA": "Flash Flood Watch",
-    "FFS": "Flash Flood Statement",
-    "FLW": "Flood Warning",
-    "FLA": "Flood Watch",
-    "FLS": "Flood Statement",
-    "HMW": "Hazardous Materials Warning",
-    "HWW": "High Wind Warning",
-    "HWA": "High Wind Watch",
-    "HUW": "Hurricane Warning",
-    "HUA": "Hurricane Watch",
-    "HLS": "Hurricane Statement",
-    "LEW": "Law Enforcement Warning",
-    "LAE": "Local Area Emergency",
-    "MEP": "Missing and Endangered Persons",
-    "NMN": "Network Message Notification",
-    "TOE": "911 Telephone Outage Emergency",
-    "NUW": "Nuclear Power Plant Warning",
-    "DMO": "Practice/Demo Warning",
-    "RHW": "Radiological Hazard Warning",
-    "SVR": "Severe Thunderstorm Warning",
-    "SVA": "Severe Thunderstorm Watch",
-    "SVS": "Severe Weather Statement",
-    "SPW": "Shelter in Place Warning",
-    "SMW": "Special Marine Warning",
-    "SPS": "Special Weather Statement",
-    "SSA": "Storm Surge Watch",
-    "SSW": "Storm Surge Warning",
-    "TOR": "Tornado Warning",
-    "TOA": "Tornado Watch",
-    "TRW": "Tropical Storm Warning",
-    "TRA": "Tropical Storm Watch",
-    "TSW": "Tsunami Warning",
-    "TSA": "Tsunami Watch",
-    "VOW": "Volcano Warning",
-    "WSW": "Winter Storm Warning",
-    "WSA": "Winter Storm Watch",
-}
-
-# A few common legacy/enthusiast aliases you may still see in the wild.
-# (Harmless if unused; keeps UI from falling back to raw code text.)
-_SF_EAS_EVENT_LABELS_FULL.setdefault("EAT", "Emergency Action Termination")
-_SF_EAS_EVENT_LABELS_FULL.setdefault("NAT", "National Audible Test")
-_SF_EAS_EVENT_LABELS_FULL.setdefault("NEM", "National Emergency Message")
-_SF_EAS_EVENT_LABELS_FULL.setdefault("NST", "National Silent Test")
-
-def _sf_eas_event_label_full(code):
-    c = (str(code or "").strip().upper())
-    if not c:
-        return "Alert"
-    return _SF_EAS_EVENT_LABELS_FULL.get(c, c)
-
-def _sf_patch_eas_label_helpers():
-    # 1) Patch common dict names by updating them in place
-    dict_candidates = (
-        "_EAS_EVENT_LABELS",
-        "EAS_EVENT_LABELS",
-        "_EAS_EVENT_NAMES",
-        "EAS_EVENT_NAMES",
-        "_SF_EAS_EVENT_LABELS",
-        "_SF_EAS_EVENT_NAMES",
-        "_SAME_EVENT_LABELS",
-        "_SAME_EVENT_NAMES",
-    )
-    for nm in dict_candidates:
-        try:
-            obj = globals().get(nm)
-            if isinstance(obj, dict):
-                obj.update(_SF_EAS_EVENT_LABELS_FULL)
-        except Exception:
-            pass
-
-    # 2) Wrap common helper function names so they fall back to the full map
-    fn_candidates = (
-        "_sf_eas_event_name",
-        "_sf_eas_event_label",
-        "_same_event_name",
-        "_same_event_label",
-        "_eas_event_name",
-        "_eas_event_label",
-    )
-    for nm in fn_candidates:
-        try:
-            fn = globals().get(nm)
-            if not callable(fn):
-                continue
-            # Avoid double-wrapping
-            if getattr(fn, "__name__", "") == "_sf_eas_event_label_full_wrapper":
-                continue
-
-            def _make_wrapper(_orig):
-                def _sf_eas_event_label_full_wrapper(code, *args, **kwargs):
-                    c = (str(code or "").strip().upper())
-                    if c in _SF_EAS_EVENT_LABELS_FULL:
-                        return _SF_EAS_EVENT_LABELS_FULL[c]
-                    try:
-                        return _orig(code, *args, **kwargs)
-                    except TypeError:
-                        return _orig(code)
-                return _sf_eas_event_label_full_wrapper
-
-            globals()[nm] = _make_wrapper(fn)
-        except Exception:
-            pass
-
-_sf_patch_eas_label_helpers()
 
 
 ### STATION_FEED_HOUSEKEEPING_PATCH ###
@@ -1431,17 +1293,7 @@ _EXPIRY_LINE_RE = re.compile(
 )
 
 
-# VTEC finder (accepts YYYYMMDD or legacy YYMMDD date digits)
-_VTEC_FIND_RE = re.compile(
-    r"/[A-Z]\.[A-Z]{3}\.[A-Z]{4}\.[A-Z0-9]{2}\.[A-Z]\.\d{4}\.(?:\d{8}|\d{6})T\d{4}Z-(?:\d{8}|\d{6})T\d{4}Z/"
-)
-
-# VTEC parser for action/track extraction (office+phen+sig+etn)
-_VTEC_PARSE_RE = re.compile(
-    r"/(?P<prod>[A-Z])\.(?P<act>[A-Z]{3})\.(?P<office>[A-Z]{4})\.(?P<phen>[A-Z0-9]{2})\.(?P<sig>[A-Z])\.(?P<etn>\d{4})\.(?P<start>(?:\d{8}|\d{6})T\d{4}Z)-(?P<end>(?:\d{8}|\d{6})T\d{4}Z)/"
-)
-
-
+# _VTEC_FIND_RE and _VTEC_PARSE_RE are now imported from .alerts.vtec above.
 
 
 def _setup_logging() -> None:
@@ -2385,43 +2237,8 @@ class Orchestrator:
         return "And now a Special Weather Statement from your National Weather Service."
 
     def _expiry_summary_script(self, official_text: str) -> str | None:
-        """
-        For VTEC EXP (and often CAN) updates, don't read the whole product.
-        Try to narrate the first 1-2 human-friendly 'has expired' lines from the header region.
-        """
-        if not official_text:
-            return None
-
-        hits: list[str] = []
-        for ln in (official_text or "").splitlines()[:240]:
-            s = re.sub(r"\s+", " ", (ln or "")).strip()
-            if not s:
-                continue
-            if _EXPIRY_LINE_RE.search(s):
-                if not s.endswith((".", "!", "?")):
-                    s += "."
-                hits.append(s)
-                if len(hits) >= 2:
-                    break
-
-        if not hits:
-            # Fallback: search a flattened window for a sentence containing "has expired"
-            flat = re.sub(r"\s+", " ", (official_text or "")[:7000]).strip()
-            m = re.search(
-                r"([^.]{0,220}\bhas (?:expired|been allowed to expire|ended)\b[^.]{0,220}\.)",
-                flat,
-                flags=re.IGNORECASE,
-            )
-            if m:
-                hits = [m.group(1).strip()]
-
-        if not hits:
-            return None
-
-        lines = ["The National Weather Service reports the following update."]
-        lines.extend(hits)
-        lines.append("End of message.")
-        return "\n".join(lines).strip()
+        """Shim → product_text.expiry_summary_script()."""
+        return _expiry_summary_script_fn(official_text)
 
     # ---- NWWS UGC -> SAME targeting helpers ----
     def _build_nwws_statement_vtec_action_script(
@@ -2433,16 +2250,17 @@ class Orchestrator:
         headline: str,
         vtec_actions: set[str],
     ) -> str:
-        """
-        Reuse the CAP advisory/statement/message EXP/CAN helper for NWWS voice-only
-        updates so CAP and NWWS expiration/cancellation copy stays aligned.
-        """
-        faux_ev = type("NwwsStatementEvent", (), {})()
-        faux_ev.event = str(event_text or "Weather alert").strip()
-        faux_ev.area_desc = str(area_text or _sf_nwws_area_from_text(official_text) or "the affected areas").strip()
-        faux_ev.description = str(official_text or "").strip()
-        faux_ev.headline = str(headline or event_text or "").strip()
-        return self._build_statement_vtec_action_script(faux_ev, vtec_actions, [])
+        """Shim → product_text.build_statement_vtec_action_script()."""
+        return _build_statement_vtec_action_script_fn(
+            event=event_text,
+            area_desc=area_text or _sf_nwws_area_from_text(official_text) or "",
+            description=official_text,
+            headline=headline,
+            vtec=[],
+            vtec_actions=vtec_actions,
+            parameters=None,
+            sps_preamble=self._cap_sps_preamble,
+        )
 
     def _state_to_fips2(self, st: str) -> str | None:
         s = (st or "").strip().upper()
@@ -3145,7 +2963,7 @@ class Orchestrator:
                     removed += 1
 
         if removed:
-            self.log.info(
+            log.info(
                 "Rebroadcast: removed %d item(s) tracks=%s reason=%s",
                 removed,
                 ",".join(sorted(track_ids)),
@@ -3177,7 +2995,7 @@ class Orchestrator:
                     touched += 1
 
         if touched:
-            self.log.debug(
+            log.debug(
                 "Rebroadcast: refreshed expiry for %d item(s) tracks=%s expires_at=%s reason=%s",
                 touched,
                 ",".join(sorted(track_ids)),
@@ -3236,7 +3054,7 @@ class Orchestrator:
                 updated += 1
 
         if updated:
-            self.log.info(
+            log.info(
                 "Rebroadcast: updated script for %d item(s) tracks=%s reason=%s",
                 updated, ",".join(sorted(track_ids)), reason,
             )
@@ -3704,7 +3522,7 @@ class Orchestrator:
 
                 # Human label if available, else fall back to the raw code
                 try:
-                    label = _sf_eas_event_label_full(code)
+                    label = _same_label_or_code(code)
                 except Exception:
                     label = code
 
@@ -4788,17 +4606,8 @@ class Orchestrator:
             raise
 
     def _clean_cap_text(self, s: str, *, limit: int = 900) -> str:
-        s2 = (s or "").replace("\r", " ").replace("\n", " ")
-        s2 = re.sub(r"\s+", " ", s2).strip()
-        s2 = s2.replace("...", ". ").replace("..", ".")
-        # Strip a bare AWIPS product identifier that NWS sometimes embeds at the
-        # start of the description field (e.g. "SVRLOT The National Weather…").
-        # Pattern: 5–8 uppercase letters/digits at the very beginning, followed by
-        # whitespace, with no punctuation — not legitimate narrative text.
-        s2 = re.sub(r"^[A-Z][A-Z0-9]{4,7}\s+", "", s2)
-        if len(s2) > limit:
-            s2 = s2[:limit].rstrip() + "..."
-        return s2
+        """Shim → product_text.clean_cap_text()."""
+        return _pt_clean_cap_text(s, limit=limit)
 
 
     def _build_cap_watch_script(self, ev: "CapAlertEvent", *, mode: str = "full") -> str:  # type: ignore[name-defined]
@@ -5040,62 +4849,19 @@ class Orchestrator:
     #  VTEC-action script builders (NWR-style update/cancel narration)    #
     # ------------------------------------------------------------------ #
 
-    _STATE_NAME_FULL: dict[str, str] = {
-        "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
-        "CA": "California", "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware",
-        "DC": "the District of Columbia", "FL": "Florida", "GA": "Georgia",
-        "HI": "Hawaii", "ID": "Idaho", "IL": "Illinois", "IN": "Indiana",
-        "IA": "Iowa", "KS": "Kansas", "KY": "Kentucky", "LA": "Louisiana",
-        "ME": "Maine", "MD": "Maryland", "MA": "Massachusetts", "MI": "Michigan",
-        "MN": "Minnesota", "MS": "Mississippi", "MO": "Missouri", "MT": "Montana",
-        "NE": "Nebraska", "NV": "Nevada", "NH": "New Hampshire", "NJ": "New Jersey",
-        "NM": "New Mexico", "NY": "New York", "NC": "North Carolina",
-        "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma", "OR": "Oregon",
-        "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina",
-        "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah",
-        "VT": "Vermont", "VA": "Virginia", "WA": "Washington",
-        "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming",
-    }
+    # _STATE_NAME_FULL moved to product_text.STATE_NAME_FULL
+    _STATE_NAME_FULL: dict[str, str] = _STATE_NAME_FULL_MAP
 
     def _parse_cap_area_by_state(self, area_desc: str) -> tuple[dict[str, list[str]], list[str], list[str]]:
-        """
-        Parse CAP areaDesc (semicolon-separated "County, ST" items).
-        Returns (groups_by_state, state_order, misc_items).
-        """
-        groups: dict[str, list[str]] = {}
-        order: list[str] = []
-        misc: list[str] = []
-        for raw in re.split(r";\s*", area_desc or ""):
-            s = (raw or "").strip().strip(".")
-            if not s:
-                continue
-            if "," in s:
-                name, st = s.rsplit(",", 1)
-                name = name.strip()
-                st = st.strip().upper()
-                if st not in groups:
-                    groups[st] = []
-                    order.append(st)
-                groups[st].append(name)
-            else:
-                misc.append(s)
-        return groups, order, misc
+        """Shim → product_text.parse_cap_area_by_state()."""
+        return _pt_parse_cap_area_by_state(area_desc)
 
     def _join_oxford(self, items: list[str]) -> str:
-        xs = [x.strip() for x in items if x and x.strip()]
-        if not xs:
-            return ""
-        if len(xs) == 1:
-            return xs[0]
-        if len(xs) == 2:
-            return f"{xs[0]} and {xs[1]}"
-        return ", ".join(xs[:-1]) + f", and {xs[-1]}"
+        """Shim → product_text.join_oxford()."""
+        return _pt_join_oxford(items)
 
     def _fmt_local_from_utc_iso(self, iso_str: str) -> str:
-        """
-        Parse an ISO-8601 UTC string and return a human-friendly local time phrase.
-        Returns "" on failure.
-        """
+        """Parse an ISO-8601 UTC string and return a human-friendly local time phrase."""
         s = (iso_str or "").strip()
         if not s:
             return ""
@@ -5137,29 +4903,12 @@ class Orchestrator:
         return (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=6)).isoformat()
 
     def _cap_prefers_statement_update_script(self, event: str, vtec_actions: set[str]) -> bool:
-        e = (event or '').strip().lower()
-        if not e:
-            return False
-        if not (vtec_actions & {'CAN', 'EXP'}):
-            return False
-        return e.endswith('advisory') or e.endswith('statement') or e.endswith('message')
+        """Shim → product_text.cap_prefers_statement_update_script()."""
+        return _cap_prefers_statement_update_script_fn(event, vtec_actions)
 
     def _cap_expiry_summary_line(self, text: str) -> str:
-        src = str(text or '').strip()
-        if not src:
-            return ''
-        flat = re.sub(r'\s+', ' ', src)
-        m = re.search(
-            r'([^.]{0,220}\b(?:will expire|has expired|has been allowed to expire|has ended|is no longer in effect|the threat has ended)\b[^.]{0,220}[.?!]?)',
-            flat,
-            flags=re.IGNORECASE,
-        )
-        if not m:
-            return ''
-        line = m.group(1).strip()
-        if line and not line.endswith(('.', '!', '?')):
-            line += '.'
-        return line
+        """Shim → product_text.cap_expiry_summary_line()."""
+        return _cap_expiry_summary_line(text)
 
     def _build_statement_vtec_action_script(
         self,
@@ -5167,64 +4916,18 @@ class Orchestrator:
         vtec_actions: set[str],
         tracks: list[tuple[str, str]],
     ) -> str:
-        """
-        Lighter-weight voice cut-in for advisory / statement / message EXP/CAN updates.
-        This intentionally sounds like a short NWR-style statement instead of a full
-        warning, or watch style update.
-        """
-        event = self._clean_cap_text(ev.event or '', limit=120)
-        area_desc = (getattr(ev, 'area_desc', '') or '').strip()
-        desc = str(getattr(ev, 'description', '') or '').strip()
-        headline = str(getattr(ev, 'headline', '') or '').strip()
-
-        groups, order, misc = self._parse_cap_area_by_state(area_desc)
-
-        def _county_segs() -> str:
-            if not groups:
-                return self._clean_cap_text(area_desc or 'the affected areas', limit=400)
-            parts: list[str] = []
-            for st in order:
-                st_full = self._STATE_NAME_FULL.get(st, st)
-                county_list = self._join_oxford(groups[st])
-                if county_list:
-                    parts.append(f'in {st_full}, {county_list}')
-            if misc:
-                parts.append(self._join_oxford(misc))
-            return '; '.join(parts) if parts else self._clean_cap_text(area_desc or 'the affected areas', limit=400)
-
-        summary_line = ''
-        if vtec_actions & {'EXP'}:
-            summary_line = self._cap_expiry_summary_line(desc) or self._cap_expiry_summary_line(headline)
-            if not summary_line and event:
-                summary_line = f'The {event} has expired.'
-        elif vtec_actions & {'CAN'}:
-            summary_line = self._cap_expiry_summary_line(desc) or self._cap_expiry_summary_line(headline)
-            if not summary_line and event:
-                summary_line = f'The {event} has been cancelled.'
-
-        lines: list[str] = []
-        lines.append(
-            _cap_statement_intro(
-                event=event,
-                sent_iso=getattr(ev, 'sent', None),
-                sps_preamble=self._cap_sps_preamble,
-            )
+        """Shim → product_text.build_statement_vtec_action_script()."""
+        return _build_statement_vtec_action_script_fn(
+            event=getattr(ev, "event", "") or "",
+            area_desc=(getattr(ev, "area_desc", "") or "").strip(),
+            description=str(getattr(ev, "description", "") or "").strip(),
+            headline=str(getattr(ev, "headline", "") or "").strip(),
+            vtec=self._cap_vtec_list(ev),
+            vtec_actions=vtec_actions,
+            parameters=getattr(ev, "parameters", {}) or {},
+            sps_preamble=self._cap_sps_preamble,
+            sent_iso=getattr(ev, "sent", None),
         )
-        area_line = _county_segs()
-        if area_line:
-            area_noun = _cap_statement_area_noun(
-                event=event,
-                area_desc=area_desc,
-                parameters=getattr(ev, 'parameters', {}) or {},
-                vtec=self._cap_vtec_list(ev),
-            )
-            lines.append(f'For the following {area_noun}: {area_line}.')
-        if summary_line:
-            lines.append(summary_line)
-        elif event:
-            lines.append(f'The {event} has been updated.')
-        lines.append('End of message.')
-        return "\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
 
     def _build_warning_vtec_action_script(
         self,
@@ -5232,21 +4935,7 @@ class Orchestrator:
         vtec_actions: set[str],
         tracks: list[tuple[str, str]],
     ) -> str:
-        """
-        NWR-style voice script for VTEC update actions on warnings (non-watch).
-
-        CON/EXT  →  "…remains in effect until …"
-        CAN      →  "…has been cancelled"
-        EXP      →  "…has been allowed to expire"
-        EXA/EXB  →  "…has been expanded to include …"
-        UPG      →  handled by _build_cap_full_script (new warning issued)
-        """
-        event = self._clean_cap_text(ev.event or "", limit=120)
-        headline = self._clean_cap_text(ev.headline or "", limit=280)
-        desc = self._clean_cap_text(getattr(ev, "description", "") or "", limit=800)
-        instr = self._clean_cap_text(getattr(ev, "instruction", "") or "", limit=400)
-        area_desc = (getattr(ev, "area_desc", "") or "").strip()
-
+        """Shim → product_text.build_warning_vtec_action_script()."""
         vtec = self._cap_vtec_list(ev)
         exp_utc = self._best_expiry_from_vtec(vtec)
         exp_phrase = ""
@@ -5257,63 +4946,19 @@ class Orchestrator:
             if raw_exp:
                 exp_phrase = self._fmt_local_from_utc_iso(str(raw_exp))
 
-        lines: list[str] = []
-
-        if vtec_actions & {"CAN"}:
-            lines.append(f"The {event} for the following areas has been cancelled.")
-            if area_desc:
-                lines.append(f"Areas: {area_desc}.")
-            if headline:
-                lines.append(headline if headline.endswith((".", "!", "?")) else headline + ".")
-
-        elif vtec_actions & {"EXP"}:
-            lines.append(f"The {event} for the following areas has been allowed to expire.")
-            if area_desc:
-                lines.append(f"Areas: {area_desc}.")
-
-        elif vtec_actions & {"EXA", "EXB"}:
-            lines.append(f"The {event} has been expanded.")
-            if area_desc:
-                lines.append(f"This now includes: {area_desc}.")
-            if exp_phrase:
-                lines.append(f"This warning remains in effect until {exp_phrase}.")
-            if desc:
-                lines.append(desc)
-            if instr:
-                lines.append(instr)
-
-        elif vtec_actions & {"EXT"}:
-            lines.append(f"The {event} has been extended.")
-            if area_desc:
-                lines.append(f"For the following areas: {area_desc}.")
-            if exp_phrase:
-                lines.append(f"This warning is now in effect until {exp_phrase}.")
-            if desc:
-                lines.append(desc)
-            if instr:
-                lines.append(instr)
-
-        else:  # CON (continuation) and anything else
-            if headline:
-                lines.append(headline if headline.endswith((".", "!", "?")) else headline + ".")
-            elif event:
-                lead = f"A {event} remains in effect"
-                if exp_phrase:
-                    lead += f" until {exp_phrase}"
-                lead += "."
-                lines.append(lead)
-            if area_desc:
-                lines.append(f"For the following areas: {area_desc}.")
-            if desc:
-                lines.append(desc)
-            if instr:
-                lines.append(instr)
-
-        if not lines:
+        result = _build_warning_vtec_action_script_fn(
+            event=getattr(ev, "event", "") or "",
+            headline=getattr(ev, "headline", "") or "",
+            description=str(getattr(ev, "description", "") or ""),
+            instruction=str(getattr(ev, "instruction", "") or ""),
+            area_desc=(getattr(ev, "area_desc", "") or "").strip(),
+            vtec_actions=vtec_actions,
+            exp_phrase=exp_phrase,
+        )
+        # If the free function produced nothing, fall through to the full script.
+        if not result or result.strip() == "End of message.":
             return self._build_cap_full_script(ev)
-
-        lines.append("End of message.")
-        return "\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
+        return result
 
     def _build_watch_vtec_action_script(
         self,
@@ -6137,22 +5782,34 @@ class Orchestrator:
         log.debug("NWWS vtec policy: %s", _nw_policy.reason)
 
         # Keep rebroadcast rotation in sync with VTEC lifecycle.
+        # For partial CAN+CON (e.g. MWS cancelling some zones, continuing others)
+        # only remove the tracks that are genuinely cancelled — not the whole event.
         if self.rebroadcast_enabled and tracks:
             now_local = dt.datetime.now(self.local_tz)
             expires_at = self._rebroadcast_clamp_expiry(now_local, exp_utc)
 
             if vtec_actions & {"CAN", "EXP"}:
-                await self._rebroadcast_remove_by_tracks(
-                    tracks=tracks,
-                    reason=f"nwws:{parsed.product_type}:{','.join(sorted(vtec_actions & {'CAN','EXP'}))}",
-                )
+                # Build the set of track IDs that carry a CAN/EXP action specifically.
+                # CON/EXT tracks in the same product stay in the rotation.
+                cancelled_tracks = [(tid, act) for tid, act in tracks if act in {"CAN", "EXP"}]
+                continuing_tracks = [(tid, act) for tid, act in tracks if act not in {"CAN", "EXP"}]
+                if cancelled_tracks:
+                    await self._rebroadcast_remove_by_tracks(
+                        tracks=cancelled_tracks,
+                        reason=f"nwws:{parsed.product_type}:{','.join(sorted(vtec_actions & {'CAN','EXP'}))}",
+                    )
+                if continuing_tracks:
+                    await self._rebroadcast_touch_expiry_by_tracks(
+                        tracks=continuing_tracks,
+                        expires_at=expires_at,
+                        reason=f"nwws:{parsed.product_type}:CON",
+                    )
             else:
                 await self._rebroadcast_touch_expiry_by_tracks(
                     tracks=tracks,
                     expires_at=expires_at,
                     reason=f"nwws:{parsed.product_type}:{','.join(sorted(vtec_actions))}",
                 )
-
 
 
         # Critical safety gate:
@@ -6231,13 +5888,44 @@ class Orchestrator:
             except Exception:
                 log.exception('NWWS SPS preamble normalization failed; continuing with original script')
 
-            # EXP/CAN short narration: if VTEC says expired/cancel and this is voice-only,
-            # keep NWWS aligned with the CAP advisory/statement/message helper when the
-            # event class is light enough for statement-style narration.
+            # EXP/CAN narration — partial cancel-aware.
+            #
+            # Three cases:
+            #   1. Mixed CAN+CON (partial cancel): parse per-segment and build
+            #      a single voice piece that describes what cancelled AND what
+            #      remains active.  Applies to MWS and similar.
+            #   2. Pure CAN/EXP on warning-class events: use warning-style builder
+            #      (e.g. "The Special Marine Warning has been cancelled for…").
+            #   3. Pure CAN/EXP on advisory/statement/message: use the lighter
+            #      statement-style builder.
             try:
                 if tracks and not should_full:
                     if ('EXP' in vtec_actions) or ('CAN' in vtec_actions):
-                        if self._cap_prefers_statement_update_script(sf_event_label, vtec_actions):
+                        has_continuation = bool(vtec_actions & {"CON", "EXT", "EXA", "EXB"})
+
+                        if has_continuation:
+                            # Partial cancel: some zones cancelled, others active.
+                            segs = _parse_nwws_product_segments(official_text)
+                            partial_script = _build_nwws_partial_cancel_script(sf_event_label, segs)
+                            if partial_script:
+                                spoken.script = partial_script
+                                log.info(
+                                    'NWWS partial cancel script built (act=%s type=%s awips=%s wfo=%s segs=%d)',
+                                    ','.join(sorted(vtec_actions))[:64],
+                                    parsed.product_type,
+                                    parsed.awips_id or '',
+                                    parsed.wfo,
+                                    len(segs),
+                                )
+                            else:
+                                log.warning(
+                                    'NWWS partial cancel: segment parse empty, using raw script (act=%s type=%s)',
+                                    ','.join(sorted(vtec_actions))[:64],
+                                    parsed.product_type,
+                                )
+
+                        elif self._cap_prefers_statement_update_script(sf_event_label, vtec_actions):
+                            # Advisory / statement / message — lighter style.
                             spoken.script = self._build_nwws_statement_vtec_action_script(
                                 event_text=sf_event_label,
                                 area_text=sf_area_text,
@@ -6253,6 +5941,7 @@ class Orchestrator:
                                 parsed.wfo,
                             )
                         else:
+                            # Warning-class full cancel/expiry.
                             summ = self._expiry_summary_script(official_text)
                             if summ:
                                 spoken.script = summ
@@ -6392,13 +6081,61 @@ class Orchestrator:
                 _nw_event_label = sf_event_label
                 _nw_headline = sf_headline
                 if _nw_vtec_actions & {"CAN", "EXP"} and not should_full:
-                    # Cancellation/expiry voice-only: remove from tracker
-                    removed_n = self.alert_tracker.remove_by_vtec_tracks(
-                        _nw_track_ids,  # type: ignore[arg-type]
-                        reason=f"nwws:{parsed.product_type}:{','.join(sorted(_nw_vtec_actions & {'CAN','EXP'}))}",
-                    )
-                    log.info("AlertTracker: removed %d entries for NWWS CAN/EXP type=%s awips=%s",
-                             removed_n, parsed.product_type, parsed.awips_id or "")
+                    # Partial cancel awareness: use the cancel_tracks frozenset from
+                    # toneout_policy() — only tracks with a CAN/EXP action are removed.
+                    # Tracks still active (CON/EXT in the same product) are left in place.
+                    cancel_track_ids: frozenset[str] = _nw_policy.cancel_tracks
+                    continuation_track_ids: frozenset[str] = _nw_policy.continuation_tracks
+
+                    # Fall back to all tracks if vtec.py didn't differentiate
+                    # (e.g. a product with only CAN and no CON).
+                    if not cancel_track_ids and not continuation_track_ids:
+                        cancel_track_ids = frozenset(_nw_track_ids)
+
+                    if cancel_track_ids:
+                        removed_n = self.alert_tracker.remove_by_vtec_tracks(
+                            cancel_track_ids,
+                            reason=f"nwws:{parsed.product_type}:{','.join(sorted(_nw_vtec_actions & {'CAN','EXP'}))}",
+                        )
+                        log.info(
+                            "AlertTracker: removed %d entries for NWWS CAN/EXP type=%s awips=%s tracks=%s",
+                            removed_n,
+                            parsed.product_type,
+                            parsed.awips_id or "",
+                            ",".join(sorted(cancel_track_ids)),
+                        )
+
+                    if continuation_track_ids:
+                        # Some tracks are still active — keep them in the tracker
+                        # with an updated script so the cycle reflects the partial state.
+                        _nw_tid_str = next(iter(continuation_track_ids), None)
+                        _nw_tracker_id = f"NWWS:{_nw_tid_str}" if _nw_tid_str else (
+                            f"NWWS:{parsed.product_type}:{parsed.wfo}:{(parsed.awips_id or '').strip()}")
+                        _nw_issued = sf_issued_dt or dt.datetime.now(dt.timezone.utc)
+                        if _nw_issued.tzinfo is None:
+                            _nw_issued = _nw_issued.replace(tzinfo=dt.timezone.utc)
+                        _ae_nw_con = ActiveAlert(
+                            id=_nw_tracker_id,
+                            source="NWWS",
+                            event=_nw_event_label,
+                            code=_nw_same_code,
+                            vtec=_nw_vtec,
+                            headline=_nw_headline,
+                            script_text=spoken.script,
+                            audio_path=str(out_wav),
+                            expires=_nw_expires_iso,
+                            issued=_nw_issued.isoformat(),
+                            same_locs=_nw_same_locs,
+                            cycle_only=True,
+                        )
+                        self.alert_tracker.add_or_update(_ae_nw_con)
+                        self.alert_tracker.mark_aired(_nw_tracker_id)
+                        log.info(
+                            "AlertTracker: kept continuing NWWS id=%s type=%s (partial cancel) tracks=%s",
+                            _nw_tracker_id,
+                            parsed.product_type,
+                            ",".join(sorted(continuation_track_ids)),
+                        )
                 else:
                     # New issuance, update, or continuation
                     _nw_tid_str = next(iter(_nw_track_ids), None)
@@ -6727,7 +6464,7 @@ class Orchestrator:
 
         try:
             same_codes = [str(x).strip() for x in (same_locations or []) if str(x).strip()]
-            event_text = _sf_eas_event_label_full(event_code)
+            event_text = _same_label_or_code(event_code)
             now_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
             expires_at = now_utc + dt.timedelta(minutes=max(1, int(expires_in_minutes or 30)))
 
