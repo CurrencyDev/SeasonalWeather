@@ -26,6 +26,31 @@ _URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)", re.IGNORECASE)
 _ANGLE_URL_RE = re.compile(r"<(https?://[^>]+)>", re.IGNORECASE)
 
+# Characters that commonly trail a URL in NWS product text but are not part of it.
+_URL_TRAIL_RE = re.compile(r"[.,;:)\]]+$")
+
+def verbalize_url(url: str) -> str:
+    """Convert a URL to a spoken form suitable for TTS / NWR broadcast.
+
+    Examples:
+        http://dcnr.pa.gov/Communities/Wildfire
+            -> "dcnr dot pa dot gov slash communities slash wildfire"
+        www.wvforestry.com
+            -> "www dot wvforestry dot com"
+    """
+    u = re.sub(r"^https?://", "", url, flags=re.IGNORECASE)
+    # Strip trailing punctuation that is not part of the URL (e.g. a sentence-ending period).
+    u = _URL_TRAIL_RE.sub("", u)
+    u = u.replace(".", " dot ")
+    u = u.replace("/", " slash ")
+    u = u.replace("-", " dash ")
+    u = u.replace("_", " ")
+    u = u.replace("=", " equals ")
+    u = u.replace("?", " ")
+    u = u.replace("&", " and ")
+    u = re.sub(r"\s+", " ", u).strip().lower()
+    return u
+
 def _compile_text_override_rx(spec: dict) -> re.Pattern[str]:
     match = str(spec.get("match", "") or "")
     if not match:
@@ -162,8 +187,8 @@ def clean_for_tts(text: str) -> str:
         if _SKIP_LINE_RE.match(line):
             continue
 
-        # Remove URLs that are embedded in a line
-        line = _URL_RE.sub("", line).strip()
+        # Verbalize URLs rather than silently dropping them (mirrors real NWR behaviour).
+        line = _URL_RE.sub(lambda m: " " + verbalize_url(m.group(0)) + " ", line).strip()
 
         # Drop "link" or similar orphan words after URL removal
         if line.lower() in {"link", "links"}:

@@ -240,8 +240,8 @@ _RULES: list[Rule] = [
     Rule(re.compile(r"\bTSTM\b", re.IGNORECASE), _phoneme_x_cmu("TH AH1 N D ER0 S T OW0 R M")),
 
     # Time zone abbreviations that may still appear in headers or time announcements
-    Rule(re.compile(r"\bEST\b"), _sub_alias("Eastern Standard Time")),
-    Rule(re.compile(r"\bEDT\b"), _sub_alias("Eastern Daylight Time")),
+    Rule(re.compile(r"\bEST\b", re.IGNORECASE), _sub_alias("Eastern Standard Time")),
+    Rule(re.compile(r"\bEDT\b", re.IGNORECASE), _sub_alias("Eastern Daylight Time")),
 
     # Aviation categories sometimes appear in AFD/TAF-style text
     Rule(re.compile(r"\bVFR\b"),  _sub_alias("V F R")),

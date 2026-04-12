@@ -15,7 +15,7 @@ from .rwr import (
     ObsPressureCache, parse_rwr, build_rwr_obs_text, build_asos_obs_text,
     asos_to_rwr_station, RwrProduct, build_marine_obs_text,
 )
-from ..tts.tts import clean_for_tts
+from ..tts.tts import clean_for_tts, verbalize_url
 
 
 def _fmt_time(now: dt.datetime) -> str:
@@ -356,7 +356,7 @@ def _scrub_nws_product_text(text: str) -> str:
             continue
 
         if _URL_RE.search(line):
-            line = _URL_RE.sub(" ", line)
+            line = _URL_RE.sub(lambda m: " " + verbalize_url(m.group(0)) + " ", line)
         if _EMAIL_RE.search(line):
             line = _EMAIL_RE.sub(" ", line)
 
