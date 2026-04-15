@@ -3421,6 +3421,59 @@ class Orchestrator:
     def _tests_ern_block_seconds(self) -> int:
         return self.cfg.tests.ern_block_seconds
 
+    @staticmethod
+    def _format_presentation_template(template: str, **ctx: str) -> str:
+        tpl = str(template or "").strip()
+        if not tpl:
+            return ""
+        try:
+            return tpl.format(**ctx).strip()
+        except Exception:
+            return tpl
+
+    async def _local_test_presentation(self, code: str, same_codes: list[str] | None = None) -> tuple[str, str, str]:
+        event_text = _same_label_or_code(code)
+        station_name = str(self.cfg.station.name or "SeasonalWeather").strip() or "SeasonalWeather"
+        service_area_name = str(self.cfg.station.service_area_name or "service area").strip() or "service area"
+        codes = [str(x).strip() for x in (same_codes or []) if str(x).strip()]
+
+        auto_area_text = ""
+        if codes:
+            try:
+                auto_area_text = await self._sf_area_text_from_same_codes(codes)
+            except Exception:
+                auto_area_text = ""
+        auto_area_text = auto_area_text or service_area_name
+
+        pres = self.cfg.tests.presentation
+        fmt_ctx = {
+            "code": str(code or "").strip().upper(),
+            "event": event_text,
+            "station_name": station_name,
+            "service_area_name": service_area_name,
+            "auto_area_text": auto_area_text,
+        }
+        headline = self._format_presentation_template(
+            pres.headline_template,
+            **fmt_ctx,
+        ) or f"{event_text} for the {service_area_name}"
+        area_text = self._format_presentation_template(
+            pres.area_text,
+            **fmt_ctx,
+        ) or auto_area_text
+        discord_area_text = self._format_presentation_template(
+            pres.discord_area_text,
+            **{**fmt_ctx, "area_text": area_text},
+        ) or area_text
+        return headline, area_text, discord_area_text
+
+    def _test_same_codes_for_presentation(self) -> list[str]:
+        try:
+            codes = sorted(getattr(self, "_same_fips_allow_set", None) or [])
+        except Exception:
+            codes = []
+        return [str(x).strip() for x in codes if str(x).strip()]
+
     def _tests_gate(self) -> tuple[bool, str]:
         now = dt.datetime.now(tz=self._tz)
 
@@ -3515,6 +3568,18 @@ class Orchestrator:
             self.telnet.push_alert(str(out_wav), meta=meta)
 
         # --- Station feed note (radio UI: handled-alerts.json) ---
+        local_test_same_codes = self._test_same_codes_for_presentation()
+        test_headline = f"Required {'Weekly' if code == 'RWT' else 'Monthly'} Test"
+        test_area_text = str(self.cfg.station.service_area_name or "SeasonalWeather").strip() or "SeasonalWeather"
+        discord_test_area_text = test_area_text
+        try:
+            test_headline, test_area_text, discord_test_area_text = await self._local_test_presentation(
+                code,
+                local_test_same_codes,
+            )
+        except Exception:
+            pass
+
         try:
             if _sf_enabled() and StationFeedAlert is not None:
                 now_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
@@ -3527,29 +3592,23 @@ class Orchestrator:
                     label = code
 
                 sender = FeedSender(name="SeasonalWeather", kind="origin") if FeedSender else None
-
-                same_codes = []
-                try:
-                    same_codes = sorted(getattr(self, "_same_fips_allow_set", None) or [])
-                except Exception:
-                    same_codes = []
-                same_codes = [str(x) for x in same_codes[:32]]
+                same_codes = [str(x) for x in local_test_same_codes[:32]]
 
                 alert = StationFeedAlert(
                     id=_sf_sha1_12(f"test:{code}:{now_utc.isoformat()}"),
                     event=str(label),
-                    headline=f"{label} (Local origination)",
+                    headline=str(test_headline),
                     severity="Unknown",
                     urgency="Unknown",
-                    certainty="Unknown",
-                    area="SeasonalWeather",
+                    certainty="Observed",
+                    area=str(test_area_text),
                     effective=now_utc.isoformat(),
                     ends=exp_utc.isoformat(),
                     expires=exp_utc.isoformat(),
                     sent=now_utc.isoformat(),
                     sameCodes=same_codes,
                     from_=sender,
-                    links={"mode": "TEST", "wav": str(out_wav)},
+                    links={"mode": "TEST", "wav": str(out_wav), "via": "local-scheduler"},
                 )
                 _sf_emit(alert, expires_at=exp_utc)
         except Exception:
@@ -3563,6 +3622,8 @@ class Orchestrator:
             event=f"Required {'Weekly' if code == 'RWT' else 'Monthly'} Test",
             source="SeasonalWeather (local)",
             mode="full",
+            area=discord_test_area_text,
+            same_codes=local_test_same_codes,
             is_test=True,
         )
 
@@ -5718,14 +5779,8 @@ class Orchestrator:
                 out_wav,
             )
             # _ERN_DL_
-            self.discord.alert_aired(
-                code=code,
-                event=_same_label_or_code(code),
-                source=f"ERN/GWES ({(ev.sender or '').strip() or 'unknown'})",
-                mode="full",
-                is_ern=True,
-            )
             sf_ev = ev
+            area_text = ""
             try:
                 area_text = await self._sf_area_text_from_same_codes(in_area_locs)
                 if area_text:
@@ -5738,7 +5793,16 @@ class Orchestrator:
                         except Exception:
                             sf_ev = ev
             except Exception:
-                pass
+                area_text = ""
+            self.discord.alert_aired(
+                code=code,
+                event=_same_label_or_code(code),
+                source=f"ERN/GWES ({(ev.sender or '').strip() or 'unknown'})",
+                mode="full",
+                area=area_text,
+                same_codes=in_area_locs,
+                is_ern=True,
+            )
             _station_feed_note_ern(sf_ev, same_locations=in_area_locs, out_wav=str(out_wav))
 
     async def _handle_toneout(self, parsed: ParsedProduct) -> None:

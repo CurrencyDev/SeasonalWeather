@@ -263,6 +263,10 @@ tests:
   toneout_cooldown_seconds: 1800  # don't tone again this soon after a test (matches min_heightened_seconds)
   cap_block_seconds: 3600      # block CAP full cut-ins for this long after a test
   ern_block_seconds: 3600      # block ERN relays for this long after a test
+  presentation:
+    headline_template: "{event} for the {service_area_name}"
+    area_text: ""              # blank = resolve SAME coverage names, fallback to service_area_name
+    discord_area_text: ""      # blank = use resolved coverage text in Discord embeds too
   rwt:
     weekday: 3                 # 0=Mon … 6=Sun
     hour: 11
@@ -517,3 +521,19 @@ service_area:
       - { name: "Hardy WV", same_fips: "054031" }
       - { name: "Mineral WV", same_fips: "054057" }
       - { name: "Morgan WV", same_fips: "054065" }
+
+
+# Discord webhook logging / embed presentation
+logs:
+  discord:
+    enabled: false
+    alerts_enabled: true
+    ops_enabled: true
+    api_enabled: true
+    errors_enabled: true
+    rate_limit_per_minute: 20
+    post_tests: true
+    post_voice_only: true
+    cycle_rebuild_log: true
+    alerttracker_lifecycle_log: false
+    icon_cdn_url: ""

@@ -354,6 +354,14 @@ class TestsRmtConfig:
 
 
 @dataclass(frozen=True)
+class TestsPresentationConfig:
+    """Presentation overrides for locally-originated test events."""
+    headline_template: str
+    area_text: str
+    discord_area_text: str
+
+
+@dataclass(frozen=True)
 class TestsConfig:
     enabled: bool
     postpone_minutes: int
@@ -362,6 +370,7 @@ class TestsConfig:
     toneout_cooldown_seconds: int
     cap_block_seconds: int
     ern_block_seconds: int
+    presentation: TestsPresentationConfig
     rwt: TestsScheduleConfig
     rmt: TestsRmtConfig
 
@@ -921,6 +930,7 @@ def load_config(path: str) -> AppConfig:
     tst_raw = raw.get("tests", {})
     rwt_raw = tst_raw.get("rwt", {})
     rmt_raw = tst_raw.get("rmt", {})
+    tst_present_raw = tst_raw.get("presentation", {})
     tests = TestsConfig(
         enabled=bool(tst_raw.get("enabled", False)),
         postpone_minutes=int(tst_raw.get("postpone_minutes", 15)),
@@ -931,6 +941,17 @@ def load_config(path: str) -> AppConfig:
         ),
         cap_block_seconds=int(tst_raw.get("cap_block_seconds", 3600)),
         ern_block_seconds=int(tst_raw.get("ern_block_seconds", 3600)),
+        presentation=TestsPresentationConfig(
+            headline_template=str(
+                tst_present_raw.get(
+                    "headline_template",
+                    "{event} for the {service_area_name}",
+                )
+                or "{event} for the {service_area_name}"
+            ),
+            area_text=str(tst_present_raw.get("area_text", "") or ""),
+            discord_area_text=str(tst_present_raw.get("discord_area_text", "") or ""),
+        ),
         rwt=TestsScheduleConfig(
             weekday=int(rwt_raw.get("weekday", 2)),
             hour=int(rwt_raw.get("hour", 11)),

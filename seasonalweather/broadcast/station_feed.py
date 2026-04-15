@@ -89,7 +89,9 @@ def build_station_feed_payload(
         # hard clamp a few strings to keep payload sane
         d["id"] = _clamp(d.get("id"), 300)
         d["event"] = _clamp(d.get("event"), 120) or "Alert"
-        d["headline"] = _clamp(d.get("headline"), 220)
+        # Keep full headline text for downstream UIs and webhook mirrors.
+        # Truncating here makes relay/test entries look broken or bland.
+        d["headline"] = str(d.get("headline") or "")
         d["severity"] = _clamp(d.get("severity"), 24) or "Unknown"
         d["urgency"] = _clamp(d.get("urgency"), 24) or "Unknown"
         d["certainty"] = _clamp(d.get("certainty"), 24) or "Unknown"

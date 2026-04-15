@@ -247,6 +247,17 @@ def _area_display(area: str) -> str:
     return f"`{joined}`" if joined else "—"
 
 
+def _same_codes_display(same_codes: list[str] | None) -> str:
+    codes = [str(c).strip() for c in (same_codes or []) if str(c).strip()]
+    if not codes:
+        return "—"
+    shown = " · ".join(f"`{c}`" for c in codes[:8])
+    extra = len(codes) - 8
+    if extra > 0:
+        shown += f" · +{extra} more"
+    return shown
+
+
 # ---------------------------------------------------------------------------
 # Token bucket — per webhook URL
 # ---------------------------------------------------------------------------
@@ -486,6 +497,7 @@ class DiscordLogger:
         source: str,
         mode: str,
         area: str = "",
+        same_codes: list[str] | None = None,
         vtec: list[str] | None = None,
         expires: str = "",
         is_test: bool = False,
@@ -522,13 +534,18 @@ class DiscordLogger:
 
         event_str    = (event or code_u).strip()
         mode_display = (
-            "Originated" if is_test
+            "Originated (scheduled test)" if is_test
             else ("FULL + SAME" if not is_voice else "Voice-only")
         )
         if is_ern:
             mode_display += " (ERN relay)"
 
         title = f"{event_str} — {'originated' if is_test else 'aired'}"
+        description = ""
+        if is_test:
+            description = "Routine local test of the SeasonalWeather alert stream."
+        elif is_ern:
+            description = "Relayed from the configured ERN/GWES monitor."
 
         fields: list[dict] = [
             self._field("Source", source, inline=True),
@@ -536,7 +553,9 @@ class DiscordLogger:
             self._field("Code", code_u, inline=True),
         ]
         if area:
-            fields.append(self._field("Area", _area_display(area), inline=False))
+            fields.append(self._field("Coverage" if (is_test or is_ern) else "Area", _area_display(area), inline=False))
+        if same_codes:
+            fields.append(self._field("SAME", _same_codes_display(same_codes), inline=False))
         if expires:
             fields.append(self._field("Expires", expires, inline=True))
         for v in (vtec or [])[:2]:
@@ -551,6 +570,7 @@ class DiscordLogger:
         embed = self._embed(
             color=color,
             title=title,
+            description=description,
             fields=fields,
             footer_text=f"SeasonalWeather · {src_slug} · alerts",
             thumbnail_url=thumb,
