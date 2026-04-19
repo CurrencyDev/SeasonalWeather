@@ -71,11 +71,12 @@ Low-severity CAP alerts can optionally trigger **voice-only interruptions** (no 
 
 ```
 config/
-  config.yaml       — all behaviour configuration (edit this for your deployment)
+  config.yaml       — repo template/example for runtime behaviour
   example.env       — secrets template (copy to /etc/seasonalweather/seasonalweather.env)
-docs/               — design notes, state machine documentation
+docs/               — design notes, state machine documentation, runtime wrapper notes
 liquidsoap/         — Liquidsoap script(s)
 scripts/            — bootstrap + helper scripts
+  wrappers/         — version-controlled runtime wrapper scripts installed into /usr/local/bin
 tools/              — standalone dev/debug utilities
 systemd/            — systemd service unit files
 seasonalweather/    — Python application
@@ -159,32 +160,45 @@ VOICETEXT_PAUL_WINEDEBUG=-all,+seh,+tid,+timestamp
 
 Everything else that was previously in `.env` (SEASONAL_CAP_*, SEASONAL_ERN_*, SEASONAL_TESTS_*, SEASONAL_CYCLE_*, VOICETEXT_PAUL_RETRIES, etc.) is now in `config.yaml`.
 
+For the wrapper install/runtime contract, see `docs/runtime-wrappers.md`.
+
 ---
 
 ## Quick start
 
-### 1) System deps
+### 1) Clone to a staging path
+
+Do **not** clone directly into `/opt/seasonalweather/app`. Clone to any temporary or staging path and run bootstrap from there. The bootstrapper rsyncs the repo into `/opt/seasonalweather/app` automatically.
 
 ```bash
-# Debian/Ubuntu
-sudo apt-get install -y python3 python3-venv ffmpeg icecast2 liquidsoap espeak-ng
+git clone https://git.seasonalnet.org/Seasonal_Currency/SeasonalWeather /tmp/SeasonalWeather
+cd /tmp/SeasonalWeather
 ```
 
-### 2) Bootstrap (installs, creates user, sets up dirs)
+### 2) Bootstrap
 
 ```bash
 sudo bash scripts/00-bootstrap.sh
 ```
 
-### 3) Configure
+Optional backend installs:
 
 ```bash
-# Behaviour — edit for your service area, TTS backend, schedule, etc.
+SEASONAL_DECTALK=1 sudo -E bash scripts/00-bootstrap.sh
+SEASONAL_VOICETEXT_PAUL=1 sudo -E bash scripts/00-bootstrap.sh
+```
+
+### 3) Configure the live files
+
+```bash
+# Behaviour — this is the LIVE config the service reads
 sudo nano /etc/seasonalweather/config.yaml
 
 # Secrets — fill in NWWS_JID, NWWS_PASSWORD, ICECAST_SOURCE_PASSWORD
 sudo nano /etc/seasonalweather/seasonalweather.env
 ```
+
+Do not edit `/opt/seasonalweather/app/config/config.yaml` and expect the running service to change. That file is the repo template/example only.
 
 ### 4) Start
 
