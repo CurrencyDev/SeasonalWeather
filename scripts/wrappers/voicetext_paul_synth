@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CORE="${VOICETEXT_PAUL_CORE:-0}"
+if [[ "${CORE}" == "unlimited" || "${CORE}" == "infinity" ]]; then
+  ulimit -c unlimited || true
+elif [[ "${CORE}" =~ ^[0-9]+$ ]]; then
+  ulimit -c "${CORE}" || true
+else
+  ulimit -c 0 || true
+fi
+if [[ "${VOICETEXT_DEBUG:-0}" == "1" ]]; then
+  echo "[voicetext_paul_synth] core_limit=$(ulimit -c) (VOICETEXT_PAUL_CORE=${CORE})" >&2
+fi
+
+STATE_BASE="${SEASONALWEATHER_DATA_BASE:-/home/seasonalweather-data/var-lib-seasonalweather}"
+ENGINE_ROOT="${VOICETEXT_PAUL_ENGINE_ROOT:-${STATE_BASE}/voices/voicetext_paul/WeatherRadioSuite-LIB}"
+BIN="${VOICETEXT_PAUL_BIN_DIR:-${ENGINE_ROOT}/binary}"
+PREFIX_BASE="${VOICETEXT_PAUL_PREFIX_BASE:-${STATE_BASE}/wineprefixes}"
+PREFIX_NAME="${VOICETEXT_PAUL_PREFIX_NAME:-voicetext_paul_voicetext}"
+PREFIX="${VOICETEXT_PAUL_WINEPREFIX:-${PREFIX_BASE}/${PREFIX_NAME}}"
+TMPD="${VOICETEXT_PAUL_TMPDIR:-${STATE_BASE}/tmp}"
+
+export WINEPREFIX="${PREFIX}"
+unset WINEARCH
+export WINEDEBUG="${VOICETEXT_PAUL_WINEDEBUG:--all}"
+export WINEESYNC="${VOICETEXT_PAUL_WINEESYNC:-0}"
+export WINEFSYNC="${VOICETEXT_PAUL_WINEFSYNC:-0}"
+export WINE_DISABLE_WRITE_WATCH="${VOICETEXT_PAUL_DISABLE_WRITE_WATCH:-1}"
+export TMPDIR="${TMPD}"
+
+uid="$(id -u)"
+if [[ -d "/run/user/${uid}" && -w "/run/user/${uid}" ]]; then
+  export XDG_RUNTIME_DIR="/run/user/${uid}"
+else
+  export XDG_RUNTIME_DIR="${TMPD}/xdg-runtime-${uid}"
+  mkdir -p "${XDG_RUNTIME_DIR}"
+  chmod 700 "${XDG_RUNTIME_DIR}"
+fi
+mkdir -p "${PREFIX}" "${TMPD}"
+
+cd "${BIN}"
+
+exec 9> "${BIN}/.voicetext_paul.flock"
+WAIT_S="${VOICETEXT_PAUL_LOCK_WAIT:-60}"
+flock -w "${WAIT_S}" -x 9
+
+PAUSE_MS="${VOICETEXT_VTML_PARA_PAUSE_MS:-700}"
+DEBUG="${VOICETEXT_DEBUG:-0}"
+
+rm -f input1.txt output.wav
+
+python3 -c '
+import os, re, sys
+pause_ms = int(os.getenv("VOICETEXT_VTML_PARA_PAUSE_MS", "700") or "700")
+
+t = sys.stdin.read()
+t = t.replace("\r\n", "\n").replace("\r", "\n")
+blocks = [b.strip() for b in re.split(r"\n\s*\n+", t) if b.strip()]
+blocks = [" ".join(b.splitlines()).strip() for b in blocks]
+sep = f"<vtml_pause time=\"{pause_ms}\"/>"
+out = sep.join(blocks).strip()
+out = out.replace("\n", " ").replace("\r", " ").strip()
+sys.stdout.write(out + "\n")
+' > input1.txt
+
+if [[ "${DEBUG}" == "1" ]]; then
+  echo "[voicetext_paul_synth] input bytes: $(wc -c < input1.txt)" >&2
+  echo "[voicetext_paul_synth] input preview: $(head -c 240 input1.txt | tr '\n' ' ')" >&2
+fi
+
+set +e
+ENGINE_USED="wine"
+if [[ "${DEBUG}" == "1" ]]; then
+  echo "[voicetext_paul_synth] engine=${ENGINE_USED}" >&2
+fi
+rc1=0
+STAMP="$(date +%Y-%m-%d_%H%M%S)"
+WLOG="${TMPD}/voicetext_paul_wine.${STAMP}.log"
+timeout 25s wine voicetext_paul.exe >"${WLOG}" 2>&1
+rc1=$?
+if [[ ${rc1} -eq 0 ]]; then
+  rm -f "${WLOG}" 2>/dev/null || true
+else
+  echo "[voicetext_paul_synth] wine failed rc=${rc1}; log=${WLOG}" >&2
+  INLOG="${TMPD}/voicetext_paul_input.${STAMP}.txt"
+  cp -a input1.txt "${INLOG}" 2>/dev/null || true
+  echo "[voicetext_paul_synth] saved input=${INLOG}" >&2
+fi
+set -e
+
+if [[ ! -s output.wav ]]; then
+  echo "[voicetext_paul_synth] no output.wav produced (wine rc=${rc1})" >&2
+  exit 1
+fi
+
+size=$(stat -c %s output.wav 2>/dev/null || echo 0)
+if [[ "${size}" -lt 2000 ]]; then
+  echo "[voicetext_paul_synth] output.wav too small (${size} bytes) — synthesis failed" >&2
+  exit 1
+fi
+
+chmod 664 output.wav

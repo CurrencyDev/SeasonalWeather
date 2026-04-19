@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_BASE="${SEASONALWEATHER_DATA_BASE:-/home/seasonalweather-data/var-lib-seasonalweather}"
+ENGINE_DIR="${VOICETEXT_PAUL_BIN_DIR:-${STATE_BASE}/voices/voicetext_paul/WeatherRadioSuite-LIB/binary}"
+LOCK="${ENGINE_DIR}/.voicetext_paul.flock"
+PREFIX_BASE="${VOICETEXT_PAUL_PREFIX_BASE:-${STATE_BASE}/wineprefixes}"
+PREFIX_NAME="${VOICETEXT_PAUL_PREFIX_NAME:-voicetext_paul_voicetext}"
+PREFIX="${VOICETEXT_PAUL_WINEPREFIX:-${PREFIX_BASE}/${PREFIX_NAME}}"
+TMPD="${VOICETEXT_PAUL_TMPDIR:-${STATE_BASE}/tmp}"
+
+export WINEPREFIX="${PREFIX}"
+export WINEDEBUG="${VOICETEXT_PAUL_WINEDEBUG:--all}"
+
+uid="$(id -u)"
+export XDG_RUNTIME_DIR="${TMPD}/xdg-runtime-${uid}"
+mkdir -p "${XDG_RUNTIME_DIR}" || true
+chmod 700 "${XDG_RUNTIME_DIR}" 2>/dev/null || true
+
+exec 9> "${LOCK}"
+WAIT_S="${VOICETEXT_PAUL_LOCK_WAIT:-60}"
+if command -v flock >/dev/null 2>&1; then
+  flock -x -w "${WAIT_S}" 9 || exit 0
+fi
+
+wineserver -k || true

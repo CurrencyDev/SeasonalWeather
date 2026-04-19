@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+OUT=""
+VOICE="${DECTALK_VOICE:-9}"
+RATE="${DECTALK_RATE_WPM:-165}"
+TEXT_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o|--out) OUT="${2:-}"; shift 2 ;;
+    -v|--voice) VOICE="${2:-}"; shift 2 ;;
+    -r|--rate) RATE="${2:-}"; shift 2 ;;
+    --) shift; TEXT_ARGS+=("$@"); break ;;
+    *) TEXT_ARGS+=("$1"); shift ;;
+  esac
+done
+
+if [[ -z "${OUT}" && ${#TEXT_ARGS[@]} -ge 2 ]]; then
+  if [[ "${TEXT_ARGS[0]}" == *.wav ]]; then
+    OUT="${TEXT_ARGS[0]}"
+    TEXT_ARGS=("${TEXT_ARGS[@]:1}")
+  elif [[ "${TEXT_ARGS[-1]}" == *.wav ]]; then
+    OUT="${TEXT_ARGS[-1]}"
+    unset 'TEXT_ARGS[-1]'
+  fi
+fi
+
+if [[ -z "${OUT}" ]]; then
+  echo "ERR: output wav path not provided. Use --out /path/file.wav" >&2
+  exit 2
+fi
+
+TEXT="${TEXT_ARGS[*]:-}"
+if [[ -z "${TEXT}" ]]; then
+  TEXT="$(cat)"
+fi
+
+SAY_BIN="${DECTALK_SAY_BIN:-/opt/dectalk/dectalk/dist/say}"
+if [[ ! -x "${SAY_BIN}" ]]; then
+  SAY_BIN="$(command -v say || true)"
+fi
+if [[ -z "${SAY_BIN}" || ! -x "${SAY_BIN}" ]]; then
+  echo "ERR: DECtalk say binary not found." >&2
+  exit 3
+fi
+
+HELP="$("${SAY_BIN}" --help 2>&1 || true)"
+
+OUTFLAG=""
+if grep -qE '(^|[[:space:]])-fo([[:space:]]|$)' <<<"${HELP}"; then
+  OUTFLAG="-fo"
+elif grep -qE '(^|[[:space:]])-o([[:space:]]|$)' <<<"${HELP}"; then
+  OUTFLAG="-o"
+elif grep -qiE '(^|[[:space:]])--output([[:space:]]|$)' <<<"${HELP}"; then
+  OUTFLAG="--output"
+fi
+if [[ -z "${OUTFLAG}" ]]; then
+  echo "ERR: couldn't detect file-output flag." >&2
+  exit 4
+fi
+
+VOICE_ARGS=()
+if grep -qE '(^|[[:space:]])-v([[:space:]]|$)' <<<"${HELP}"; then
+  VOICE_ARGS=(-v "${VOICE}")
+elif grep -qiE '(^|[[:space:]])--voice([[:space:]]|$)' <<<"${HELP}"; then
+  VOICE_ARGS=(--voice "${VOICE}")
+fi
+
+RATE_ARGS=()
+if grep -qE '(^|[[:space:]])-r([[:space:]]|$)' <<<"${HELP}"; then
+  RATE_ARGS=(-r "${RATE}")
+elif grep -qiE '(^|[[:space:]])--rate([[:space:]]|$)' <<<"${HELP}"; then
+  RATE_ARGS=(--rate "${RATE}")
+fi
+
+/usr/local/bin/dectalk-env "${SAY_BIN}" "${VOICE_ARGS[@]}" "${RATE_ARGS[@]}" "${OUTFLAG}" "${OUT}" "${TEXT}"

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DECTALK_DIST="${DECTALK_DIST:-/opt/dectalk/dectalk/dist}"
+export DECTALK_DIST
+export LD_LIBRARY_PATH="${DECTALK_DIST}/lib:${LD_LIBRARY_PATH:-}"
+export PATH="${DECTALK_DIST}:${PATH}"
+
+exec "$@"

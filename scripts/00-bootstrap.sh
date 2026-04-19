@@ -27,6 +27,20 @@ SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 log()  { echo "[+] $*"; }
 warn() { echo "[!] $*" >&2; }
 
+install_repo_wrapper() {
+  local name="$1"
+  local src="/opt/seasonalweather/app/scripts/wrappers/${name}"
+  local dest="/usr/local/bin/${name}"
+
+  if [[ ! -f "${src}" ]]; then
+    warn "Repo wrapper missing: ${src}"
+    return 1
+  fi
+
+  bash -n "${src}"
+  install -m 755 "${src}" "${dest}"
+}
+
 export DEBIAN_FRONTEND=noninteractive
 
 # -----------------------------------------------------------------------------------------
@@ -183,88 +197,9 @@ if [[ "${SEASONAL_DECTALK:-0}" == "1" ]]; then
     log "DECtalk already built (${DECTALK_SAY} exists)"
   fi
 
-  log "Ensuring DECtalk wrapper scripts exist"
-  if [[ -f "/opt/seasonalweather/app/scripts/dectalk-env" ]]; then
-    install -m 755 /opt/seasonalweather/app/scripts/dectalk-env /usr/local/bin/dectalk-env
-  elif [[ ! -x /usr/local/bin/dectalk-env ]]; then
-    cat > /usr/local/bin/dectalk-env <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-DECTALK_DIST="${DECTALK_DIST:-/opt/dectalk/dectalk/dist}"
-export DECTALK_DIST
-export LD_LIBRARY_PATH="${DECTALK_DIST}/lib:${LD_LIBRARY_PATH:-}"
-export PATH="${DECTALK_DIST}:${PATH}"
-exec "$@"
-EOF
-    chmod 755 /usr/local/bin/dectalk-env
-  fi
-
-  if [[ -f "/opt/seasonalweather/app/scripts/dectalk-text2wav" ]]; then
-    install -m 755 /opt/seasonalweather/app/scripts/dectalk-text2wav /usr/local/bin/dectalk-text2wav
-  elif [[ ! -x /usr/local/bin/dectalk-text2wav ]]; then
-    cat > /usr/local/bin/dectalk-text2wav <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-OUT=""
-VOICE="${DECTALK_VOICE:-9}"
-RATE="${DECTALK_RATE_WPM:-165}"
-TEXT_ARGS=()
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -o|--out) OUT="${2:-}"; shift 2;;
-    -v|--voice) VOICE="${2:-}"; shift 2;;
-    -r|--rate) RATE="${2:-}"; shift 2;;
-    --) shift; TEXT_ARGS+=("$@"); break;;
-    *) TEXT_ARGS+=("$1"); shift;;
-  esac
-done
-
-if [[ -z "${OUT}" && ${#TEXT_ARGS[@]} -ge 2 ]]; then
-  if [[ "${TEXT_ARGS[0]}" == *.wav ]]; then
-    OUT="${TEXT_ARGS[0]}"; TEXT_ARGS=("${TEXT_ARGS[@]:1}")
-  elif [[ "${TEXT_ARGS[-1]}" == *.wav ]]; then
-    OUT="${TEXT_ARGS[-1]}"; unset 'TEXT_ARGS[-1]'
-  fi
-fi
-
-if [[ -z "${OUT}" ]]; then
-  echo "ERR: output wav path not provided. Use --out /path/file.wav" >&2; exit 2
-fi
-
-TEXT="${TEXT_ARGS[*]:-}"
-if [[ -z "${TEXT}" ]]; then TEXT="$(cat)"; fi
-
-SAY_BIN="${DECTALK_SAY_BIN:-/opt/dectalk/dectalk/dist/say}"
-if [[ ! -x "${SAY_BIN}" ]]; then SAY_BIN="$(command -v say || true)"; fi
-if [[ -z "${SAY_BIN}" || ! -x "${SAY_BIN}" ]]; then
-  echo "ERR: DECtalk say binary not found." >&2; exit 3
-fi
-
-HELP="$("${SAY_BIN}" --help 2>&1 || true)"
-
-OUTFLAG=""
-if grep -qE '(^|[[:space:]])-fo([[:space:]]|$)' <<<"${HELP}"; then OUTFLAG="-fo"
-elif grep -qE '(^|[[:space:]])-o([[:space:]]|$)' <<<"${HELP}"; then OUTFLAG="-o"
-elif grep -qiE '(^|[[:space:]])--output([[:space:]]|$)' <<<"${HELP}"; then OUTFLAG="--output"
-fi
-if [[ -z "${OUTFLAG}" ]]; then echo "ERR: couldn't detect file-output flag." >&2; exit 4; fi
-
-VOICE_ARGS=()
-if grep -qE '(^|[[:space:]])-v([[:space:]]|$)' <<<"${HELP}"; then VOICE_ARGS=(-v "${VOICE}")
-elif grep -qiE '(^|[[:space:]])--voice([[:space:]]|$)' <<<"${HELP}"; then VOICE_ARGS=(--voice "${VOICE}")
-fi
-
-RATE_ARGS=()
-if grep -qE '(^|[[:space:]])-r([[:space:]]|$)' <<<"${HELP}"; then RATE_ARGS=(-r "${RATE}")
-elif grep -qiE '(^|[[:space:]])--rate([[:space:]]|$)' <<<"${HELP}"; then RATE_ARGS=(--rate "${RATE}")
-fi
-
-/usr/local/bin/dectalk-env "${SAY_BIN}" "${VOICE_ARGS[@]}" "${RATE_ARGS[@]}" "${OUTFLAG}" "${OUT}" "${TEXT}"
-EOF
-    chmod 755 /usr/local/bin/dectalk-text2wav
-  fi
+  log "Installing DECtalk wrapper scripts from repo"
+  install_repo_wrapper dectalk-env
+  install_repo_wrapper dectalk-text2wav
 else
   log "Skipping DECtalk (set SEASONAL_DECTALK=1 to install)"
 fi
@@ -317,59 +252,22 @@ if [[ "${SEASONAL_VOICETEXT_PAUL:-0}" == "1" ]]; then
     log "VoiceText Paul binary already present — skipping download"
   fi
 
-  # Synth wrapper — called by SeasonalWeather via: sudo -n -u voicetext /usr/local/bin/voicetext_paul_synth
-  # Text arrives on stdin; the exe writes output.wav into its working directory (engine bin dir).
-  if [[ ! -x "${VTP_SYNTH}" ]]; then
-    cat > "${VTP_SYNTH}" <<VTSEOF
-#!/usr/bin/env bash
-# voicetext_paul_synth
-# Run as the voicetext user (via sudo -n -u voicetext).
-# Reads text from stdin. The exe writes output.wav to its working directory.
-set -euo pipefail
-ENGINE_DIR="${VTP_BIN_DIR}"
-EXE="\${ENGINE_DIR}/voicetext_paul.exe"
-if [[ ! -f "\${EXE}" ]]; then
-  echo "voicetext_paul_synth: exe not found at \${EXE}" >&2
-  exit 1
-fi
-export WINEPREFIX="\${HOME}/.wine"
-export WINEDEBUG="-all"
-export DISPLAY=""
-cd "\${ENGINE_DIR}"
-exec wine "\${EXE}"
-VTSEOF
-    chmod 755 "${VTP_SYNTH}"
-  fi
+  log "Installing VoiceText Paul wrapper scripts from repo"
+  install_repo_wrapper voicetext_paul_synth
+  install_repo_wrapper voicetext_paul_wineserver_kill
 
-  if [[ ! -x "${VTP_WSKILL}" ]]; then
-    cat > "${VTP_WSKILL}" <<WSKEOF
-#!/usr/bin/env bash
-# voicetext_paul_wineserver_kill
-# Run as the voicetext user (via sudo -n -u voicetext).
-set -euo pipefail
-export WINEPREFIX="\${HOME}/.wine"
-export WINEDEBUG="-all"
-wineserver -k 2>/dev/null || true
-WSKEOF
-    chmod 755 "${VTP_WSKILL}"
-  fi
-
-  if [[ ! -f "${VTP_SUDOERS}" ]]; then
-    cat > "${VTP_SUDOERS}" <<SUDOEOF
+  cat > "${VTP_SUDOERS}" <<SUDOEOF
 # SeasonalWeather: voicetext_paul backend
 # Allows the seasonalweather service user to invoke the Wine TTS wrappers as the voicetext user.
 seasonalweather ALL=(${VTP_USER}) NOPASSWD: ${VTP_SYNTH}
 seasonalweather ALL=(${VTP_USER}) NOPASSWD: ${VTP_WSKILL}
 SUDOEOF
-    chmod 440 "${VTP_SUDOERS}"
-    if ! visudo -cf "${VTP_SUDOERS}" >/dev/null 2>&1; then
-      warn "sudoers syntax check failed — removing ${VTP_SUDOERS}"
-      rm -f "${VTP_SUDOERS}"
-    else
-      log "sudoers entry installed at ${VTP_SUDOERS}"
-    fi
+  chmod 440 "${VTP_SUDOERS}"
+  if ! visudo -cf "${VTP_SUDOERS}" >/dev/null 2>&1; then
+    warn "sudoers syntax check failed — removing ${VTP_SUDOERS}"
+    rm -f "${VTP_SUDOERS}"
   else
-    log "sudoers entry already exists — not overwriting"
+    log "sudoers entry installed at ${VTP_SUDOERS}"
   fi
 
   log "VoiceText Paul install complete"
