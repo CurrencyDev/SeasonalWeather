@@ -303,13 +303,20 @@ fi
 # -----------------------------------------------------------------------------------------
 # systemd
 # -----------------------------------------------------------------------------------------
+log "Installing preflight helper scripts"
+if [[ -f /opt/seasonalweather/app/scripts/preflight/seasonalweather-preflight.sh ]]; then
+  bash -n /opt/seasonalweather/app/scripts/preflight/seasonalweather-preflight.sh
+  install -m 755 /opt/seasonalweather/app/scripts/preflight/seasonalweather-preflight.sh /usr/local/sbin/seasonalweather-preflight.sh
+fi
+
+
 log "Installing systemd units"
 cp /opt/seasonalweather/app/systemd/seasonalweather.service /etc/systemd/system/seasonalweather.service
 cp /opt/seasonalweather/app/systemd/seasonalweather-liquidsoap.service /etc/systemd/system/seasonalweather-liquidsoap.service
 systemctl daemon-reload
 
 log "Installing helper scripts (if present in repo)"
-for f in seasonalweather-preflight.sh seasonalweather-audio-prune.sh seasonalweather-prune-audio.sh; do
+for f in seasonalweather-audio-prune.sh seasonalweather-prune-audio.sh; do
   if [[ -f "/opt/seasonalweather/app/scripts/${f}" ]]; then
     install -m 755 "/opt/seasonalweather/app/scripts/${f}" "/usr/local/sbin/${f}"
   fi
@@ -319,7 +326,6 @@ for f in seasonalweather-inject; do
     install -m 755 "/opt/seasonalweather/app/scripts/${f}" "/usr/local/bin/${f}"
   fi
 done
-
 # -----------------------------------------------------------------------------------------
 # Permissions
 # -----------------------------------------------------------------------------------------
