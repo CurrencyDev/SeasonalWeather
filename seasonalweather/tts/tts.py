@@ -378,9 +378,10 @@ class TTS:
                         pass
 
             elif self.backend == "dectalk":
-                say_bin = Path("/opt/dectalk/runtime/say")
+                dectalk_dist = Path("/opt/dectalk/dectalk/dist")
+                say_bin = dectalk_dist / "say"
                 if not say_bin.exists():
-                    raise RuntimeError("dectalk backend selected but /opt/dectalk/runtime/say not found")
+                    raise RuntimeError(f"dectalk backend selected but {say_bin} not found")
 
                 dectalk_env = shutil.which("dectalk-env")
                 if not dectalk_env:
