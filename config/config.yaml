@@ -344,7 +344,7 @@ dedupe:
   ttl_seconds: 900              # 15 minutes
 
 tts:
-  backend: "voicetext_paul"  # espeak-ng | piper | festival | dectalk | voicetext_paul
+  backend: "espeak-ng"       # espeak-ng | piper | festival | dectalk | voicetext_paul
   voice: "9"                 # backend voice switcher
   rate_wpm: 165
   volume: 1.0
