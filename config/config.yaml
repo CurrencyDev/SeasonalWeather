@@ -146,6 +146,8 @@ policy:
     - "RHW"  # Radiological Hazard Warning
     - "SPW"  # Shelter in Place Warning
     - "TOE"  # 911 Telephone Outage Emergency
+    # - "FZW"  # Freeze Warning (supported natively; commented out by default)
+    # - "FSW"  # Flash Freeze Warning (supported natively; commented out by default)
     - "RWT"  # Required Weekly Test
 
   # Minimum gap between consecutive tone-outs (prevents "tone spam" when back-to-back products drop)
@@ -174,7 +176,9 @@ cap:
     cooldown_seconds: 180
   voice:
     enabled: true              # voice-only interruption (no SAME/tone/EOM) for low-severity
-    events: ["Special Weather Statement"]
+    events:
+      - "Special Weather Statement"
+      - "Freeze Watch"            # native FZA classification; voice-only by default
     cooldown_seconds: 600
 
 # ERN/JON GWES-ERN Level-3 source monitoring

@@ -110,6 +110,9 @@ _TABLE: dict[str, tuple[str, Urgency]] = {
     "WSA": ("Winter Storm Watch",               "Expected"),
     "BZW": ("Blizzard Warning",                 "Expected"),
     "ISW": ("Ice Storm Warning",                "Expected"),
+    "FZW": ("Freeze Warning",                   "Expected"),
+    "FZA": ("Freeze Watch",                     "Expected"),
+    "FSW": ("Flash Freeze Warning",             "Expected"),
     "WCW": ("Wind Chill Warning",               "Expected"),
     "WCA": ("Wind Chill Watch",                 "Expected"),
     "LEW": ("Lake Effect Snow Warning",         "Expected"),   # some WFOs use LEW

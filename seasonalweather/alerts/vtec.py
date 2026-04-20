@@ -99,6 +99,10 @@ _SIG_LABELS: dict[str, str] = {
 _FULL_ACTIONS: frozenset[str] = frozenset({"NEW", "UPG", "EXA", "EXB"})
 _VOICE_ACTIONS: frozenset[str] = frozenset({"CON", "EXT", "COR", "ROU", "CAN", "EXP"})
 
+# phen.sig pairs that are known/classified but intentionally remain voice-only
+# in SeasonalWeather policy even though their significance is SAME-eligible.
+_VOICE_ONLY_PHEN_SIG: frozenset[str] = frozenset({"FZ.A"})
+
 _ACTION_LABELS: dict[str, str] = {
     "NEW": "New",
     "CON": "Continued",
@@ -136,6 +140,8 @@ _PHEN_SIG_TO_SAME: dict[str, str] = {
     "BZ.W": "BZW",
     # Ice Storm
     "IS.W": "ISW",
+    # Freeze
+    "FZ.W": "FZW",  "FZ.A": "FZA",
     # High Wind
     "HW.W": "HWW",  "HW.A": "HWA",
     # Wind Chill
@@ -482,7 +488,8 @@ def toneout_policy(vtec_strings: list[str]) -> ToneoutPolicy:
              (Continuation updates — still voice-only on air, but track is known.)
 
       4. SAME-eligible significance AND FULL-worthy action (NEW/UPG/EXA/EXB)
-             → FULL, same_code from _PHEN_SIG_TO_SAME, reason="sig=W:action=NEW:full"
+             → FULL, same_code from _PHEN_SIG_TO_SAME, unless a phen.sig is
+               explicitly configured as voice-only in this policy layer
 
     cancel_tracks and continuation_tracks are populated from the full VTEC list
     regardless of what mode is returned, so the Orchestrator can keep AlertTracker
@@ -540,13 +547,19 @@ def toneout_policy(vtec_strings: list[str]) -> ToneoutPolicy:
             primary=primary,
         )
 
-    # Case 4: FULL toneout
+    # Case 4: FULL toneout, unless this phen.sig is intentionally voice-only.
     same_code = primary.same_code
     if same_code is None:
         # Eligible significance but no table entry — shouldn't happen for standard
         # phen codes, but handle gracefully rather than crash.
         return _no_policy(
             f"sig={primary.significance}:action={primary.action}:phen={primary.phenomena}:no-same-table-entry",
+            primary=primary,
+        )
+
+    if primary.phen_sig in _VOICE_ONLY_PHEN_SIG:
+        return _no_policy(
+            f"sig={primary.significance}:action={primary.action}:phen_sig={primary.phen_sig}:policy-voice-only",
             primary=primary,
         )
 
@@ -593,6 +606,16 @@ _TEST_VECTORS: list[tuple[str, str, str | None, str]] = [
         "/O.CON.KLWX.CF.W.0003.260325T1400Z-260325T1800Z/",
         "VOICE", None,
         "CF.W CON — continuation of warning, non-FULL action",
+    ),
+    (
+        "/O.NEW.KLWX.FZ.W.0001.260325T1400Z-260325T1800Z/",
+        "FULL", "FZW",
+        "FZ.W NEW — Freeze Warning, should FULL when policy enables it",
+    ),
+    (
+        "/O.NEW.KLWX.FZ.A.0001.260325T1400Z-260325T1800Z/",
+        "VOICE", None,
+        "FZ.A NEW — Freeze Watch is classified but policy-voice-only",
     ),
     (
         "/O.NEW.KLWX.TO.W.0012.260325T1800Z-260325T2000Z/",

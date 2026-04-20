@@ -47,6 +47,8 @@ Full cut-ins (when enabled) follow:
 
 Low-severity CAP alerts can optionally trigger **voice-only interruptions** (no SAME/tone/EOM) with per-event cooldowns.
 
+Freeze products are supported natively. `FZ.W` maps to SAME `FZW` (**Freeze Warning**), `FZ.A` maps to SAME `FZA` (**Freeze Watch**), and `FSW` (**Flash Freeze Warning**) is recognized as a native event code. The repo default keeps **Freeze Watch** voice-only and leaves **Freeze Warning** / **Flash Freeze Warning** commented out in the tone-out list so operators can opt in deliberately.
+
 ### Dedupe and safety gates
 
 - Cross-source deduplication prevents the same alert from airing twice via NWWS then CAP.
@@ -117,6 +119,7 @@ This is the single source of truth for all runtime behaviour. The file is well-c
 | `observations` | ASOS/AWOS station IDs for current conditions |
 | `nwws` | NWWS-OI server, allowed WFOs, resiliency knobs |
 | `policy` | Product types that trigger tone-out |
+| `cap.voice.events` | Voice-only CAP events; repo default includes `Freeze Watch` (`FZA`) here |
 | `same` | SAME encoding: enabled, sender ID, amplitude |
 | `cap` | CAP polling: enabled, dryrun, poll interval, voice/full thresholds |
 | `ern` | ERN/GWES stream monitoring and relay settings |
