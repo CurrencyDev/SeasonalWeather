@@ -1,0 +1,28 @@
+from seasonalweather.tts.voicetext_paul_vtml import apply_voicetext_paul_vtml
+
+
+def test_nm_expands_across_wrapped_marine_zone_lines() -> None:
+    text = (
+        "Waters from Cape May NJ to Fenwick Island DE from 20 to 60 NM.\n"
+        "Waters from Great Egg Inlet NJ to Cape May NJ from 20 to 60 NM.\n"
+    )
+
+    rendered = apply_voicetext_paul_vtml(text)
+
+    assert rendered.count('alias="nautical miles"') == 2
+
+
+def test_nm_still_expands_in_sentence_context() -> None:
+    text = "At 1241 PM EDT, a severe thunderstorm was located 25 nm southeast of Deepwater Reef."
+
+    rendered = apply_voicetext_paul_vtml(text)
+
+    assert '25 <vtml_sub alias="nautical miles">nm</vtml_sub>' in rendered
+
+
+def test_in_rule_still_avoids_place_name_false_positive() -> None:
+    text = "Interstate 270 in Maryland remains busy."
+
+    rendered = apply_voicetext_paul_vtml(text)
+
+    assert 'inches' not in rendered

@@ -213,19 +213,22 @@ _RULES: list[Rule] = [
 
     # Measurements only when they look like units after a number.
     #
-    # The negative lookahead (?!\s+(?-i:[A-Z])) blocks the rule when the abbreviation
-    # is followed by whitespace and an uppercase letter — i.e. a proper noun, place
-    # name, or state code.  (?-i:[A-Z]) uses an inline flag to disable IGNORECASE for
-    # just that character class so it only matches true uppercase letters.
+    # The negative lookahead (?![ \t]+(?-i:[A-Z])) blocks the rule when the abbreviation
+    # is followed by same-line whitespace and an uppercase letter — i.e. a proper noun,
+    # place name, or state code.  We intentionally restrict this to horizontal
+    # whitespace so a line break after a unit (common in wrapped marine zone text like
+    # "60 NM.\nWaters ...") does not suppress the conversion.  (?-i:[A-Z]) uses an
+    # inline flag to disable IGNORECASE for just that character class so it only
+    # matches true uppercase letters.
     #
     # Without this guard the "in" rule fires on constructions like:
     #   "Interstate 270 in Maryland" → "Interstate 270 inches Maryland"
     # The positive lookahead (?=\s|$|[,:;!?]) is kept as the word-boundary guard so
     # we never match mid-word (e.g. "inches" itself isn't double-converted).
-    Rule(re.compile(r"(\d+(?:\.\d+)?)\s*((?:in)\.?)(?!\s+(?-i:[A-Z]))(?=\s|$|[,:;!?])", re.IGNORECASE), lambda m: f'{m.group(1)} <vtml_sub alias="inches">{m.group(2)}</vtml_sub>'),
-    Rule(re.compile(r"(\d+(?:\.\d+)?)\s*((?:ft)\.?)(?!\s+(?-i:[A-Z]))(?=\s|$|[,:;!?])", re.IGNORECASE), lambda m: f'{m.group(1)} <vtml_sub alias="feet">{m.group(2)}</vtml_sub>'),
-    Rule(re.compile(r"(\d+(?:\.\d+)?)\s*((?:mi)\.?)(?!\s+(?-i:[A-Z]))(?=\s|$|[,:;!?])", re.IGNORECASE), lambda m: f'{m.group(1)} <vtml_sub alias="miles">{m.group(2)}</vtml_sub>'),
-    Rule(re.compile(r"(\d+(?:\.\d+)?)\s*((?:nm)\.?)(?!\s+(?-i:[A-Z]))(?=\s|$|[,:;!?])", re.IGNORECASE), lambda m: f'{m.group(1)} <vtml_sub alias="nautical miles">{m.group(2)}</vtml_sub>'),
+    Rule(re.compile(r"(\d+(?:\.\d+)?)\s*((?:in)\.?)(?![ \t]+(?-i:[A-Z]))(?=\s|$|[,:;!?])", re.IGNORECASE), lambda m: f'{m.group(1)} <vtml_sub alias="inches">{m.group(2)}</vtml_sub>'),
+    Rule(re.compile(r"(\d+(?:\.\d+)?)\s*((?:ft)\.?)(?![ \t]+(?-i:[A-Z]))(?=\s|$|[,:;!?])", re.IGNORECASE), lambda m: f'{m.group(1)} <vtml_sub alias="feet">{m.group(2)}</vtml_sub>'),
+    Rule(re.compile(r"(\d+(?:\.\d+)?)\s*((?:mi)\.?)(?![ \t]+(?-i:[A-Z]))(?=\s|$|[,:;!?])", re.IGNORECASE), lambda m: f'{m.group(1)} <vtml_sub alias="miles">{m.group(2)}</vtml_sub>'),
+    Rule(re.compile(r"(\d+(?:\.\d+)?)\s*((?:nm)\.?)(?![ \t]+(?-i:[A-Z]))(?=\s|$|[,:;!?])", re.IGNORECASE), lambda m: f'{m.group(1)} <vtml_sub alias="nautical miles">{m.group(2)}</vtml_sub>'),
 
     # State abbreviations only when they look like place-name suffixes.
     Rule(_PLACE_STATE_RE, _place_state_repl),
