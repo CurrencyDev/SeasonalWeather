@@ -26,3 +26,11 @@ def test_in_rule_still_avoids_place_name_false_positive() -> None:
     rendered = apply_voicetext_paul_vtml(text)
 
     assert 'inches' not in rendered
+
+
+def test_same_acronym_is_spoken_as_word() -> None:
+    text = "This broadcast also carries SAME for selected locations."
+
+    rendered = apply_voicetext_paul_vtml(text)
+
+    assert '<vtml_sub alias="same">SAME</vtml_sub>' in rendered

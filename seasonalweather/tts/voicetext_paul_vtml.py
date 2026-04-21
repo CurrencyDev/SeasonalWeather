@@ -237,6 +237,7 @@ _RULES: list[Rule] = [
     # NOAA: VoiceText Paul reads it as "N-O-A-A" letters without this rule.
     Rule(re.compile(r"\bNOAA\b"), _sub_alias("noah")),
     Rule(re.compile(r"\bNWS\b"), _sub_alias("National Weather Service")),
+    Rule(re.compile(r"\bSAME\b"), _sub_alias("same")),
     Rule(re.compile(r"\bthunderstorms\b", re.IGNORECASE), _phoneme_x_cmu("TH AH1 N D ER0 S T OW0 R M Z")),
     Rule(re.compile(r"\bthunderstorm\b", re.IGNORECASE), _phoneme_x_cmu("TH AH1 N D ER0 S T OW0 R M")),
     Rule(re.compile(r"\bTSTMS\b", re.IGNORECASE), _phoneme_x_cmu("TH AH1 N D ER0 S T OW0 R M Z")),
