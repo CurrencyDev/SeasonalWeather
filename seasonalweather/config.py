@@ -475,6 +475,27 @@ class DedupeConfig:
 
 
 @dataclass(frozen=True)
+class LogsRuntimeConfig:
+    """Runtime/systemd logging policy knobs."""
+    level: str = "INFO"
+    httpx_level: str = "WARNING"
+    httpcore_level: str = "WARNING"
+    uvicorn_access_level: str = "WARNING"
+    uvicorn_error_level: str = "INFO"
+    asyncio_level: str = "WARNING"
+    slixmpp_level: str = "WARNING"
+    slixmpp_xmlstream_level: str = "WARNING"
+    logger_levels: Dict[str, str] = field(default_factory=dict)
+    cap_poll_summary: bool = False
+    ipaws_poll_summary: bool = False
+    conductor_cycle_push: bool = False
+    conductor_alert_push: bool = False
+    conductor_live_time_push: bool = False
+    segment_refresher_synth: bool = False
+    segment_refresher_alert_lifecycle: bool = False
+
+
+@dataclass(frozen=True)
 class LogsDiscordConfig:
     """Discord webhook logging knobs. URLs come from .env, not config.yaml."""
     enabled: bool = False
@@ -511,6 +532,7 @@ class LogsDiscordConfig:
 
 @dataclass(frozen=True)
 class LogsConfig:
+    runtime: LogsRuntimeConfig = field(default_factory=LogsRuntimeConfig)
     discord: LogsDiscordConfig = field(default_factory=LogsDiscordConfig)
 
 @dataclass(frozen=True)
@@ -1165,8 +1187,31 @@ def load_config(path: str) -> AppConfig:
 
 
     # ------------------------------------------------------------------
-    # logs — Discord webhook URLs (from .env, not config.yaml)
+    # logs — runtime policy from config.yaml; Discord webhook URLs from .env
     # ------------------------------------------------------------------
+    _lr = _get(raw, "logs", "runtime") or {}
+    _logs_runtime = LogsRuntimeConfig(
+        level=str(_get(_lr, "level", default="INFO") or "INFO").strip().upper(),
+        httpx_level=str(_get(_lr, "httpx_level", default="WARNING") or "WARNING").strip().upper(),
+        httpcore_level=str(_get(_lr, "httpcore_level", default="WARNING") or "WARNING").strip().upper(),
+        uvicorn_access_level=str(_get(_lr, "uvicorn_access_level", default="WARNING") or "WARNING").strip().upper(),
+        uvicorn_error_level=str(_get(_lr, "uvicorn_error_level", default="INFO") or "INFO").strip().upper(),
+        asyncio_level=str(_get(_lr, "asyncio_level", default="WARNING") or "WARNING").strip().upper(),
+        slixmpp_level=str(_get(_lr, "slixmpp_level", default="WARNING") or "WARNING").strip().upper(),
+        slixmpp_xmlstream_level=str(_get(_lr, "slixmpp_xmlstream_level", default="WARNING") or "WARNING").strip().upper(),
+        logger_levels={
+            str(k).strip(): str(v).strip().upper()
+            for k, v in (_get(_lr, "logger_levels", default={}) or {}).items()
+            if str(k).strip() and str(v).strip()
+        },
+        cap_poll_summary=bool(_get(_lr, "cap_poll_summary", default=False)),
+        ipaws_poll_summary=bool(_get(_lr, "ipaws_poll_summary", default=False)),
+        conductor_cycle_push=bool(_get(_lr, "conductor_cycle_push", default=False)),
+        conductor_alert_push=bool(_get(_lr, "conductor_alert_push", default=False)),
+        conductor_live_time_push=bool(_get(_lr, "conductor_live_time_push", default=False)),
+        segment_refresher_synth=bool(_get(_lr, "segment_refresher_synth", default=False)),
+        segment_refresher_alert_lifecycle=bool(_get(_lr, "segment_refresher_alert_lifecycle", default=False)),
+    )
     _ld = _get(raw, "logs", "discord") or {}
     _logs_discord = LogsDiscordConfig(
         enabled=bool(_get(_ld, "enabled", default=False)),
@@ -1188,7 +1233,7 @@ def load_config(path: str) -> AppConfig:
         ),
         icon_cdn_url=str(_get(_ld, "icon_cdn_url", default="") or "").strip(),
     )
-    logs = LogsConfig(discord=_logs_discord)
+    logs = LogsConfig(runtime=_logs_runtime, discord=_logs_discord)
 
     return AppConfig(
         station=station,

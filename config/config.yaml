@@ -527,8 +527,26 @@ service_area:
       - { name: "Morgan WV", same_fips: "054065" }
 
 
-# Discord webhook logging / embed presentation
+# Runtime logging / webhook presentation
 logs:
+  runtime:
+    level: "INFO"                 # root logger level for SeasonalWeather itself
+    httpx_level: "WARNING"        # raise to INFO to see every outbound HTTP request again
+    httpcore_level: "WARNING"
+    uvicorn_access_level: "WARNING"
+    uvicorn_error_level: "INFO"
+    asyncio_level: "WARNING"
+    slixmpp_level: "WARNING"
+    slixmpp_xmlstream_level: "WARNING"
+    cap_poll_summary: false        # log CAP poll summaries even when nothing aired
+    ipaws_poll_summary: false      # log IPAWS poll summaries even when nothing aired
+    conductor_cycle_push: false    # log every routine cycle segment push
+    conductor_alert_push: false    # log every repeated alert segment push
+    conductor_live_time_push: false # log every live time segment push
+    segment_refresher_synth: false # log routine segment synthesis / resynthesis
+    segment_refresher_alert_lifecycle: false # log alert segment expiry placeholder churn
+    logger_levels: {}              # optional explicit overrides, e.g. { seasonalweather.cap: "INFO" }
+
   discord:
     enabled: false
     alerts_enabled: true

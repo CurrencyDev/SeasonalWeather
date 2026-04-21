@@ -14,6 +14,8 @@ Agents working in this repository must prefer small, reversible changes that pre
 - When adding a new config key in code, update both:
   - the repo config example/default in `config/config.yaml`
   - the config loader/schema in `seasonalweather/config.py`
+- Runtime logging policy is centralised in `seasonalweather/logging_config.py` and exposed via `logs.runtime` in config.yaml.
+  Prefer adjusting policy there over scattering one-off logger tweaks through feature code.
 - If a change depends on a live config value, call that out explicitly.
 
 ### 2) Preserve operational safety
@@ -60,6 +62,7 @@ Agents working in this repository must prefer small, reversible changes that pre
 - `seasonalweather/main.py` — orchestration, local test origination, alert handling
 - `seasonalweather/config.py` — config loading and defaults
 - `seasonalweather/discord_log.py` — Discord webhook/embed presentation
+- `seasonalweather/logging_config.py` — central runtime/systemd logging policy
 - `seasonalweather/broadcast/station_feed.py` — handled-alerts JSON output
 - `config/config.yaml` — repo example/default config
 - `scripts/wrappers/` — canonical runtime wrapper scripts installed to `/usr/local/bin/` by bootstrap; version-controlled here, do not regenerate inline

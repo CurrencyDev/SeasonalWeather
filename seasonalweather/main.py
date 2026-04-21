@@ -33,6 +33,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from .config import load_config, AppConfig
+from .logging_config import setup_logging
 
 # Module-level config reference — set once at startup before Orchestrator is created.
 _APP_CFG: "AppConfig | None" = None
@@ -1296,12 +1297,8 @@ _EXPIRY_LINE_RE = re.compile(
 # _VTEC_FIND_RE and _VTEC_PARSE_RE are now imported from .alerts.vtec above.
 
 
-def _setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        stream=sys.stdout,
-    )
+def _setup_logging(cfg: AppConfig | None = None) -> None:
+    setup_logging(cfg)
 
 
 # _env_* helpers removed — all configuration now flows through AppConfig.
@@ -6933,12 +6930,12 @@ class Orchestrator:
 
 
 def main(argv: list[str] | None = None) -> int:
-    _setup_logging()
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="/etc/seasonalweather/config.yaml")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
+    _setup_logging(cfg)
     orch = Orchestrator(cfg)
     asyncio.run(orch.run())
     return 0

@@ -19,6 +19,7 @@ log = logging.getLogger("seasonalweather.api")
 
 async def run_api_server(*, config_path: str, host: str, port: int) -> None:
     cfg = load_config(config_path)
+    _setup_logging(cfg)
     orch = Orchestrator(cfg)
     control = OrchestratorControl(orch, config_path=config_path)
     db = bootstrap_database_from_config(cfg) if getattr(cfg.database, "enabled", True) else None
@@ -41,7 +42,6 @@ async def run_api_server(*, config_path: str, host: str, port: int) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    _setup_logging()
     ap = argparse.ArgumentParser(description="Run the SeasonalWeather orchestrator with the localhost control API.")
     ap.add_argument("--config", default="/etc/seasonalweather/config.yaml")
     ap.add_argument("--host", default="127.0.0.1")

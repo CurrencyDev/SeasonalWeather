@@ -86,6 +86,7 @@ seasonalweather/    — Python application
   control.py        — API → Orchestrator bridge
   config.py         — config loader
   discord_log.py    — Discord embed logger
+  logging_config.py — central runtime/systemd logging policy
   liquidsoap_telnet.py
   cli/              — CLI tools (inject)
   same/             — SAME/EAS subsystem (encoder, decoder, event codes, listeners)
@@ -216,6 +217,39 @@ sudo systemctl enable --now seasonalweather
 ```bash
 journalctl -u seasonalweather -f
 ```
+
+### Runtime logging policy
+
+SeasonalWeather now has a central runtime logging policy in `seasonalweather/logging_config.py`, driven by `logs.runtime` in `config.yaml`.
+
+The defaults are intentionally quieter for systemd/journalctl:
+- suppress `httpx` and `httpcore` request lines unless you opt back in
+- suppress routine CAP/IPAWS zero-change poll summaries
+- suppress routine cycle conductor push chatter and segment refresher synthesis chatter
+- keep normal `INFO`/`WARNING`/`ERROR` application logs for real state changes and failures
+
+Example live config snippet:
+
+```yaml
+logs:
+  runtime:
+    level: INFO
+    httpx_level: WARNING
+    httpcore_level: WARNING
+    uvicorn_access_level: WARNING
+    uvicorn_error_level: INFO
+    cap_poll_summary: false
+    ipaws_poll_summary: false
+    conductor_cycle_push: false
+    conductor_alert_push: false
+    conductor_live_time_push: false
+    segment_refresher_synth: false
+    segment_refresher_alert_lifecycle: false
+    logger_levels:
+      seasonalweather.nwws: INFO
+```
+
+Set the per-logger levels back to `INFO` or enable the boolean toggles when you want the firehose during troubleshooting.
 
 ### 6) Listen
 
