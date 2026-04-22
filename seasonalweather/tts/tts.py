@@ -441,7 +441,9 @@ class TTS:
                 )
 
                 # VoiceText Paul via wrapper run as voicetext (or VOICETEXT_PAUL_RUN_AS) (avoids Wine crashes + perms under seasonalweather).
-                engine_dir = Path("/home/seasonalweather-data/var-lib-seasonalweather/voices/voicetext_paul/WeatherRadioSuite-LIB/binary")
+                state_base = Path(os.getenv("SEASONALWEATHER_DATA_BASE", "/var/lib/seasonalweather"))
+                engine_root = Path(os.getenv("VOICETEXT_PAUL_ENGINE_ROOT", str(state_base / "voices/voicetext_paul/WeatherRadioSuite-LIB")))
+                engine_dir = Path(os.getenv("VOICETEXT_PAUL_BIN_DIR", str(engine_root / "binary")))
                 exe = engine_dir / "voicetext_paul.exe"
                 if not exe.exists():
                     raise RuntimeError(f"voicetext_paul backend selected but {exe} not found")

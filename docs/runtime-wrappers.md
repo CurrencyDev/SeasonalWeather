@@ -54,6 +54,11 @@ The synth wrapper is invoked by SeasonalWeather via `sudo -n -u <run_as>` and is
 
 The wineserver-kill wrapper takes the same lock before calling `wineserver -k` so it does not kill Wine mid-synthesis.
 
+Repo-default VoiceText state uses the canonical SeasonalWeather state root under `/var/lib/seasonalweather`.
+Deployments that want alternate storage should redirect `/var/lib/seasonalweather` with a symlink or mount, rather than hardcoding the backing path into repo code or wrapper defaults.
+
+Fresh VoiceText installs also ship a persistent headless display service at `seasonalweather-voicetext-xvfb.service`, and the wrappers default `DISPLAY` to `:99`.
+
 Relevant environment variables:
 
 - `SEASONALWEATHER_DATA_BASE`

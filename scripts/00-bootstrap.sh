@@ -217,11 +217,12 @@ fi
 if [[ "${SEASONAL_VOICETEXT_PAUL:-0}" == "1" ]]; then
   log "Installing VoiceText Paul backend"
 
-  apt-get install -y --no-install-recommends wine wine64 unzip
+  apt-get install -y --no-install-recommends wine wine64 unzip xvfb
 
   VTP_USER="voicetext"
   VTP_HOME="/home/${VTP_USER}"
-  VTP_BASE="/home/seasonalweather-data/var-lib-seasonalweather/voices/voicetext_paul"
+  VTP_STATE_BASE="${SEASONALWEATHER_DATA_BASE:-/var/lib/seasonalweather}"
+  VTP_BASE="${VTP_STATE_BASE}/voices/voicetext_paul"
   VTP_ENGINE_DIR="${VTP_BASE}/WeatherRadioSuite-LIB"
   VTP_BIN_DIR="${VTP_ENGINE_DIR}/binary"
   VTP_EXE="${VTP_BIN_DIR}/voicetext_paul.exe"
@@ -235,10 +236,15 @@ if [[ "${SEASONAL_VOICETEXT_PAUL:-0}" == "1" ]]; then
   fi
   install -d -o "${VTP_USER}" -g "${VTP_USER}" "${VTP_HOME}"
 
-  install -d -o root          -g root          "$(dirname "${VTP_BASE}")"
-  install -d -o root          -g root          "${VTP_BASE}"
-  install -d -o "${VTP_USER}" -g "${VTP_USER}" "${VTP_ENGINE_DIR}"
-  install -d -o "${VTP_USER}" -g "${VTP_USER}" "${VTP_BIN_DIR}"
+  install -d -o seasonalweather -g seasonalweather "${VTP_STATE_BASE}"
+  install -d -o seasonalweather -g seasonalweather "${VTP_STATE_BASE}/audio"
+  install -d -o seasonalweather -g seasonalweather "${VTP_STATE_BASE}/cache"
+  install -d -o seasonalweather -g seasonalweather "${VTP_STATE_BASE}/voices"
+  install -d -o "${VTP_USER}"    -g "${VTP_USER}"    "${VTP_BASE}"
+  install -d -o "${VTP_USER}"    -g "${VTP_USER}"    "${VTP_STATE_BASE}/wineprefixes"
+  install -d -m 700 -o "${VTP_USER}" -g "${VTP_USER}" "${VTP_STATE_BASE}/tmp"
+  install -d -o "${VTP_USER}"    -g "${VTP_USER}"    "${VTP_ENGINE_DIR}"
+  install -d -o "${VTP_USER}"    -g "${VTP_USER}"    "${VTP_BIN_DIR}"
 
   if [[ ! -f "${VTP_EXE}" ]]; then
     log "Downloading WeatherRadioSuite-LIB.zip"
@@ -313,7 +319,15 @@ fi
 log "Installing systemd units"
 cp /opt/seasonalweather/app/systemd/seasonalweather.service /etc/systemd/system/seasonalweather.service
 cp /opt/seasonalweather/app/systemd/seasonalweather-liquidsoap.service /etc/systemd/system/seasonalweather-liquidsoap.service
+if [[ -f /opt/seasonalweather/app/systemd/seasonalweather-voicetext-xvfb.service ]]; then
+  cp /opt/seasonalweather/app/systemd/seasonalweather-voicetext-xvfb.service /etc/systemd/system/seasonalweather-voicetext-xvfb.service
+fi
 systemctl daemon-reload
+
+if [[ "${SEASONAL_VOICETEXT_PAUL:-0}" == "1" && -f /etc/systemd/system/seasonalweather-voicetext-xvfb.service ]]; then
+  log "Enabling seasonalweather-voicetext-xvfb service"
+  systemctl enable --now seasonalweather-voicetext-xvfb.service
+fi
 
 log "Installing helper scripts (if present in repo)"
 for f in seasonalweather-audio-prune.sh seasonalweather-prune-audio.sh; do
@@ -330,7 +344,7 @@ done
 # Permissions
 # -----------------------------------------------------------------------------------------
 log "Permissions"
-chown -R seasonalweather:seasonalweather /var/lib/seasonalweather /var/log/seasonalweather
+chown seasonalweather:seasonalweather /var/lib/seasonalweather /var/lib/seasonalweather/audio /var/lib/seasonalweather/cache /var/log/seasonalweather
 chmod 755 /var/lib/seasonalweather /var/lib/seasonalweather/audio /var/lib/seasonalweather/cache /var/log/seasonalweather
 
 echo

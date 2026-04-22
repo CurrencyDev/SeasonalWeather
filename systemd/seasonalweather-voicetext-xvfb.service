@@ -1,0 +1,17 @@
+[Unit]
+Description=SeasonalWeather VoiceText Paul headless X display
+After=network.target
+
+[Service]
+Type=simple
+User=voicetext
+Group=voicetext
+WorkingDirectory=/home/voicetext
+Environment=DISPLAY=:99
+ExecStart=/usr/bin/Xvfb :99 -screen 0 1024x768x24 -nolisten tcp -noreset
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

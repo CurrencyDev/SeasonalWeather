@@ -13,7 +13,7 @@ if [[ "${VOICETEXT_DEBUG:-0}" == "1" ]]; then
   echo "[voicetext_paul_synth] core_limit=$(ulimit -c) (VOICETEXT_PAUL_CORE=${CORE})" >&2
 fi
 
-STATE_BASE="${SEASONALWEATHER_DATA_BASE:-/home/seasonalweather-data/var-lib-seasonalweather}"
+STATE_BASE="${SEASONALWEATHER_DATA_BASE:-/var/lib/seasonalweather}"
 ENGINE_ROOT="${VOICETEXT_PAUL_ENGINE_ROOT:-${STATE_BASE}/voices/voicetext_paul/WeatherRadioSuite-LIB}"
 BIN="${VOICETEXT_PAUL_BIN_DIR:-${ENGINE_ROOT}/binary}"
 PREFIX_BASE="${VOICETEXT_PAUL_PREFIX_BASE:-${STATE_BASE}/wineprefixes}"
@@ -28,6 +28,7 @@ export WINEESYNC="${VOICETEXT_PAUL_WINEESYNC:-0}"
 export WINEFSYNC="${VOICETEXT_PAUL_WINEFSYNC:-0}"
 export WINE_DISABLE_WRITE_WATCH="${VOICETEXT_PAUL_DISABLE_WRITE_WATCH:-1}"
 export TMPDIR="${TMPD}"
+export DISPLAY="${VOICETEXT_PAUL_DISPLAY:-:99}"
 
 uid="$(id -u)"
 if [[ -d "/run/user/${uid}" && -w "/run/user/${uid}" ]]; then

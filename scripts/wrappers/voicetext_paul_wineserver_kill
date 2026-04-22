@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STATE_BASE="${SEASONALWEATHER_DATA_BASE:-/home/seasonalweather-data/var-lib-seasonalweather}"
+STATE_BASE="${SEASONALWEATHER_DATA_BASE:-/var/lib/seasonalweather}"
 ENGINE_DIR="${VOICETEXT_PAUL_BIN_DIR:-${STATE_BASE}/voices/voicetext_paul/WeatherRadioSuite-LIB/binary}"
 LOCK="${ENGINE_DIR}/.voicetext_paul.flock"
 PREFIX_BASE="${VOICETEXT_PAUL_PREFIX_BASE:-${STATE_BASE}/wineprefixes}"
@@ -11,6 +11,7 @@ TMPD="${VOICETEXT_PAUL_TMPDIR:-${STATE_BASE}/tmp}"
 
 export WINEPREFIX="${PREFIX}"
 export WINEDEBUG="${VOICETEXT_PAUL_WINEDEBUG:--all}"
+export DISPLAY="${VOICETEXT_PAUL_DISPLAY:-:99}"
 
 uid="$(id -u)"
 export XDG_RUNTIME_DIR="${TMPD}/xdg-runtime-${uid}"
