@@ -316,6 +316,136 @@ def _sf_vtec_tracks(vtec_list) -> list[tuple[str, str]]:
     return out
 
 
+def _sf_nws_alert_url(alert_ref) -> str | None:
+    s = str(alert_ref or "").strip()
+    if not s:
+        return None
+    if s.startswith(("https://", "http://")):
+        return s
+    return f"https://api.weather.gov/alerts/{s}"
+
+
+def _sf_is_vtec_track_id(value) -> bool:
+    s = str(value or "").strip().upper()
+    if not s:
+        return False
+    return bool(re.fullmatch(r"[A-Z]{4}\.[A-Z]{2}\.[A-Z]\.[0-9]{4}", s))
+
+
+def _sf_bad_nws_alert_link_track(value) -> str | None:
+    s = str(value or "").strip()
+    if not s:
+        return None
+    prefix = "https://api.weather.gov/alerts/"
+    if not s.startswith(prefix):
+        return None
+    target = s[len(prefix):].strip()
+    return target if _sf_is_vtec_track_id(target) else None
+
+
+def _sf_active_alerts_for_link_repair() -> list[dict]:
+    try:
+        import requests  # type: ignore
+        r = requests.get(
+            "https://api.weather.gov/alerts/active",
+            headers={"User-Agent": "(seasonalnet.org, info@seasonalnet.org)"},
+            timeout=10,
+        )
+        if not r.ok:
+            return []
+        feats = (r.json() or {}).get("features") or []
+        return [f for f in feats if isinstance(f, dict)]
+    except Exception:
+        return []
+
+
+def _sf_repair_restored_links(alert_id, item, links, *, active_features=None):
+    out = dict(links or {})
+    bad_track = _sf_bad_nws_alert_link_track(out.get("nws"))
+    if not bad_track:
+        return out
+
+    track_ids = _sf_vtec_track_ids(out.get("vtec") or [])
+    if not track_ids and _sf_is_vtec_track_id(alert_id):
+        track_ids = [str(alert_id).strip()]
+    if bad_track not in track_ids:
+        track_ids.insert(0, bad_track)
+
+    candidates = []
+    for feat in (active_features or []):
+        try:
+            props = feat.get("properties") if isinstance(feat, dict) else None
+            if not isinstance(props, dict):
+                continue
+            params = props.get("parameters") if isinstance(props.get("parameters"), dict) else {}
+            raw_vtec = params.get("VTEC") if isinstance(params, dict) else []
+            feat_tracks = _sf_vtec_track_ids(raw_vtec or [])
+            if not feat_tracks or not any(t in feat_tracks for t in track_ids):
+                continue
+
+            score = 0
+            if bad_track in feat_tracks:
+                score += 100
+
+            feat_event = str(props.get("event") or "")
+            item_event = str(item.get("event") or "")
+            if feat_event and item_event and feat_event == item_event:
+                score += 20
+
+            feat_sent = _sf_iso(props.get("sent"))
+            item_sent = _sf_iso(item.get("sent"))
+            if feat_sent and item_sent and feat_sent == item_sent:
+                score += 15
+
+            feat_effective = _sf_iso(props.get("effective"))
+            item_effective = _sf_iso(item.get("effective"))
+            if feat_effective and item_effective and feat_effective == item_effective:
+                score += 10
+
+            feat_ends = _sf_iso(props.get("ends") or props.get("eventEndingTime"))
+            item_ends = _sf_iso(item.get("ends"))
+            if feat_ends and item_ends and feat_ends == item_ends:
+                score += 10
+
+            feat_area = str(props.get("areaDesc") or "")
+            item_area = str(item.get("area") or "")
+            if feat_area and item_area and feat_area == item_area:
+                score += 10
+
+            feat_same = {str(x).strip() for x in (((props.get("geocode") or {}).get("SAME") or []) if isinstance(props.get("geocode"), dict) else []) if str(x).strip()}
+            item_same = {str(x).strip() for x in (item.get("sameCodes") or []) if str(x).strip()}
+            if feat_same and item_same:
+                if feat_same == item_same:
+                    score += 20
+                elif feat_same & item_same:
+                    score += 5
+
+            url = _sf_nws_alert_url(props.get("id") or props.get("@id") or feat.get("id"))
+            if not url:
+                continue
+            candidates.append((score, url))
+        except Exception:
+            continue
+
+    if not candidates:
+        return out
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_url = candidates[0]
+    if best_score <= 0:
+        return out
+    tied = {url for score, url in candidates if score == best_score}
+    if len(tied) != 1:
+        return out
+
+    out["nws"] = best_url
+    try:
+        log.info("Station feed: repaired restored NWS link id=%s track=%s url=%s", alert_id, bad_track, best_url)
+    except Exception:
+        pass
+    return out
+
+
 def _sf_eas_article(word: str) -> str:
     w = (word or "").strip()
     return "an" if (w[:1].lower() in "aeiou") else "a"
@@ -890,6 +1020,11 @@ def _sf_seed_memory_from_payload_file() -> int:
 
     now_ts = time.time()
     restored = 0
+    needs_link_repair = any(
+        isinstance(item, dict) and _sf_bad_nws_alert_link_track(((item.get("links") or {}).get("nws")))
+        for item in alerts
+    )
+    active_features = _sf_active_alerts_for_link_repair() if needs_link_repair else []
 
     for item in alerts:
         if not isinstance(item, dict):
@@ -919,8 +1054,16 @@ def _sf_seed_memory_from_payload_file() -> int:
                     kind=str((sender_raw.get("kind") if isinstance(sender_raw, dict) else "") or "unknown"),
                 )
 
+            restored_id = str(item.get("id") or _sf_sha1_12(json.dumps(item, sort_keys=True)))
+            restored_links = _sf_repair_restored_links(
+                restored_id,
+                item,
+                item.get("links") or {},
+                active_features=active_features,
+            )
+
             alert = StationFeedAlert(
-                id=str(item.get("id") or _sf_sha1_12(json.dumps(item, sort_keys=True))),
+                id=restored_id,
                 event=str(item.get("event") or "Alert"),
                 headline=str(item.get("headline") or item.get("event") or "Alert"),
                 severity=str(item.get("severity") or "Unknown"),
@@ -933,7 +1076,7 @@ def _sf_seed_memory_from_payload_file() -> int:
                 sent=_sf_iso(item.get("sent")),
                 sameCodes=[str(x) for x in (item.get("sameCodes") or [])],
                 from_=sender,
-                links=dict(item.get("links") or {}),
+                links=restored_links,
             )
             _STATION_FEED_STATE[str(alert.id)] = (alert, float(exp_ts))
             restored += 1
@@ -955,7 +1098,9 @@ def _station_feed_note_cap(ev, *, mode: str, same_locations, out_wav: str, same_
             _sf_remove_by_vtec_tracks(vtec_tracks)
             _sf_remove_ids(_sf_cap_reference_ids(ev) + [getattr(ev, "alert_id", None)])
             return
-        alert_id = (vtec_tracks[0] if vtec_tracks else None) or getattr(ev, "alert_id", None) or getattr(ev, "id", None) or _sf_sha1_12(str(ev))
+        cap_alert_ref = getattr(ev, "alert_id", None) or getattr(ev, "id", None)
+        alert_id = (vtec_tracks[0] if vtec_tracks else None) or cap_alert_ref or _sf_sha1_12(str(ev))
+        nws_alert_url = _sf_nws_alert_url(cap_alert_ref)
         event = getattr(ev, "event", None) or "Alert"
         headline = getattr(ev, "headline", None) or event
         severity = getattr(ev, "severity", None) or "Unknown"
@@ -1018,12 +1163,11 @@ def _station_feed_note_cap(ev, *, mode: str, same_locations, out_wav: str, same_
             effective_raw = effective_raw or sent_raw  # best-effort
 
         # Optional: backfill from NWS alert detail endpoint (handles urn:oid IDs)
-        if (_APP_CFG.station_feed.fetch_nws if _APP_CFG else False) and isinstance(alert_id, str) and alert_id.strip():
+        if (_APP_CFG.station_feed.fetch_nws if _APP_CFG else False) and nws_alert_url:
             try:
                 import requests  # type: ignore
-                url = f"https://api.weather.gov/alerts/{alert_id}"
                 r = requests.get(
-                    url,
+                    nws_alert_url,
                     headers={"User-Agent": "(seasonalnet.org, info@seasonalnet.org)"},
                     timeout=8,
                 )
@@ -1072,8 +1216,8 @@ def _station_feed_note_cap(ev, *, mode: str, same_locations, out_wav: str, same_
         sender = FeedSender(name=sender_name, kind="origin") if FeedSender else None
 
         links = {"mode": mode, "wav": out_wav}
-        if isinstance(alert_id, str) and alert_id.strip():
-            links["nws"] = f"https://api.weather.gov/alerts/{alert_id}"
+        if nws_alert_url:
+            links["nws"] = nws_alert_url
         if same_code:
             links["same"] = f"same:{same_code}"
         if vtec:
@@ -1121,7 +1265,7 @@ def _station_feed_note_ern(ev, *, same_locations, out_wav: str) -> None:
         if parsed:
             code = str(parsed.get("event_code") or "").upper()
             if (not event_text) or (event_text.upper() == code):
-                event_text = _SF_EAS_EVENT_LABELS.get(code, code or "EAS Alert")
+                event_text = _same_label_or_code(code)
         if not event_text:
             event_text = "EAS Alert"
 
