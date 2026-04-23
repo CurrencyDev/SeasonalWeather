@@ -101,7 +101,17 @@ _VOICE_ACTIONS: frozenset[str] = frozenset({"CON", "EXT", "COR", "ROU", "CAN", "
 
 # phen.sig pairs that are known/classified but intentionally remain voice-only
 # in SeasonalWeather policy even though their significance is SAME-eligible.
-_VOICE_ONLY_PHEN_SIG: frozenset[str] = frozenset({"FZ.A"})
+_VOICE_ONLY_PHEN_SIG: frozenset[str] = frozenset({
+    "FZ.A",
+    "XH.W", "XH.A",
+    "EC.W", "EC.A",
+    "CW.Y",
+    "SP.S",
+    # legacy aliases kept recognized, but not SAME-mapped
+    "EH.W", "EH.A",
+    "HZ.W", "HZ.A",
+    "WC.W", "WC.A", "WC.Y",
+})
 
 _ACTION_LABELS: dict[str, str] = {
     "NEW": "New",
@@ -120,7 +130,7 @@ _ACTION_LABELS: dict[str, str] = {
 # phen.sig → SAME event code
 #
 # This is the authoritative table. Advisory (Y), Statement (S), etc. are
-# deliberately absent — they have no SAME code and are always voice-only.
+# deliberately absent — they have no SAME code and are always voice-only (with one tiny exception).
 # "If it's not in this table, there is no SAME code for it."
 # ---------------------------------------------------------------------------
 _PHEN_SIG_TO_SAME: dict[str, str] = {
@@ -132,7 +142,7 @@ _PHEN_SIG_TO_SAME: dict[str, str] = {
     "SV.W": "SVR",  "SV.A": "SVA",
     # Flash Flood
     "FF.W": "FFW",  "FF.A": "FFA",
-    # Flood (riverine)
+    # Flood (riverine, areal)
     "FL.W": "FLW",  "FL.A": "FLA",
     # Winter Storm
     "WS.W": "WSW",  "WS.A": "WSA",
@@ -141,11 +151,9 @@ _PHEN_SIG_TO_SAME: dict[str, str] = {
     # Ice Storm
     "IS.W": "ISW",
     # Freeze
-    "FZ.W": "FZW",  "FZ.A": "FZA",
+    "FZ.W": "FZW",
     # High Wind
     "HW.W": "HWW",  "HW.A": "HWA",
-    # Wind Chill
-    "WC.W": "WCW",  "WC.A": "WCA",
     # Extreme Wind
     "EW.W": "EWW",
     # Hurricane
@@ -168,8 +176,6 @@ _PHEN_SIG_TO_SAME: dict[str, str] = {
     "FW.W": "FRW",
     # Snow Squall
     "SQ.W": "SQW",
-    # Hazardous Materials
-    "HZ.W": "HMW",
     # Civil Danger
     "CD.W": "CDW",
     # Nuclear Power Plant
@@ -182,6 +188,8 @@ _PHEN_SIG_TO_SAME: dict[str, str] = {
     "RH.W": "RHW",
     # Special Marine Warning (action-based, marine-only)
     "MA.W": "SMW",
+    # Special Weather Statement (valid code, voice-only by default)
+    "SP.S": "SPS",
 }
 
 
@@ -248,13 +256,16 @@ _PHEN_SIG_TO_LABEL: dict[str, str] = {
     "WI.Y": "Wind Advisory",
     "LW.Y": "Lake Wind Advisory",
     # Heat / Cold
-    "EH.W": "Excessive Heat Warning",      "EH.A": "Excessive Heat Watch",
+    "XH.W": "Extreme Heat Warning",        "XH.A": "Extreme Heat Watch",
     "HT.Y": "Heat Advisory",
-    "HZ.W": "Hard Freeze Warning",         "HZ.A": "Hard Freeze Watch",
     "FZ.W": "Freeze Warning",              "FZ.A": "Freeze Watch",
     "FR.Y": "Frost Advisory",
-    "WC.W": "Wind Chill Warning",          "WC.A": "Wind Chill Watch",        "WC.Y": "Wind Chill Advisory",
     "EC.W": "Extreme Cold Warning",        "EC.A": "Extreme Cold Watch",
+    "CW.Y": "Cold Weather Advisory",
+    # Legacy pre-HazSimp aliases retained for stale/archive inputs.
+    "EH.W": "Excessive Heat Warning",      "EH.A": "Excessive Heat Watch",
+    "HZ.W": "Hard Freeze Warning",         "HZ.A": "Hard Freeze Watch",
+    "WC.W": "Wind Chill Warning",          "WC.A": "Wind Chill Watch",        "WC.Y": "Wind Chill Advisory",
     # Fire
     "FW.W": "Red Flag Warning",            "FW.A": "Fire Weather Watch",
     # Fog / Smoke / Dust
@@ -273,6 +284,8 @@ _PHEN_SIG_TO_LABEL: dict[str, str] = {
     "NU.W": "Nuclear Power Plant Warning",
     "SP.W": "Shelter in Place Warning",
     "RH.W": "Radiological Hazard Warning",
+    # Meteorological
+    "SP.S": "Special Weather Statement",
 }
 
 
@@ -616,6 +629,46 @@ _TEST_VECTORS: list[tuple[str, str, str | None, str]] = [
         "/O.NEW.KLWX.FZ.A.0001.260325T1400Z-260325T1800Z/",
         "VOICE", None,
         "FZ.A NEW — Freeze Watch is classified but policy-voice-only",
+    ),
+    (
+        "/O.NEW.KLWX.XH.W.0001.260325T1400Z-260325T1800Z/",
+        "VOICE", None,
+        "XH.W NEW — Extreme Heat Warning, should VOICE",
+    ),
+    (
+        "/O.NEW.KLWX.XH.A.0001.260325T1400Z-260325T1800Z/",
+        "VOICE", None,
+        "XH.A NEW — Extreme Heat Watch, should VOICE",
+    ),
+    (
+        "/O.NEW.KLWX.EC.W.0001.260325T1400Z-260325T1800Z/",
+        "VOICE", None,
+        "EC.W NEW — Extreme Cold Warning, should VOICE",
+    ),
+    (
+        "/O.NEW.KLWX.EC.A.0001.260325T1400Z-260325T1800Z/",
+        "VOICE", None,
+        "EC.A NEW — Extreme Cold Watch, should VOICE",
+    ),
+    (
+        "/O.NEW.KLWX.CW.Y.0001.260325T1400Z-260325T1800Z/",
+        "VOICE", None,
+        "CW.Y NEW — Cold Weather Advisory remains voice-only",
+    ),
+    (
+        "/O.NEW.KLWX.EH.W.0001.260325T1400Z-260325T1800Z/",
+        "VOICE", None,
+        "EH.W NEW — legacy Excessive Heat Warning alias, should still VOICE",
+    ),
+    (
+        "/O.NEW.KLWX.HZ.A.0001.260325T1400Z-260325T1800Z/",
+        "VOICE", None,
+        "HZ.A NEW — legacy Hard Freeze Watch alias, should remain policy-voice-only",
+    ),
+    (
+        "/O.NEW.KLWX.WC.W.0001.260325T1400Z-260325T1800Z/",
+        "VOICE", None,
+        "WC.W NEW — legacy Wind Chill Warning alias, should map to Extreme Cold",
     ),
     (
         "/O.NEW.KLWX.TO.W.0012.260325T1800Z-260325T2000Z/",
