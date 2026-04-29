@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,10 +67,29 @@ def _cfg_samedec_args() -> tuple[str, float, float]:
 
 
 def _normalize_decoder_backend(value: str) -> str:
-    raw = str(value or "samedec").strip().lower().replace("-", "_")
+    raw = str(value or "auto").strip().lower().replace("-", "_")
+    if raw in {"auto", "default"}:
+        return "auto"
     if raw in {"native", "python", "legacy", "internal"}:
         return "native"
     return "samedec"
+
+
+def _samedec_available(bin_path: str) -> bool:
+    candidate = str(bin_path or "").strip()
+    if not candidate:
+        return False
+    if "/" not in candidate:
+        return shutil.which(candidate) is not None
+    path = Path(candidate)
+    return path.exists() and os.access(path, os.X_OK)
+
+
+def _resolve_decoder_backend(value: str, samedec_bin: str) -> str:
+    backend = _normalize_decoder_backend(value)
+    if backend == "auto":
+        return "samedec" if _samedec_available(samedec_bin) else "native"
+    return backend
 
 
 def _same_listen_module_cmd(
@@ -84,7 +104,7 @@ def _same_listen_module_cmd(
     samedec_confidence: float,
     samedec_start_delay_s: float,
 ) -> list[str]:
-    backend = _normalize_decoder_backend(decoder_backend)
+    backend = _resolve_decoder_backend(decoder_backend, samedec_bin)
     module = "seasonalweather.same.listen_samedec" if backend == "samedec" else "seasonalweather.same.listen"
 
     cmd = [
@@ -140,7 +160,7 @@ class ErnGwesMonitor:
         tail_seconds: float = 10.0,
         confidence_min: float = 0.25,
         name: str = "ERN/JON",
-        decoder_backend: str = "samedec",
+        decoder_backend: str = "auto",
     ) -> None:
         self.out_queue = out_queue
         self.same_fips_allow = set(str(x).strip() for x in (same_fips_allow or []) if str(x).strip())
@@ -213,6 +233,12 @@ class ErnGwesMonitor:
         env["PYTHONPATH"] = str(root)
 
         samedec_bin, samedec_confidence, samedec_start_delay_s = _cfg_samedec_args()
+        active_decoder_backend = _resolve_decoder_backend(self.decoder_backend, samedec_bin)
+        if self.decoder_backend == "auto" and active_decoder_backend == "native":
+            log.warning(
+                "ERN decoder_backend=auto: samedec binary %s is unavailable; falling back to native decoder",
+                samedec_bin,
+            )
 
         cmd = _same_listen_module_cmd(
             self.url,
@@ -220,13 +246,13 @@ class ErnGwesMonitor:
             dedupe=self.dedupe_seconds,
             trigger_ratio=self.trigger_ratio,
             tail=self.tail_seconds,
-            decoder_backend=self.decoder_backend,
+            decoder_backend=active_decoder_backend,
             samedec_bin=samedec_bin,
             samedec_confidence=samedec_confidence,
             samedec_start_delay_s=samedec_start_delay_s,
         )
 
-        log.info("ERN monitor starting (%s backend=%s): %s", self.name, self.decoder_backend, " ".join(cmd))
+        log.info("ERN monitor starting (%s backend=%s): %s", self.name, active_decoder_backend, " ".join(cmd))
 
         while True:
             proc = await asyncio.create_subprocess_exec(

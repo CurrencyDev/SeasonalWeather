@@ -23,7 +23,8 @@ def test_bootstrap_does_not_recursively_clobber_voicetext_owned_state() -> None:
 def test_bootstrap_installs_and_enables_voicetext_xvfb_service() -> None:
     bootstrap = (REPO_ROOT / "scripts/00-bootstrap.sh").read_text()
 
-    assert 'apt-get install -y --no-install-recommends wine wine64 unzip xvfb' in bootstrap
+    assert 'dpkg --add-architecture i386' in bootstrap
+    assert 'apt-get install -y --no-install-recommends wine wine64 wine32:i386 unzip xvfb x11-utils' in bootstrap
     assert 'cp /opt/seasonalweather/app/systemd/seasonalweather-voicetext-xvfb.service /etc/systemd/system/seasonalweather-voicetext-xvfb.service' in bootstrap
     assert 'systemctl enable --now seasonalweather-voicetext-xvfb.service' in bootstrap
     assert 'VTP_SYSTEMD_DROPIN="${VTP_SYSTEMD_DROPIN_DIR}/10-voicetext-paul.conf"' in bootstrap

@@ -188,7 +188,7 @@ ern:
   dryrun: false
   url: "http://radio.wjonip.org/WJONTV"
   name: "ERN/JON"
-  decoder_backend: "samedec"     # samedec | native
+  decoder_backend: "auto"        # auto | samedec | native
   sample_rate: 48000
   tail_seconds: 10.0
   trigger_ratio: 8.0

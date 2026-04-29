@@ -78,12 +78,14 @@ def _nwws_credentials_are_default(jid: str, password: str) -> bool:
 
 
 def _normalize_ern_decoder_backend(value: Any) -> str:
-    raw = str(value or "samedec").strip().lower().replace("-", "_")
+    raw = str(value or "auto").strip().lower().replace("-", "_")
+    if raw in {"auto", "default"}:
+        return "auto"
     if raw in {"samedec", "same_dec", "rust"}:
         return "samedec"
     if raw in {"native", "python", "legacy", "internal"}:
         return "native"
-    return "samedec"
+    return "auto"
 
 
 # ---------------------------------------------------------------------------
@@ -977,7 +979,7 @@ def load_config(path: str) -> AppConfig:
         dryrun=bool(ern_raw.get("dryrun", True)),
         url=str(ern_raw.get("url", "")),
         name=str(ern_raw.get("name", "ERN/JON")),
-        decoder_backend=_normalize_ern_decoder_backend(ern_raw.get("decoder_backend", "samedec")),
+        decoder_backend=_normalize_ern_decoder_backend(ern_raw.get("decoder_backend", "auto")),
         sample_rate=int(ern_raw.get("sample_rate", 48000)),
         tail_seconds=float(ern_raw.get("tail_seconds", 10.0)),
         trigger_ratio=float(ern_raw.get("trigger_ratio", 8.0)),

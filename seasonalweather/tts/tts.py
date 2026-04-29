@@ -17,6 +17,7 @@ import shutil
 import time
 import subprocess
 import tempfile
+import fcntl
 from dataclasses import dataclass
 from contextlib import contextmanager
 from pathlib import Path
@@ -323,6 +324,26 @@ def _file_lock(lock_path: Path, timeout_s: float = 30.0, poll_s: float = 0.1):
             pass
 
 
+@contextmanager
+def _flock_path(lock_path: Path, timeout_s: float = 90.0, poll_s: float = 0.1):
+    """Process-safe advisory lock that is released automatically on crash/exit."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    start = time.time()
+    with lock_path.open("a+") as fh:
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.time() - start > timeout_s:
+                    raise RuntimeError(f"Timed out waiting for lock {lock_path}")
+                time.sleep(poll_s)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
 @dataclass
 class TTS:
     backend: str
@@ -459,45 +480,46 @@ class TTS:
 
 
                 out_src = engine_dir / "output.wav"
-                out_src.unlink(missing_ok=True)
 
                 retries = int(getattr(self.vtp_cfg, "retries", 1) or 1)
                 retry_sleep_ms = int(getattr(self.vtp_cfg, "retry_sleep_ms", 150) or 150)
                 reset_every = int(getattr(self.vtp_cfg, "reset_every", 0) or 0)
                 kill_before = bool(getattr(self.vtp_cfg, "kill_before", False))
 
-                calls = getattr(self, "_vt_paul_calls", 0) + 1
-                setattr(self, "_vt_paul_calls", calls)
-
-                def _wineserver_kill() -> None:
-                    subprocess.run([
-                        "sudo", "-n", "-u", run_as,
-                        "/usr/local/bin/voicetext_paul_wineserver_kill",
-                    ], check=False)
-
                 cmd = ["sudo", "-n", "-u", run_as, str(synth)]
+                lock_path = state_base / ".voicetext_paul_tts.lock"
 
-                if kill_before or (reset_every > 0 and (calls % reset_every) == 0):
-                    _wineserver_kill()
+                with _flock_path(lock_path, timeout_s=120.0):
+                    calls = getattr(self, "_vt_paul_calls", 0) + 1
+                    setattr(self, "_vt_paul_calls", calls)
 
-                last_err: Exception | None = None
-                for attempt in range(retries + 1):
-                    out_src.unlink(missing_ok=True)
-                    try:
-                        subprocess.run(cmd, input=(msg + "\n").encode("utf-8"), cwd=str(engine_dir), check=True)
-                        if out_src.exists() and out_src.stat().st_size >= 2000:
-                            break
-                        raise RuntimeError("voicetext_paul did not produce a valid output.wav")
-                    except Exception as e:
-                        last_err = e
+                    def _wineserver_kill() -> None:
+                        subprocess.run([
+                            "sudo", "-n", "-u", run_as,
+                            "/usr/local/bin/voicetext_paul_wineserver_kill",
+                        ], check=False)
+
+                    if kill_before or (reset_every > 0 and (calls % reset_every) == 0):
                         _wineserver_kill()
-                        if attempt < retries:
-                            time.sleep(max(0.0, retry_sleep_ms / 1000.0))
-                else:
-                    raise RuntimeError(f"voicetext_paul failed after wineserver reset/retry: {last_err}") from last_err
 
-                shutil.copyfile(out_src, tmp_wav)
-                out_src.unlink(missing_ok=True)
+                    last_err: Exception | None = None
+                    for attempt in range(retries + 1):
+                        out_src.unlink(missing_ok=True)
+                        try:
+                            subprocess.run(cmd, input=(msg + "\n").encode("utf-8"), cwd=str(engine_dir), check=True)
+                            if out_src.exists() and out_src.stat().st_size >= 2000:
+                                break
+                            raise RuntimeError("voicetext_paul did not produce a valid output.wav")
+                        except Exception as e:
+                            last_err = e
+                            _wineserver_kill()
+                            if attempt < retries:
+                                time.sleep(max(0.0, retry_sleep_ms / 1000.0))
+                    else:
+                        raise RuntimeError(f"voicetext_paul failed after wineserver reset/retry: {last_err}") from last_err
+
+                    shutil.copyfile(out_src, tmp_wav)
+                    out_src.unlink(missing_ok=True)
             else:
                 # default: espeak-ng
                 if not shutil.which("espeak-ng"):

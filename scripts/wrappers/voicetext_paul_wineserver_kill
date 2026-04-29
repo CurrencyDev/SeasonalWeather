@@ -10,7 +10,13 @@ PREFIX="${VOICETEXT_PAUL_WINEPREFIX:-${PREFIX_BASE}/${PREFIX_NAME}}"
 TMPD="${VOICETEXT_PAUL_TMPDIR:-${STATE_BASE}/tmp}"
 
 export WINEPREFIX="${PREFIX}"
+if [[ ! -f "${PREFIX}/system.reg" ]]; then
+  export WINEARCH="${VOICETEXT_PAUL_WINEARCH:-win32}"
+else
+  unset WINEARCH
+fi
 export WINEDEBUG="${VOICETEXT_PAUL_WINEDEBUG:--all}"
+export WINEDLLOVERRIDES="${VOICETEXT_PAUL_WINEDLLOVERRIDES:-mscoree,mshtml=}"
 export DISPLAY="${VOICETEXT_PAUL_DISPLAY:-:99}"
 
 if [[ "${DISPLAY}" =~ ^:([0-9]+)(\..*)?$ ]]; then

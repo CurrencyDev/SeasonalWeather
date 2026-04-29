@@ -111,3 +111,11 @@ If a deployment intentionally uses another display, set `VOICETEXT_PAUL_DISPLAY`
 in `/etc/seasonalweather/seasonalweather.env`.  When the default local display
 socket is missing, the wrapper fails fast with an actionable message instead of
 letting Wine abort without context.
+
+## VoiceText Paul Wine/runtime notes
+
+Fresh VoiceText Paul installs provision i386 architecture and install the 32-bit Wine stack because the VoiceText runtime may require 32-bit Wine support on otherwise 64-bit hosts. The wrapper also creates new prefixes as `WINEARCH=win32`; existing prefixes are left alone to avoid Wine rejecting a mismatched architecture.
+
+The Xvfb unit is started with access control disabled for this private local display, and the wrapper probes the display with `xdpyinfo` when available. If Wine fails after those preflight checks, the wrapper prints the tail of the saved Wine log into journald and preserves the full log under `/var/lib/seasonalweather/tmp/`.
+
+SeasonalWeather also serializes the Python-side VoiceText call path before invoking the wrapper. This avoids concurrent segment refresh jobs deleting or copying the shared `output.wav` while another synthesis is still returning from Wine.

@@ -22,11 +22,19 @@ PREFIX="${VOICETEXT_PAUL_WINEPREFIX:-${PREFIX_BASE}/${PREFIX_NAME}}"
 TMPD="${VOICETEXT_PAUL_TMPDIR:-${STATE_BASE}/tmp}"
 
 export WINEPREFIX="${PREFIX}"
-unset WINEARCH
+# VoiceText Paul deployments often need the 32-bit Wine stack. Use a win32
+# prefix for fresh installs, but never force WINEARCH after a prefix exists
+# because Wine rejects mismatched WINEARCH values.
+if [[ ! -f "${PREFIX}/system.reg" ]]; then
+  export WINEARCH="${VOICETEXT_PAUL_WINEARCH:-win32}"
+else
+  unset WINEARCH
+fi
 export WINEDEBUG="${VOICETEXT_PAUL_WINEDEBUG:--all}"
 export WINEESYNC="${VOICETEXT_PAUL_WINEESYNC:-0}"
 export WINEFSYNC="${VOICETEXT_PAUL_WINEFSYNC:-0}"
 export WINE_DISABLE_WRITE_WATCH="${VOICETEXT_PAUL_DISABLE_WRITE_WATCH:-1}"
+export WINEDLLOVERRIDES="${VOICETEXT_PAUL_WINEDLLOVERRIDES:-mscoree,mshtml=}"
 export TMPDIR="${TMPD}"
 export DISPLAY="${VOICETEXT_PAUL_DISPLAY:-:99}"
 
@@ -39,6 +47,12 @@ if [[ "${DISPLAY}" =~ ^:([0-9]+)(\..*)?$ ]]; then
   done
   if [[ ! -S "${DISPLAY_SOCKET}" ]]; then
     echo "[voicetext_paul_synth] DISPLAY=${DISPLAY} is not available; start seasonalweather-voicetext-xvfb.service or set VOICETEXT_PAUL_DISPLAY" >&2
+    exit 1
+  fi
+fi
+if command -v xdpyinfo >/dev/null 2>&1; then
+  if ! timeout 3s xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1; then
+    echo "[voicetext_paul_synth] DISPLAY=${DISPLAY} exists but is not accepting X11 clients; check seasonalweather-voicetext-xvfb.service" >&2
     exit 1
   fi
 fi
@@ -83,6 +97,11 @@ if [[ "${DEBUG}" == "1" ]]; then
   echo "[voicetext_paul_synth] input preview: $(head -c 240 input1.txt | tr '\n' ' ')" >&2
 fi
 
+if ! command -v wine >/dev/null 2>&1; then
+  echo "[voicetext_paul_synth] wine is not installed or not in PATH" >&2
+  exit 1
+fi
+
 set +e
 ENGINE_USED="wine"
 if [[ "${DEBUG}" == "1" ]]; then
@@ -97,6 +116,10 @@ if [[ ${rc1} -eq 0 ]]; then
   rm -f "${WLOG}" 2>/dev/null || true
 else
   echo "[voicetext_paul_synth] wine failed rc=${rc1}; log=${WLOG}" >&2
+  if [[ -s "${WLOG}" ]]; then
+    echo "[voicetext_paul_synth] wine log tail:" >&2
+    tail -n 40 "${WLOG}" >&2 || true
+  fi
   INLOG="${TMPD}/voicetext_paul_input.${STAMP}.txt"
   cp -a input1.txt "${INLOG}" 2>/dev/null || true
   echo "[voicetext_paul_synth] saved input=${INLOG}" >&2

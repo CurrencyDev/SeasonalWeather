@@ -217,7 +217,15 @@ fi
 if [[ "${SEASONAL_VOICETEXT_PAUL:-0}" == "1" ]]; then
   log "Installing VoiceText Paul backend"
 
-  apt-get install -y --no-install-recommends wine wine64 unzip xvfb
+  if ! dpkg --print-foreign-architectures | grep -qx i386; then
+    log "Enabling i386 architecture for 32-bit Wine support"
+    dpkg --add-architecture i386
+    apt-get update
+  fi
+  if ! apt-get install -y --no-install-recommends wine wine64 wine32:i386 unzip xvfb x11-utils; then
+    warn "wine32:i386 install failed; retrying with distro wine32 package name"
+    apt-get install -y --no-install-recommends wine wine64 wine32 unzip xvfb x11-utils
+  fi
 
   VTP_USER="voicetext"
   VTP_HOME="/home/${VTP_USER}"
