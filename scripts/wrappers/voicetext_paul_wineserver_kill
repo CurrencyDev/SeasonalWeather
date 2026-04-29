@@ -13,6 +13,13 @@ export WINEPREFIX="${PREFIX}"
 export WINEDEBUG="${VOICETEXT_PAUL_WINEDEBUG:--all}"
 export DISPLAY="${VOICETEXT_PAUL_DISPLAY:-:99}"
 
+if [[ "${DISPLAY}" =~ ^:([0-9]+)(\..*)?$ ]]; then
+  DISPLAY_SOCKET="/tmp/.X11-unix/X${BASH_REMATCH[1]}"
+  if [[ ! -S "${DISPLAY_SOCKET}" ]]; then
+    echo "[voicetext_paul_wineserver_kill] DISPLAY=${DISPLAY} is not available; wineserver cleanup may be a no-op" >&2
+  fi
+fi
+
 uid="$(id -u)"
 export XDG_RUNTIME_DIR="${TMPD}/xdg-runtime-${uid}"
 mkdir -p "${XDG_RUNTIME_DIR}" || true

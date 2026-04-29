@@ -98,3 +98,16 @@ SEASONAL_VOICETEXT_PAUL=1 sudo -E bash scripts/00-bootstrap.sh
 
 The live runtime config is `/etc/seasonalweather/config.yaml`.
 The repo copy at `/opt/seasonalweather/app/config/config.yaml` is only a template/example.
+
+## VoiceText Paul display startup contract
+
+`voicetext_paul_synth` defaults to `DISPLAY=:99` and expects the
+`seasonalweather-voicetext-xvfb.service` unit to provide that local X socket.
+When `SEASONAL_VOICETEXT_PAUL=1` is used during bootstrap, the installer now
+adds a `seasonalweather.service.d/10-voicetext-paul.conf` drop-in so the main
+service is ordered after the headless display.
+
+If a deployment intentionally uses another display, set `VOICETEXT_PAUL_DISPLAY`
+in `/etc/seasonalweather/seasonalweather.env`.  When the default local display
+socket is missing, the wrapper fails fast with an actionable message instead of
+letting Wine abort without context.

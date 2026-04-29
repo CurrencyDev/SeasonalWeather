@@ -230,6 +230,8 @@ if [[ "${SEASONAL_VOICETEXT_PAUL:-0}" == "1" ]]; then
   VTP_SYNTH="/usr/local/bin/voicetext_paul_synth"
   VTP_WSKILL="/usr/local/bin/voicetext_paul_wineserver_kill"
   VTP_SUDOERS="/etc/sudoers.d/seasonalweather-voicetext-paul"
+  VTP_SYSTEMD_DROPIN_DIR="/etc/systemd/system/seasonalweather.service.d"
+  VTP_SYSTEMD_DROPIN="${VTP_SYSTEMD_DROPIN_DIR}/10-voicetext-paul.conf"
 
   if ! id -u "${VTP_USER}" >/dev/null 2>&1; then
     useradd --system --home "${VTP_HOME}" --create-home --shell /usr/sbin/nologin "${VTP_USER}"
@@ -276,7 +278,16 @@ SUDOEOF
     log "sudoers entry installed at ${VTP_SUDOERS}"
   fi
 
+  install -d -o root -g root "${VTP_SYSTEMD_DROPIN_DIR}"
+  cat > "${VTP_SYSTEMD_DROPIN}" <<'SYSTEMDEOF'
+[Unit]
+Wants=seasonalweather-voicetext-xvfb.service
+After=seasonalweather-voicetext-xvfb.service
+SYSTEMDEOF
+  chmod 644 "${VTP_SYSTEMD_DROPIN}"
+
   log "VoiceText Paul install complete"
+  log "  Installed systemd ordering drop-in: ${VTP_SYSTEMD_DROPIN}"
   log "  Activate: set  tts.backend: \"voicetext_paul\"  in /etc/seasonalweather/config.yaml"
 else
   log "Skipping VoiceText Paul (set SEASONAL_VOICETEXT_PAUL=1 to install)"

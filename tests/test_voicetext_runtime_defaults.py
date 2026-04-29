@@ -24,4 +24,5 @@ def test_voicetext_wrappers_default_to_headless_display_service() -> None:
 
     assert 'VOICETEXT_PAUL_DISPLAY:-:99' in synth
     assert 'VOICETEXT_PAUL_DISPLAY:-:99' in kill
+    assert 'DISPLAY=${DISPLAY} is not available' in synth
     assert 'ExecStart=/usr/bin/Xvfb :99 -screen 0 1024x768x24 -nolisten tcp -noreset' in unit

@@ -26,3 +26,5 @@ def test_bootstrap_installs_and_enables_voicetext_xvfb_service() -> None:
     assert 'apt-get install -y --no-install-recommends wine wine64 unzip xvfb' in bootstrap
     assert 'cp /opt/seasonalweather/app/systemd/seasonalweather-voicetext-xvfb.service /etc/systemd/system/seasonalweather-voicetext-xvfb.service' in bootstrap
     assert 'systemctl enable --now seasonalweather-voicetext-xvfb.service' in bootstrap
+    assert 'VTP_SYSTEMD_DROPIN="${VTP_SYSTEMD_DROPIN_DIR}/10-voicetext-paul.conf"' in bootstrap
+    assert 'After=seasonalweather-voicetext-xvfb.service' in bootstrap

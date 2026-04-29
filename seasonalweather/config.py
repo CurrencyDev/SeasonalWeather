@@ -62,6 +62,30 @@ def _env_str(key: str, default: str) -> str:
     return v if v else default
 
 
+def _nwws_credentials_are_default(jid: str, password: str) -> bool:
+    """
+    Treat the repo/example NWWS credentials as intentionally disabled.
+
+    Fresh installs start from config/example.env.  Keeping the example values
+    should not create an endless XMPP authentication loop.
+    """
+    jid_norm = (jid or "").strip().lower()
+    password_norm = (password or "").strip()
+    return (
+        jid_norm in {"", "changeme", "changeme@nwws-oi.weather.gov"}
+        or password_norm in {"", "CHANGEME", "changeme"}
+    )
+
+
+def _normalize_ern_decoder_backend(value: Any) -> str:
+    raw = str(value or "samedec").strip().lower().replace("-", "_")
+    if raw in {"samedec", "same_dec", "rust"}:
+        return "samedec"
+    if raw in {"native", "python", "legacy", "internal"}:
+        return "native"
+    return "samedec"
+
+
 # ---------------------------------------------------------------------------
 # Dataclasses — one per logical subsystem
 # ---------------------------------------------------------------------------
@@ -220,12 +244,14 @@ class NWWSResiliencyConfig:
 
 @dataclass(frozen=True)
 class NWWSConfig:
+    enabled: bool
     server: str
     port: int
     room: str
     nick: str
     allowed_wfos: List[str]
     resiliency: NWWSResiliencyConfig
+    credentials_defaulted: bool = False
 
 
 # --- nws (api.weather.gov calls) ---
@@ -319,6 +345,7 @@ class ErnConfig:
     dryrun: bool
     url: str
     name: str
+    decoder_backend: str
     sample_rate: int
     tail_seconds: float
     trigger_ratio: float
@@ -705,6 +732,10 @@ def _get(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
 def load_config(path: str) -> AppConfig:
     raw: Dict[str, Any] = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
 
+    nwws_jid = _env_str("NWWS_JID", "")
+    nwws_password = _env_str("NWWS_PASSWORD", "")
+    nwws_credentials_defaulted = _nwws_credentials_are_default(nwws_jid, nwws_password)
+
     # ------------------------------------------------------------------
     # station
     # ------------------------------------------------------------------
@@ -846,11 +877,13 @@ def load_config(path: str) -> AppConfig:
     nw = raw["nwws"]
     res_raw = nw.get("resiliency", {})
     nwws = NWWSConfig(
+        enabled=bool(nw.get("enabled", True)) and not nwws_credentials_defaulted,
         server=str(nw.get("server", "nwws-oi.weather.gov")),
         port=int(nw.get("port", 5222)),
         room=str(nw.get("room", "NWWS@conference.nwws-oi.weather.gov")),
         nick=str(nw.get("nick", "SeasonalWeather")),
         allowed_wfos=list(nw.get("allowed_wfos", [])),
+        credentials_defaulted=nwws_credentials_defaulted,
         resiliency=NWWSResiliencyConfig(
             stall_seconds=int(res_raw.get("stall_seconds", 60)),
             muc_confirm_seconds=int(res_raw.get("muc_confirm_seconds", 30)),
@@ -944,6 +977,7 @@ def load_config(path: str) -> AppConfig:
         dryrun=bool(ern_raw.get("dryrun", True)),
         url=str(ern_raw.get("url", "")),
         name=str(ern_raw.get("name", "ERN/JON")),
+        decoder_backend=_normalize_ern_decoder_backend(ern_raw.get("decoder_backend", "samedec")),
         sample_rate=int(ern_raw.get("sample_rate", 48000)),
         tail_seconds=float(ern_raw.get("tail_seconds", 10.0)),
         trigger_ratio=float(ern_raw.get("trigger_ratio", 8.0)),
@@ -1237,8 +1271,8 @@ def load_config(path: str) -> AppConfig:
     # touches os.environ for these keys
     # ------------------------------------------------------------------
     secrets = SecretsConfig(
-        nwws_jid=_env_required("NWWS_JID"),
-        nwws_password=_env_required("NWWS_PASSWORD"),
+        nwws_jid=nwws_jid,
+        nwws_password=nwws_password,
         icecast_source_password=_env_required("ICECAST_SOURCE_PASSWORD"),
         icecast_admin_password=_env_str("ICECAST_ADMIN_PASSWORD", ""),
         icecast_relay_password=_env_str("ICECAST_RELAY_PASSWORD", ""),

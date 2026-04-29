@@ -94,6 +94,7 @@ observations:
 
 # NWWS-OI listener
 nwws:
+  enabled: true
   server: "nwws-oi.weather.gov"
   port: 5222
   room: "NWWS@conference.nwws-oi.weather.gov"
@@ -187,6 +188,7 @@ ern:
   dryrun: false
   url: "http://radio.wjonip.org/WJONTV"
   name: "ERN/JON"
+  decoder_backend: "samedec"     # samedec | native
   sample_rate: 48000
   tail_seconds: 10.0
   trigger_ratio: 8.0

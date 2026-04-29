@@ -65,6 +65,13 @@ def _cfg_samedec_args() -> tuple[str, float, float]:
     return bin_path, confidence, start_delay_s
 
 
+def _normalize_decoder_backend(value: str) -> str:
+    raw = str(value or "samedec").strip().lower().replace("-", "_")
+    if raw in {"native", "python", "legacy", "internal"}:
+        return "native"
+    return "samedec"
+
+
 def _same_listen_module_cmd(
     url: str,
     *,
@@ -72,14 +79,18 @@ def _same_listen_module_cmd(
     dedupe: float,
     trigger_ratio: float,
     tail: float,
+    decoder_backend: str,
     samedec_bin: str,
     samedec_confidence: float,
     samedec_start_delay_s: float,
 ) -> list[str]:
-    return [
+    backend = _normalize_decoder_backend(decoder_backend)
+    module = "seasonalweather.same.listen_samedec" if backend == "samedec" else "seasonalweather.same.listen"
+
+    cmd = [
         sys.executable,
         "-m",
-        "seasonalweather.same.listen_samedec",
+        module,
         "--url",
         url,
         "--sr",
@@ -90,19 +101,27 @@ def _same_listen_module_cmd(
         str(float(trigger_ratio)),
         "--tail",
         str(float(tail)),
-        "--samedec-bin",
-        str(samedec_bin),
-        "--confidence",
-        str(float(samedec_confidence)),
-        "--start-delay-s",
-        str(float(samedec_start_delay_s)),
         "--jsonl",
     ]
+
+    if backend == "samedec":
+        cmd.extend(
+            [
+                "--samedec-bin",
+                str(samedec_bin),
+                "--confidence",
+                str(float(samedec_confidence)),
+                "--start-delay-s",
+                str(float(samedec_start_delay_s)),
+            ]
+        )
+
+    return cmd
 
 
 class ErnGwesMonitor:
     """
-    Spawns same_listen_samedec.py as a module, reads JSONL decoded SAME messages,
+    Spawns a configured SAME decoder module, reads JSONL decoded SAME messages,
     filters to service area SAME/FIPS, and emits ErnSameEvent into an asyncio queue.
 
     This is a "Level 3" source: we do not try to fetch or synthesize official text.
@@ -121,6 +140,7 @@ class ErnGwesMonitor:
         tail_seconds: float = 10.0,
         confidence_min: float = 0.25,
         name: str = "ERN/JON",
+        decoder_backend: str = "samedec",
     ) -> None:
         self.out_queue = out_queue
         self.same_fips_allow = set(str(x).strip() for x in (same_fips_allow or []) if str(x).strip())
@@ -131,6 +151,7 @@ class ErnGwesMonitor:
         self.tail_seconds = float(tail_seconds)
         self.confidence_min = float(confidence_min)
         self.name = str(name)
+        self.decoder_backend = _normalize_decoder_backend(decoder_backend)
 
         if not self.url:
             raise ValueError("ERN monitor requires a non-empty url")
@@ -199,12 +220,13 @@ class ErnGwesMonitor:
             dedupe=self.dedupe_seconds,
             trigger_ratio=self.trigger_ratio,
             tail=self.tail_seconds,
+            decoder_backend=self.decoder_backend,
             samedec_bin=samedec_bin,
             samedec_confidence=samedec_confidence,
             samedec_start_delay_s=samedec_start_delay_s,
         )
 
-        log.info("ERN monitor starting (%s): %s", self.name, " ".join(cmd))
+        log.info("ERN monitor starting (%s backend=%s): %s", self.name, self.decoder_backend, " ".join(cmd))
 
         while True:
             proc = await asyncio.create_subprocess_exec(

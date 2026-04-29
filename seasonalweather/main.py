@@ -3773,19 +3773,27 @@ class Orchestrator:
         tasks.append(asyncio.create_task(self.conductor.run(), name="conductor"))
         tasks.append(asyncio.create_task(self.refresher.run(), name="segment_refresher"))
 
-        xmpp = NWWSClient(
-            self.jid, self.password, self.nwws_server, self.nwws_port, self.nwws_queue,
-            room_jid=self.cfg.nwws.room,
-            nick=self.cfg.nwws.nick,
-            # TODO: wire stall/reconnect callbacks to self.discord.nwws_stall() / .nwws_reconnected() once NWWSClient exposes them
-            stall_seconds=self.cfg.nwws.resiliency.stall_seconds,
-            muc_confirm_seconds=self.cfg.nwws.resiliency.muc_confirm_seconds,
-            start_wait_seconds=self.cfg.nwws.resiliency.start_wait_seconds,
-            join_wait_seconds=self.cfg.nwws.resiliency.join_wait_seconds,
-            backoff_max_seconds=self.cfg.nwws.resiliency.backoff_max_seconds,
-        )
-        tasks.append(asyncio.create_task(xmpp.run_forever(), name="nwws_xmpp"))
-        tasks.append(asyncio.create_task(self._consume_nwws(), name="nwws_consumer"))
+        if self.cfg.nwws.credentials_defaulted:
+            log.warning(
+                "NWWS-OI disabled because NWWS_JID/NWWS_PASSWORD are unset or still use the example CHANGEME values; "
+                "update /etc/seasonalweather/seasonalweather.env to enable NWWS-OI."
+            )
+        elif not self.cfg.nwws.enabled:
+            log.info("NWWS-OI disabled (set nwws.enabled: true in config.yaml to enable)")
+        else:
+            xmpp = NWWSClient(
+                self.jid, self.password, self.nwws_server, self.nwws_port, self.nwws_queue,
+                room_jid=self.cfg.nwws.room,
+                nick=self.cfg.nwws.nick,
+                # TODO: wire stall/reconnect callbacks to self.discord.nwws_stall() / .nwws_reconnected() once NWWSClient exposes them
+                stall_seconds=self.cfg.nwws.resiliency.stall_seconds,
+                muc_confirm_seconds=self.cfg.nwws.resiliency.muc_confirm_seconds,
+                start_wait_seconds=self.cfg.nwws.resiliency.start_wait_seconds,
+                join_wait_seconds=self.cfg.nwws.resiliency.join_wait_seconds,
+                backoff_max_seconds=self.cfg.nwws.resiliency.backoff_max_seconds,
+            )
+            tasks.append(asyncio.create_task(xmpp.run_forever(), name="nwws_xmpp"))
+            tasks.append(asyncio.create_task(self._consume_nwws(), name="nwws_consumer"))
         # _cycle_loop retired — CycleConductor runs the cycle continuously.
 
         if self.rebroadcast_enabled:
@@ -3865,14 +3873,16 @@ class Orchestrator:
                         tail_seconds=ern_cfg.tail_seconds,
                         confidence_min=ern_cfg.confidence_min,
                         name=ern_cfg.name,
+                        decoder_backend=ern_cfg.decoder_backend,
                     )
                     tasks.append(asyncio.create_task(mon.run_forever(), name="ern_monitor"))
                     tasks.append(asyncio.create_task(self._consume_ern(), name="ern_consumer"))
                     log.info(
-                        "ERN monitor enabled (dryrun=%s url=%s relay=%s)",
+                        "ERN monitor enabled (dryrun=%s url=%s relay=%s decoder=%s)",
                         self._ern_dryrun(),
                         url,
                         self._ern_relay_enabled(),
+                        ern_cfg.decoder_backend,
                     )
         else:
             log.info("ERN monitor disabled (set ern.enabled: true in config.yaml to enable)")

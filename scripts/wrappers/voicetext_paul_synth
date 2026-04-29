@@ -30,6 +30,19 @@ export WINE_DISABLE_WRITE_WATCH="${VOICETEXT_PAUL_DISABLE_WRITE_WATCH:-1}"
 export TMPDIR="${TMPD}"
 export DISPLAY="${VOICETEXT_PAUL_DISPLAY:-:99}"
 
+if [[ "${DISPLAY}" =~ ^:([0-9]+)(\..*)?$ ]]; then
+  DISPLAY_SOCKET="/tmp/.X11-unix/X${BASH_REMATCH[1]}"
+  DISPLAY_WAIT_S="${VOICETEXT_PAUL_DISPLAY_WAIT:-10}"
+  DISPLAY_WAIT_END=$((SECONDS + DISPLAY_WAIT_S))
+  while [[ ! -S "${DISPLAY_SOCKET}" && "${SECONDS}" -lt "${DISPLAY_WAIT_END}" ]]; do
+    sleep 0.2
+  done
+  if [[ ! -S "${DISPLAY_SOCKET}" ]]; then
+    echo "[voicetext_paul_synth] DISPLAY=${DISPLAY} is not available; start seasonalweather-voicetext-xvfb.service or set VOICETEXT_PAUL_DISPLAY" >&2
+    exit 1
+  fi
+fi
+
 uid="$(id -u)"
 if [[ -d "/run/user/${uid}" && -w "/run/user/${uid}" ]]; then
   export XDG_RUNTIME_DIR="/run/user/${uid}"
