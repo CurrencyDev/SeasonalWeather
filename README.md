@@ -53,7 +53,7 @@ Freeze products are supported natively. `FZ.W` maps to SAME `FZW` (**Freeze Warn
 
 - Cross-source deduplication prevents the same alert from airing twice via NWWS then CAP.
 - Ledger-based CAP tracking prevents restart spam.
-- Tests (RWT/RMT) are gated behind configurable cooldowns and blocked during active severe weather.
+- Tests (RWT/RMT) are gated behind configurable cooldowns and per-test postpone policies (`none`, `fixed_delay`, `delay_window`, `next_day`, `skip_day`, `skip_week`).
 - No "global fallback" targeting — alerts that don't match the service area are dropped.
 
 ### Output
@@ -125,7 +125,7 @@ This is the single source of truth for all runtime behaviour. The file is well-c
 | `cap` | CAP polling: enabled, dryrun, poll interval, voice/full thresholds |
 | `ern` | ERN/GWES stream monitoring and relay settings |
 | `samedec` | Path and confidence for the `samedec` binary |
-| `tests` | RWT/RMT scheduling and gating |
+| `tests` | RWT/RMT scheduling, gating, and postpone policy |
 | `zonecounty` | NWS UGC → SAME FIPS crosswalk |
 | `mareas` | Marine zone → SAME crosswalk |
 | `station_feed` | Alert feed JSON output for UI consumption |

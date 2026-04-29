@@ -261,8 +261,12 @@ samedec:
 # RWT/RMT test scheduling
 tests:
   enabled: true
-  postpone_minutes: 15         # delay test if active alert in progress
-  max_postpone_hours: 6        # give up postponing after this long
+  # Global fallback used by tests that do not set their own policy.
+  # Valid policies: none, fixed_delay, delay_window, next_day, skip_day, skip_week.
+  postpone_policy: delay_window
+  postpone_minutes: 15         # retry delay for fixed_delay/delay_window policies
+  max_postpone_hours: 6        # retry window for fixed_delay/delay_window policies
+  max_postpone_days: 2         # retry days for next_day policy
   jitter_seconds: 60           # random jitter around scheduled time
   toneout_cooldown_seconds: 1800  # don't tone again this soon after a test (matches min_heightened_seconds)
   cap_block_seconds: 3600      # block CAP full cut-ins for this long after a test
@@ -275,11 +279,26 @@ tests:
     weekday: 3                 # 0=Mon … 6=Sun
     hour: 11
     minute: 0
+    postpone_policy: next_day  # NWS-style: suppress today, retry next eligible day
+    max_postpone_days: 2
+    gate:
+      block_heightened: true
+      block_recent_toneout: true
+      block_recent_severe_cap: true
+      block_recent_ern: true
   rmt:
     nth: 1                     # which occurrence of weekday in month (1 = first)
     weekday: 3
     hour: 11
     minute: 0
+    postpone_policy: delay_window
+    postpone_minutes: 30
+    max_postpone_hours: 6
+    gate:
+      block_heightened: true
+      block_recent_toneout: true
+      block_recent_severe_cap: true
+      block_recent_ern: true
 
 # NWS UGC → SAME FIPS crosswalk (zone-to-county mapping)
 zonecounty:

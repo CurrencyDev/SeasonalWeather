@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Awaitable, Callable, Optional
 from zoneinfo import ZoneInfo
 
+from .tests import normalize_postpone_policy
+
 from ..database.core import SeasonalDatabase
 from ..database.scheduler import SchedulerStateRepository
 
@@ -36,6 +38,18 @@ class RwtRmtSchedule:
 
     state_path: str
     state_key: str = "rwt_rmt"
+
+    # Per-test postpone policy. This lets RWTs use NWS-style next-day
+    # behavior while RMTs keep a tighter retry window.
+    rwt_postpone_policy: str = "next_day"
+    rwt_postpone_minutes: int = 15
+    rwt_max_postpone_hours: int = 6
+    rwt_max_postpone_days: int = 2
+
+    rmt_postpone_policy: str = "delay_window"
+    rmt_postpone_minutes: int = 15
+    rmt_max_postpone_hours: int = 6
+    rmt_max_postpone_days: int = 0
 
 
 @dataclass
@@ -174,9 +188,37 @@ def _next_monthly_nth_weekday(now: dt.datetime, nth: int, weekday: int, hour: in
     return now + dt.timedelta(days=30)
 
 
-GateFn = Callable[[], tuple[bool, str]]
+GateFn = Callable[[str], tuple[bool, str]]
 FireFn = Callable[[str], Awaitable[None]]
 LogFn = Callable[[str], None]
+
+
+def _next_postpone_attempt(
+    *,
+    policy: str,
+    scheduled: dt.datetime,
+    now: dt.datetime,
+    blocked_count: int,
+    postpone: dt.timedelta,
+    deadline: dt.datetime,
+    max_postpone_days: int,
+) -> dt.datetime | None:
+    policy = normalize_postpone_policy(policy)
+    if policy in {"none", "skip_day", "skip_week"}:
+        return None
+    if policy == "fixed_delay":
+        if blocked_count >= 1:
+            return None
+        candidate = now + postpone
+        return candidate if candidate <= deadline else None
+    if policy == "delay_window":
+        candidate = now + postpone
+        return candidate if candidate <= deadline else None
+    if policy == "next_day":
+        if blocked_count >= max(0, int(max_postpone_days)):
+            return None
+        return scheduled + dt.timedelta(days=blocked_count + 1)
+    return None
 
 
 class RwtRmtScheduler:
@@ -209,6 +251,40 @@ class RwtRmtScheduler:
         if j <= 0:
             return dt.timedelta(0)
         return dt.timedelta(seconds=random.uniform(0, float(j)))
+
+    def _postpone_policy_for(self, event_code: str) -> str:
+        if str(event_code or "").strip().upper() == "RWT":
+            return normalize_postpone_policy(self.s.rwt_postpone_policy, "next_day")
+        return normalize_postpone_policy(self.s.rmt_postpone_policy, "delay_window")
+
+    def _postpone_minutes_for(self, event_code: str) -> int:
+        if str(event_code or "").strip().upper() == "RWT":
+            return max(1, int(self.s.rwt_postpone_minutes))
+        return max(1, int(self.s.rmt_postpone_minutes))
+
+    def _max_postpone_hours_for(self, event_code: str) -> int:
+        if str(event_code or "").strip().upper() == "RWT":
+            return max(0, int(self.s.rwt_max_postpone_hours))
+        return max(0, int(self.s.rmt_max_postpone_hours))
+
+    def _max_postpone_days_for(self, event_code: str) -> int:
+        if str(event_code or "").strip().upper() == "RWT":
+            return max(0, int(self.s.rwt_max_postpone_days))
+        return max(0, int(self.s.rmt_max_postpone_days))
+
+    def _gate(self, event_code: str) -> tuple[bool, str]:
+        try:
+            return self.gate_fn(event_code)
+        except TypeError:
+            # Compatibility for older no-argument gate callbacks.
+            return self.gate_fn()  # type: ignore[misc,call-arg]
+
+    async def _sleep_until(self, when: dt.datetime) -> None:
+        while not self._stop.is_set():
+            now = self._now()
+            if now >= when:
+                return
+            await asyncio.sleep(min(30.0, max(1.0, (when - now).total_seconds())))
 
     async def run_forever(self) -> None:
         if not self.s.enabled:
@@ -270,21 +346,49 @@ class RwtRmtScheduler:
         self.log("[RWT/RMT] scheduler stopped")
 
     async def _attempt_with_postpone(self, event_code: str, scheduled: dt.datetime) -> None:
-        deadline = scheduled + dt.timedelta(hours=max(1, int(self.s.max_postpone_hours)))
-        postpone = dt.timedelta(minutes=max(1, int(self.s.postpone_minutes)))
+        policy = self._postpone_policy_for(event_code)
+        postpone = dt.timedelta(minutes=self._postpone_minutes_for(event_code))
+        deadline = scheduled + dt.timedelta(hours=self._max_postpone_hours_for(event_code))
+        max_postpone_days = self._max_postpone_days_for(event_code)
+        blocked_count = 0
+        attempt_at = scheduled
 
         while not self._stop.is_set():
-            now = self._now()
-            if now > deadline:
-                self.log(f"[RWT/RMT] skip {event_code}: gate blocked past deadline")
+            await self._sleep_until(attempt_at)
+            if self._stop.is_set():
                 return
 
-            ok, reason = self.gate_fn()
+            now = self._now()
+            ok, reason = self._gate(event_code)
             if ok:
                 break
 
-            self.log(f"[RWT/RMT] gate blocked for {event_code}: {reason} (postpone {int(postpone.total_seconds()/60)}m)")
-            await asyncio.sleep(max(30.0, postpone.total_seconds()))
+            next_attempt = _next_postpone_attempt(
+                policy=policy,
+                scheduled=scheduled,
+                now=now,
+                blocked_count=blocked_count,
+                postpone=postpone,
+                deadline=deadline,
+                max_postpone_days=max_postpone_days,
+            )
+            blocked_count += 1
+
+            if next_attempt is None:
+                self.log(f"[RWT/RMT] skip {event_code}: gate blocked ({reason}); policy={policy}")
+                return
+
+            self.log(
+                f"[RWT/RMT] gate blocked for {event_code}: {reason} "
+                f"(policy={policy} next={next_attempt.isoformat()})"
+            )
+            self.state.save(
+                self.s.state_path,
+                repository=self._repo,
+                state_key=self.s.state_key,
+                next_run_at=next_attempt.astimezone(dt.timezone.utc).replace(microsecond=0).isoformat(),
+            )
+            attempt_at = next_attempt
 
         if self._stop.is_set():
             return

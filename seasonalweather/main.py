@@ -90,6 +90,7 @@ from .same import ugc as _ugc
 
 # RWT/RMT scheduler
 from .broadcast.rwt_rmt import RwtRmtSchedule, RwtRmtScheduler
+from .broadcast.tests import default_test_script_lines, format_test_presentation_template
 
 # Optional SAME
 try:
@@ -3562,16 +3563,6 @@ class Orchestrator:
     def _tests_ern_block_seconds(self) -> int:
         return self.cfg.tests.ern_block_seconds
 
-    @staticmethod
-    def _format_presentation_template(template: str, **ctx: str) -> str:
-        tpl = str(template or "").strip()
-        if not tpl:
-            return ""
-        try:
-            return tpl.format(**ctx).strip()
-        except Exception:
-            return tpl
-
     async def _local_test_presentation(self, code: str, same_codes: list[str] | None = None) -> tuple[str, str, str]:
         event_text = _same_label_or_code(code)
         station_name = str(self.cfg.station.name or "SeasonalWeather").strip() or "SeasonalWeather"
@@ -3594,15 +3585,15 @@ class Orchestrator:
             "service_area_name": service_area_name,
             "auto_area_text": auto_area_text,
         }
-        headline = self._format_presentation_template(
+        headline = format_test_presentation_template(
             pres.headline_template,
             **fmt_ctx,
         ) or f"{event_text} for the {service_area_name}"
-        area_text = self._format_presentation_template(
+        area_text = format_test_presentation_template(
             pres.area_text,
             **fmt_ctx,
         ) or auto_area_text
-        discord_area_text = self._format_presentation_template(
+        discord_area_text = format_test_presentation_template(
             pres.discord_area_text,
             **{**fmt_ctx, "area_text": area_text},
         ) or area_text
@@ -3615,20 +3606,23 @@ class Orchestrator:
             codes = []
         return [str(x).strip() for x in codes if str(x).strip()]
 
-    def _tests_gate(self) -> tuple[bool, str]:
+    def _tests_gate(self, event_code: str = "") -> tuple[bool, str]:
         now = dt.datetime.now(tz=self._tz)
+        code = str(event_code or "").strip().upper()
+        test_cfg = self.cfg.tests.rwt if code == "RWT" else self.cfg.tests.rmt
+        gate = test_cfg.gate
 
-        if self.heightened_until and now < self.heightened_until:
+        if gate.block_heightened and self.heightened_until and now < self.heightened_until:
             return (False, "heightened mode active")
-        if self.last_toneout_at:
+        if gate.block_recent_toneout and self.last_toneout_at:
             if (now - self.last_toneout_at).total_seconds() < self._tests_toneout_cooldown_seconds():
                 return (False, "recent tone-out cooldown")
 
-        if self.cap_last_severe_at:
+        if gate.block_recent_severe_cap and self.cap_last_severe_at:
             if (now - self.cap_last_severe_at).total_seconds() < self._tests_cap_block_seconds():
                 return (False, "recent severe CAP match")
 
-        if self.ern_last_tone_at:
+        if gate.block_recent_ern and self.ern_last_tone_at:
             if (now - self.ern_last_tone_at).total_seconds() < self._tests_ern_block_seconds():
                 return (False, "recent ERN SAME activity")
 
@@ -3649,32 +3643,8 @@ class Orchestrator:
         )
         if _cfg_lines:
             lines = list(_cfg_lines)
-        elif code == "RWT":
-            lines = [
-                "This is the SeasonalNet IP Weather Radio station, SeasonalWeather.",
-                "The preceding signals were a test of this station's public warning system.",
-                "During dangerous weather or other civil emergencies, specially equipped receivers and monitoring systems can be activated automatically by this signal to warn of an approaching hazard.",
-                "Tests of this system are normally conducted on Wednesdays between 11 a.m. and noon.",
-                "If severe weather threatens, the test may be postponed until the next available good weather day.",
-                "Performance of your decoder, monitor, or alarm tone on this IP radio stream may vary depending on your monitoring setup.",
-                "For hazardous watches and warnings affecting our service area, this stream uses the standard warning alarm tone of 1050 Hz.",
-                "This broadcast also carries Specific Area Message Encoding, or SAME, allowing properly equipped receivers and software decoders to respond only to selected event codes and locations.",
-                "This concludes the weekly test of the SeasonalNet IP Weather Radio station, SeasonalWeather.",
-                "End of message.",
-            ]
         else:
-            lines = [
-                "This is the SeasonalNet IP Weather Radio station, SeasonalWeather.",
-                "The preceding signals were a test of this station's public warning system.",
-                "During dangerous weather or other civil emergencies, specially equipped receivers and monitoring systems can be activated automatically by this signal to warn of an approaching hazard.",
-                "This is the required monthly test of the SeasonalWeather public warning system.",
-                "Monthly tests are conducted to verify the full operation of the alert origination chain under normal conditions.",
-                "Performance of your decoder, monitor, or alarm tone on this IP radio stream may vary depending on your monitoring setup.",
-                "For hazardous watches and warnings affecting our service area, this stream uses the standard warning alarm tone of 1050 Hz.",
-                "This broadcast also carries Specific Area Message Encoding, or SAME, allowing properly equipped receivers and software decoders to respond only to selected event codes and locations.",
-                "This concludes the required monthly test of the SeasonalNet IP Weather Radio station, SeasonalWeather.",
-                "End of message.",
-            ]
+            lines = default_test_script_lines(code)
 
         spoken = "\n".join(lines).strip()
 
@@ -3931,6 +3901,14 @@ class Orchestrator:
                     max_postpone_hours=self._tests_max_postpone_hours(),
                     state_path=state_path,
                     state_key="rwt_rmt",
+                    rwt_postpone_policy=self.cfg.tests.rwt.postpone_policy,
+                    rwt_postpone_minutes=self.cfg.tests.rwt.postpone_minutes,
+                    rwt_max_postpone_hours=self.cfg.tests.rwt.max_postpone_hours,
+                    rwt_max_postpone_days=self.cfg.tests.rwt.max_postpone_days,
+                    rmt_postpone_policy=self.cfg.tests.rmt.postpone_policy,
+                    rmt_postpone_minutes=self.cfg.tests.rmt.postpone_minutes,
+                    rmt_max_postpone_hours=self.cfg.tests.rmt.max_postpone_hours,
+                    rmt_max_postpone_days=self.cfg.tests.rmt.max_postpone_days,
                 )
 
                 def _rlog(s: str) -> None:

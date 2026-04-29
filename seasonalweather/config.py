@@ -25,6 +25,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
+from .broadcast.tests import normalize_postpone_policy
+
 
 # ---------------------------------------------------------------------------
 # Helpers — only used here for the surviving env-sourced secrets
@@ -337,11 +339,24 @@ class SameDecConfig:
 # --- tests (RWT/RMT scheduling) ---
 
 @dataclass(frozen=True)
+class TestsGateConfig:
+    block_heightened: bool
+    block_recent_toneout: bool
+    block_recent_severe_cap: bool
+    block_recent_ern: bool
+
+
+@dataclass(frozen=True)
 class TestsScheduleConfig:
     weekday: int
     hour: int
     minute: int
     script_lines: tuple[str, ...]  # spoken text lines; empty = use built-in default
+    postpone_policy: str
+    postpone_minutes: int
+    max_postpone_hours: int
+    max_postpone_days: int
+    gate: TestsGateConfig
 
 
 @dataclass(frozen=True)
@@ -351,6 +366,11 @@ class TestsRmtConfig:
     hour: int
     minute: int
     script_lines: tuple[str, ...]  # spoken text lines; empty = use built-in default
+    postpone_policy: str
+    postpone_minutes: int
+    max_postpone_hours: int
+    max_postpone_days: int
+    gate: TestsGateConfig
 
 
 @dataclass(frozen=True)
@@ -364,8 +384,10 @@ class TestsPresentationConfig:
 @dataclass(frozen=True)
 class TestsConfig:
     enabled: bool
+    postpone_policy: str
     postpone_minutes: int
     max_postpone_hours: int
+    max_postpone_days: int
     jitter_seconds: int
     toneout_cooldown_seconds: int
     cap_block_seconds: int
@@ -953,10 +975,35 @@ def load_config(path: str) -> AppConfig:
     rwt_raw = tst_raw.get("rwt", {})
     rmt_raw = tst_raw.get("rmt", {})
     tst_present_raw = tst_raw.get("presentation", {})
+
+    global_postpone_policy = normalize_postpone_policy(
+        tst_raw.get("postpone_policy", "delay_window"),
+        "delay_window",
+    )
+    global_postpone_minutes = int(tst_raw.get("postpone_minutes", 15))
+    global_max_postpone_hours = int(tst_raw.get("max_postpone_hours", 6))
+    global_max_postpone_days = int(tst_raw.get("max_postpone_days", 2))
+    rwt_default_postpone_policy = (
+        global_postpone_policy if "postpone_policy" in tst_raw else "next_day"
+    )
+
+    def _tests_gate_config(section_raw: Dict[str, Any]) -> TestsGateConfig:
+        gate_raw = section_raw.get("gate", {})
+        if not isinstance(gate_raw, dict):
+            gate_raw = {}
+        return TestsGateConfig(
+            block_heightened=bool(gate_raw.get("block_heightened", True)),
+            block_recent_toneout=bool(gate_raw.get("block_recent_toneout", True)),
+            block_recent_severe_cap=bool(gate_raw.get("block_recent_severe_cap", True)),
+            block_recent_ern=bool(gate_raw.get("block_recent_ern", True)),
+        )
+
     tests = TestsConfig(
         enabled=bool(tst_raw.get("enabled", False)),
-        postpone_minutes=int(tst_raw.get("postpone_minutes", 15)),
-        max_postpone_hours=int(tst_raw.get("max_postpone_hours", 6)),
+        postpone_policy=global_postpone_policy,
+        postpone_minutes=global_postpone_minutes,
+        max_postpone_hours=global_max_postpone_hours,
+        max_postpone_days=global_max_postpone_days,
         jitter_seconds=int(tst_raw.get("jitter_seconds", 60)),
         toneout_cooldown_seconds=int(
             tst_raw.get("toneout_cooldown_seconds", cycle.min_heightened_seconds)
@@ -979,6 +1026,14 @@ def load_config(path: str) -> AppConfig:
             hour=int(rwt_raw.get("hour", 11)),
             minute=int(rwt_raw.get("minute", 0)),
             script_lines=tuple(str(x) for x in rwt_raw.get("script_lines", []) if str(x).strip()),
+            postpone_policy=normalize_postpone_policy(
+                rwt_raw.get("postpone_policy", rwt_default_postpone_policy),
+                "next_day",
+            ),
+            postpone_minutes=int(rwt_raw.get("postpone_minutes", global_postpone_minutes)),
+            max_postpone_hours=int(rwt_raw.get("max_postpone_hours", global_max_postpone_hours)),
+            max_postpone_days=int(rwt_raw.get("max_postpone_days", global_max_postpone_days)),
+            gate=_tests_gate_config(rwt_raw),
         ),
         rmt=TestsRmtConfig(
             nth=int(rmt_raw.get("nth", 1)),
@@ -986,6 +1041,14 @@ def load_config(path: str) -> AppConfig:
             hour=int(rmt_raw.get("hour", 11)),
             minute=int(rmt_raw.get("minute", 0)),
             script_lines=tuple(str(x) for x in rmt_raw.get("script_lines", []) if str(x).strip()),
+            postpone_policy=normalize_postpone_policy(
+                rmt_raw.get("postpone_policy", global_postpone_policy),
+                "delay_window",
+            ),
+            postpone_minutes=int(rmt_raw.get("postpone_minutes", global_postpone_minutes)),
+            max_postpone_hours=int(rmt_raw.get("max_postpone_hours", global_max_postpone_hours)),
+            max_postpone_days=int(rmt_raw.get("max_postpone_days", 0)),
+            gate=_tests_gate_config(rmt_raw),
         ),
     )
 
