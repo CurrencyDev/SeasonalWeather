@@ -234,7 +234,10 @@ if [[ "${SEASONAL_VOICETEXT_PAUL:-0}" == "1" ]]; then
   VTP_ENGINE_DIR="${VTP_BASE}/WeatherRadioSuite-LIB"
   VTP_BIN_DIR="${VTP_ENGINE_DIR}/binary"
   VTP_EXE="${VTP_BIN_DIR}/voicetext_paul.exe"
-  VTP_CDN="https://cdn.dondaplayer.com/WeatherRadioSuite-LIB.zip"
+  VTP_DEFAULT_SOURCE="https://cdn.dondaplayer.com/WeatherRadioSuite-LIB.zip"
+  VTP_SOURCE="${SEASONAL_VOICETEXT_PAUL_SOURCE:-${SEASONAL_VOICETEXT_PAUL_ZIP_URL:-${VTP_DEFAULT_SOURCE}}}"
+  VTP_SHA256="${SEASONAL_VOICETEXT_PAUL_SHA256:-}"
+  VTP_REFRESH="${SEASONAL_VOICETEXT_PAUL_REFRESH:-0}"
   VTP_SYNTH="/usr/local/bin/voicetext_paul_synth"
   VTP_WSKILL="/usr/local/bin/voicetext_paul_wineserver_kill"
   VTP_SUDOERS="/etc/sudoers.d/seasonalweather-voicetext-paul"
@@ -256,16 +259,60 @@ if [[ "${SEASONAL_VOICETEXT_PAUL:-0}" == "1" ]]; then
   install -d -o "${VTP_USER}"    -g "${VTP_USER}"    "${VTP_ENGINE_DIR}"
   install -d -o "${VTP_USER}"    -g "${VTP_USER}"    "${VTP_BIN_DIR}"
 
-  if [[ ! -f "${VTP_EXE}" ]]; then
-    log "Downloading WeatherRadioSuite-LIB.zip"
-    TMP_ZIP="$(mktemp /tmp/WeatherRadioSuite-LIB.XXXXXX.zip)"
-    curl -fsSL --max-time 120 "${VTP_CDN}" -o "${TMP_ZIP}"
-    unzip -o "${TMP_ZIP}" -d "${VTP_ENGINE_DIR}"
-    rm -f "${TMP_ZIP}"
+  if [[ ! -f "${VTP_EXE}" || "${VTP_REFRESH}" == "1" ]]; then
+    if [[ "${VTP_REFRESH}" == "1" ]]; then
+      log "Refreshing VoiceText Paul runtime from configured source"
+      rm -rf "${VTP_ENGINE_DIR:?}/"*
+      install -d -o "${VTP_USER}" -g "${VTP_USER}" "${VTP_ENGINE_DIR}" "${VTP_BIN_DIR}"
+    fi
+
+    TMP_SRC=""
+    if [[ -d "${VTP_SOURCE}" ]]; then
+      log "Installing VoiceText Paul runtime from local directory: ${VTP_SOURCE}"
+      cp -a "${VTP_SOURCE}/." "${VTP_ENGINE_DIR}/"
+    else
+      if [[ -f "${VTP_SOURCE}" ]]; then
+        log "Installing VoiceText Paul runtime from local archive: ${VTP_SOURCE}"
+        TMP_SRC="${VTP_SOURCE}"
+      else
+        log "Downloading VoiceText Paul runtime archive: ${VTP_SOURCE}"
+        TMP_SRC="$(mktemp /tmp/WeatherRadioSuite-LIB.XXXXXX.archive)"
+        curl -fsSL --max-time 120 "${VTP_SOURCE}" -o "${TMP_SRC}"
+      fi
+
+      if [[ -n "${VTP_SHA256}" ]]; then
+        echo "${VTP_SHA256}  ${TMP_SRC}" | sha256sum -c -
+      else
+        warn "SEASONAL_VOICETEXT_PAUL_SHA256 is unset; runtime archive is not checksum-pinned"
+      fi
+
+      case "${TMP_SRC}" in
+        *.tar.gz|*.tgz)
+          tar -xzf "${TMP_SRC}" -C "${VTP_ENGINE_DIR}"
+          ;;
+        *.zip|*.archive|*)
+          unzip -o "${TMP_SRC}" -d "${VTP_ENGINE_DIR}"
+          ;;
+      esac
+      if [[ "${TMP_SRC}" == /tmp/WeatherRadioSuite-LIB.*.archive ]]; then
+        rm -f "${TMP_SRC}"
+      fi
+    fi
+
+    if [[ ! -f "${VTP_EXE}" && -f "${VTP_ENGINE_DIR}/WeatherRadioSuite-LIB/binary/voicetext_paul.exe" ]]; then
+      log "Detected nested WeatherRadioSuite-LIB directory; normalizing runtime layout"
+      cp -a "${VTP_ENGINE_DIR}/WeatherRadioSuite-LIB/." "${VTP_ENGINE_DIR}/"
+      rm -rf "${VTP_ENGINE_DIR}/WeatherRadioSuite-LIB"
+    fi
+
     chown -R "${VTP_USER}:${VTP_USER}" "${VTP_ENGINE_DIR}"
-    log "VoiceText Paul binary extracted to ${VTP_BIN_DIR}"
+    if [[ ! -f "${VTP_EXE}" ]]; then
+      warn "VoiceText Paul archive did not provide ${VTP_EXE}"
+      exit 1
+    fi
+    log "VoiceText Paul binary installed at ${VTP_EXE}"
   else
-    log "VoiceText Paul binary already present — skipping download"
+    log "VoiceText Paul binary already present - skipping runtime install"
   fi
 
   log "Installing VoiceText Paul wrapper scripts from repo"
@@ -346,6 +393,32 @@ systemctl daemon-reload
 if [[ "${SEASONAL_VOICETEXT_PAUL:-0}" == "1" && -f /etc/systemd/system/seasonalweather-voicetext-xvfb.service ]]; then
   log "Enabling seasonalweather-voicetext-xvfb service"
   systemctl enable --now seasonalweather-voicetext-xvfb.service
+
+  if [[ "${SEASONAL_VOICETEXT_PAUL_SMOKE:-1}" == "1" ]]; then
+    log "Running VoiceText Paul smoke test"
+    for _ in $(seq 1 50); do
+      [[ -S /tmp/.X11-unix/X99 ]] && break
+      sleep 0.2
+    done
+
+    VTP_STDERR="$(mktemp /tmp/voicetext-paul-smoke.XXXXXX.err)"
+    if ! printf '%s\n' 'VoiceText Paul deployment test.' | runuser -u "${VTP_USER}" -- env \
+        SEASONALWEATHER_DATA_BASE="${VTP_STATE_BASE}" \
+        VOICETEXT_DEBUG="${VOICETEXT_DEBUG:-0}" \
+        "${VTP_SYNTH}" >/dev/null 2>"${VTP_STDERR}"; then
+      warn "VoiceText Paul smoke test failed; the backend is not safe to enable yet"
+      warn "Smoke stderr follows:"
+      sed 's/^/[voicetext-paul-smoke] /' "${VTP_STDERR}" >&2 || true
+      warn "If this was a reinstall after an older failed bootstrap, remove ${VTP_STATE_BASE}/wineprefixes/voicetext_paul_voicetext and rerun bootstrap."
+      warn "If it still fails, provide a known-good runtime with SEASONAL_VOICETEXT_PAUL_SOURCE and optionally SEASONAL_VOICETEXT_PAUL_SHA256."
+      rm -f "${VTP_STDERR}"
+      exit 1
+    fi
+    rm -f "${VTP_STDERR}" "${VTP_BIN_DIR}/output.wav" "${VTP_BIN_DIR}/input1.txt" 2>/dev/null || true
+    log "VoiceText Paul smoke test passed"
+  else
+    warn "Skipping VoiceText Paul smoke test (SEASONAL_VOICETEXT_PAUL_SMOKE=0)"
+  fi
 fi
 
 log "Installing helper scripts (if present in repo)"

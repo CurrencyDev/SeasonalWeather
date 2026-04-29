@@ -28,14 +28,15 @@ def test_voicetext_wrappers_default_to_headless_display_service() -> None:
     assert 'ExecStart=/usr/bin/Xvfb :99 -screen 0 1024x768x24 -nolisten tcp -noreset -ac' in unit
 
 
-def test_voicetext_wrapper_uses_32bit_wine_prefix_for_fresh_installs() -> None:
+def test_voicetext_wrapper_does_not_force_winearch_by_default() -> None:
     synth = (REPO_ROOT / "scripts/wrappers/voicetext_paul_synth").read_text()
     kill = (REPO_ROOT / "scripts/wrappers/voicetext_paul_wineserver_kill").read_text()
 
-    assert '[[ ! -f "${PREFIX}/system.reg" ]]' in synth
-    assert 'VOICETEXT_PAUL_WINEARCH:-win32' in synth
+    assert 'REQUESTED_WINEARCH="${VOICETEXT_PAUL_WINEARCH:-}"' in synth
+    assert '[[ ! -f "${PREFIX}/system.reg" && -n "${REQUESTED_WINEARCH}" ]]' in synth
+    assert 'VOICETEXT_PAUL_WINEARCH:-win32' not in synth
     assert 'VOICETEXT_PAUL_WINEDLLOVERRIDES:-mscoree,mshtml=' in synth
-    assert 'VOICETEXT_PAUL_WINEARCH:-win32' in kill
+    assert 'VOICETEXT_PAUL_WINEARCH:-win32' not in kill
 
 
 def test_voicetext_runtime_serializes_python_side_access_to_shared_wav() -> None:

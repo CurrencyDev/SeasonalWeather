@@ -114,8 +114,31 @@ letting Wine abort without context.
 
 ## VoiceText Paul Wine/runtime notes
 
-Fresh VoiceText Paul installs provision i386 architecture and install the 32-bit Wine stack because the VoiceText runtime may require 32-bit Wine support on otherwise 64-bit hosts. The wrapper also creates new prefixes as `WINEARCH=win32`; existing prefixes are left alone to avoid Wine rejecting a mismatched architecture.
+Fresh VoiceText Paul installs provision i386 architecture and install the 32-bit Wine stack because the VoiceText runtime may require 32-bit Wine support on otherwise 64-bit hosts. The wrapper does not force `WINEARCH` by default; operators may explicitly set `VOICETEXT_PAUL_WINEARCH` only after validating that a specific Wine build requires it.
 
 The Xvfb unit is started with access control disabled for this private local display, and the wrapper probes the display with `xdpyinfo` when available. If Wine fails after those preflight checks, the wrapper prints the tail of the saved Wine log into journald and preserves the full log under `/var/lib/seasonalweather/tmp/`.
 
 SeasonalWeather also serializes the Python-side VoiceText call path before invoking the wrapper. This avoids concurrent segment refresh jobs deleting or copying the shared `output.wav` while another synthesis is still returning from Wine.
+
+## VoiceText Paul runtime source and smoke test
+
+The VoiceText Paul Windows runtime is treated as a pinned deployment artifact,
+not just a convenience download. Fresh installs should use a runtime source that
+has been smoke-tested on a known-good SeasonalWeather host.
+
+Bootstrap accepts these optional variables when `SEASONAL_VOICETEXT_PAUL=1`:
+
+- `SEASONAL_VOICETEXT_PAUL_SOURCE`: URL, local archive, or local directory to install.
+- `SEASONAL_VOICETEXT_PAUL_ZIP_URL`: legacy alias for a URL source.
+- `SEASONAL_VOICETEXT_PAUL_SHA256`: optional SHA-256 checksum for archive sources.
+- `SEASONAL_VOICETEXT_PAUL_REFRESH=1`: replace an existing runtime from the configured source.
+- `SEASONAL_VOICETEXT_PAUL_SMOKE=0`: skip the post-install smoke test; not recommended.
+
+When enabled, bootstrap starts `seasonalweather-voicetext-xvfb.service` and runs
+a small VoiceText Paul synthesis before declaring the backend installed. If the
+smoke test fails, bootstrap exits non-zero rather than leaving a service that
+will immediately spam segment refresh failures.
+
+The wrapper no longer forces `WINEARCH=win32` for fresh prefixes. It uses Wine's
+default prefix behavior unless `VOICETEXT_PAUL_WINEARCH` is explicitly set for a
+host that has been validated to require a specific architecture.

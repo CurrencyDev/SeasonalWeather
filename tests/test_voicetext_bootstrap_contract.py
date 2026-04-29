@@ -29,3 +29,13 @@ def test_bootstrap_installs_and_enables_voicetext_xvfb_service() -> None:
     assert 'systemctl enable --now seasonalweather-voicetext-xvfb.service' in bootstrap
     assert 'VTP_SYSTEMD_DROPIN="${VTP_SYSTEMD_DROPIN_DIR}/10-voicetext-paul.conf"' in bootstrap
     assert 'After=seasonalweather-voicetext-xvfb.service' in bootstrap
+
+
+def test_bootstrap_smoke_tests_voicetext_paul_before_service_use() -> None:
+    bootstrap = (REPO_ROOT / "scripts/00-bootstrap.sh").read_text()
+
+    assert 'SEASONAL_VOICETEXT_PAUL_SOURCE' in bootstrap
+    assert 'SEASONAL_VOICETEXT_PAUL_SHA256' in bootstrap
+    assert 'SEASONAL_VOICETEXT_PAUL_SMOKE:-1' in bootstrap
+    assert 'VoiceText Paul smoke test failed; the backend is not safe to enable yet' in bootstrap
+    assert 'runuser -u "${VTP_USER}" -- env' in bootstrap

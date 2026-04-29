@@ -22,11 +22,14 @@ PREFIX="${VOICETEXT_PAUL_WINEPREFIX:-${PREFIX_BASE}/${PREFIX_NAME}}"
 TMPD="${VOICETEXT_PAUL_TMPDIR:-${STATE_BASE}/tmp}"
 
 export WINEPREFIX="${PREFIX}"
-# VoiceText Paul deployments often need the 32-bit Wine stack. Use a win32
-# prefix for fresh installs, but never force WINEARCH after a prefix exists
-# because Wine rejects mismatched WINEARCH values.
-if [[ ! -f "${PREFIX}/system.reg" ]]; then
-  export WINEARCH="${VOICETEXT_PAUL_WINEARCH:-win32}"
+# Do not force WINEARCH by default. Canonical working deployments use Wine's
+# default WoW64-capable prefix behavior; forcing a pure win32 prefix has caused
+# fresh VoiceText Paul installs to abort with allocator crashes on some hosts.
+# Operators may still set VOICETEXT_PAUL_WINEARCH=win32 explicitly when they
+# have validated that a particular Wine build requires it.
+REQUESTED_WINEARCH="${VOICETEXT_PAUL_WINEARCH:-}"
+if [[ ! -f "${PREFIX}/system.reg" && -n "${REQUESTED_WINEARCH}" ]]; then
+  export WINEARCH="${REQUESTED_WINEARCH}"
 else
   unset WINEARCH
 fi
