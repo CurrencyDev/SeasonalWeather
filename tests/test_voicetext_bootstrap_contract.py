@@ -9,8 +9,21 @@ def test_bootstrap_provisions_voicetext_runtime_dirs_under_canonical_state_root(
 
     assert 'VTP_STATE_BASE="${SEASONALWEATHER_DATA_BASE:-/var/lib/seasonalweather}"' in bootstrap
     assert 'install -d -o seasonalweather -g seasonalweather "${VTP_STATE_BASE}/voices"' in bootstrap
+    assert 'install -d -o seasonalweather -g seasonalweather -m 2775 "${VTP_BASE}"' in bootstrap
+    assert 'install -d -o seasonalweather -g seasonalweather -m 2775 "${VTP_BIN_DIR}"' in bootstrap
     assert 'install -d -o "${VTP_USER}"    -g "${VTP_USER}"    "${VTP_STATE_BASE}/wineprefixes"' in bootstrap
     assert 'install -d -m 700 -o "${VTP_USER}" -g "${VTP_USER}" "${VTP_STATE_BASE}/tmp"' in bootstrap
+
+
+def test_bootstrap_normalizes_voicetext_shared_runtime_permissions() -> None:
+    bootstrap = (REPO_ROOT / "scripts/00-bootstrap.sh").read_text()
+
+    assert 'usermod -aG seasonalweather "${VTP_USER}"' in bootstrap
+    assert 'Normalizing VoiceText Paul runtime permissions for seasonalweather + ${VTP_USER}' in bootstrap
+    assert 'chown -R seasonalweather:seasonalweather "${VTP_ENGINE_DIR}"' in bootstrap
+    assert 'chmod -R u+rwX,g+rwX,o-rwx "${VTP_ENGINE_DIR}"' in bootstrap
+    assert 'find "${VTP_ENGINE_DIR}" -type d -exec chmod 2775 {} +' in bootstrap
+    assert 'rm -f "${VTP_BIN_DIR}/output.wav" "${VTP_BIN_DIR}/.voicetext_paul.flock"' in bootstrap
 
 
 def test_bootstrap_does_not_recursively_clobber_voicetext_owned_state() -> None:
@@ -40,6 +53,8 @@ def test_bootstrap_smoke_tests_voicetext_paul_before_service_use() -> None:
     assert 'SEASONAL_VOICETEXT_PAUL_SMOKE:-1' in bootstrap
     assert 'VoiceText Paul smoke test failed; the backend is not safe to enable yet' in bootstrap
     assert 'runuser -u "${VTP_USER}" -- env' in bootstrap
+    assert 'runuser -u seasonalweather -- rm -f "${VTP_BIN_DIR}/output.wav"' in bootstrap
+    assert 'VoiceText Paul smoke test synthesized audio, but seasonalweather could not clean up output.wav' in bootstrap
     assert 'Initializing VoiceText Paul Wine prefix' in bootstrap
     assert 'wineboot --init; wineserver -w' in bootstrap
 

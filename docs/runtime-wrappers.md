@@ -139,9 +139,22 @@ a small VoiceText Paul synthesis before declaring the backend installed. If the
 smoke test fails, bootstrap exits non-zero rather than leaving a service that
 will immediately spam segment refresh failures.
 
-The wrapper no longer forces `WINEARCH=win32` for fresh prefixes. It uses Wine's
-default prefix behavior unless `VOICETEXT_PAUL_WINEARCH` is explicitly set for a
-host that has been validated to require a specific architecture.
+The wrapper defaults fresh prefixes to `WINEARCH=win32` because VoiceText Paul is
+a 32-bit Windows runtime and small SeasonalWeather VMs should not need the full
+`wine64` package set. Operators may set `VOICETEXT_PAUL_WINEARCH=auto` only after
+validating a host-specific need for Wine's default prefix behavior.
+
+The runtime directory is shared between two local users:
+
+- `voicetext` runs the Wine wrapper and creates `input1.txt`, `output.wav`, and
+  `.voicetext_paul.flock`.
+- `seasonalweather` runs the Python service and must be able to remove or copy
+  `output.wav` after synthesis.
+
+Bootstrap therefore makes the runtime tree group-owned by `seasonalweather`,
+adds `voicetext` to that group, sets setgid on runtime directories, and verifies
+during the smoke test that `seasonalweather` can clean up the WAV produced by
+`voicetext`.
 
 
 ## VoiceText Paul fresh-deployment behavior

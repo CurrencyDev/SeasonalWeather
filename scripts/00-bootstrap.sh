@@ -256,15 +256,20 @@ if [[ "${SEASONAL_VOICETEXT_PAUL:-0}" == "1" ]]; then
   fi
   install -d -o "${VTP_USER}" -g "${VTP_USER}" "${VTP_HOME}"
 
+  if ! id -nG "${VTP_USER}" | tr ' ' '\n' | grep -qx seasonalweather; then
+    log "Adding ${VTP_USER} to seasonalweather group for shared VoiceText runtime access"
+    usermod -aG seasonalweather "${VTP_USER}"
+  fi
+
   install -d -o seasonalweather -g seasonalweather "${VTP_STATE_BASE}"
   install -d -o seasonalweather -g seasonalweather "${VTP_STATE_BASE}/audio"
   install -d -o seasonalweather -g seasonalweather "${VTP_STATE_BASE}/cache"
   install -d -o seasonalweather -g seasonalweather "${VTP_STATE_BASE}/voices"
-  install -d -o "${VTP_USER}"    -g "${VTP_USER}"    "${VTP_BASE}"
+  install -d -o seasonalweather -g seasonalweather -m 2775 "${VTP_BASE}"
   install -d -o "${VTP_USER}"    -g "${VTP_USER}"    "${VTP_STATE_BASE}/wineprefixes"
   install -d -m 700 -o "${VTP_USER}" -g "${VTP_USER}" "${VTP_STATE_BASE}/tmp"
-  install -d -o "${VTP_USER}"    -g "${VTP_USER}"    "${VTP_ENGINE_DIR}"
-  install -d -o "${VTP_USER}"    -g "${VTP_USER}"    "${VTP_BIN_DIR}"
+  install -d -o seasonalweather -g seasonalweather -m 2775 "${VTP_ENGINE_DIR}"
+  install -d -o seasonalweather -g seasonalweather -m 2775 "${VTP_BIN_DIR}"
 
   if [[ ! -f "${VTP_EXE}" || "${VTP_REFRESH}" == "1" ]]; then
     if [[ "${VTP_REFRESH}" == "1" ]]; then
@@ -312,7 +317,9 @@ if [[ "${SEASONAL_VOICETEXT_PAUL:-0}" == "1" ]]; then
       rm -rf "${VTP_ENGINE_DIR}/WeatherRadioSuite-LIB"
     fi
 
-    chown -R "${VTP_USER}:${VTP_USER}" "${VTP_ENGINE_DIR}"
+    chown -R seasonalweather:seasonalweather "${VTP_ENGINE_DIR}"
+    chmod -R u+rwX,g+rwX,o-rwx "${VTP_ENGINE_DIR}"
+    find "${VTP_ENGINE_DIR}" -type d -exec chmod 2775 {} +
     if [[ ! -f "${VTP_EXE}" ]]; then
       warn "VoiceText Paul archive did not provide ${VTP_EXE}"
       exit 1
@@ -321,6 +328,12 @@ if [[ "${SEASONAL_VOICETEXT_PAUL:-0}" == "1" ]]; then
   else
     log "VoiceText Paul binary already present - skipping runtime install"
   fi
+
+  log "Normalizing VoiceText Paul runtime permissions for seasonalweather + ${VTP_USER}"
+  chown -R seasonalweather:seasonalweather "${VTP_ENGINE_DIR}"
+  chmod -R u+rwX,g+rwX,o-rwx "${VTP_ENGINE_DIR}"
+  find "${VTP_ENGINE_DIR}" -type d -exec chmod 2775 {} +
+  rm -f "${VTP_BIN_DIR}/output.wav" "${VTP_BIN_DIR}/.voicetext_paul.flock"
 
   log "Installing VoiceText Paul wrapper scripts from repo"
   install_repo_wrapper voicetext_paul_synth
@@ -428,7 +441,14 @@ if [[ "${SEASONAL_VOICETEXT_PAUL:-0}" == "1" && -f /etc/systemd/system/seasonalw
       sleep 0.2
     done
 
+    if ! runuser -u "${VTP_USER}" -- test -w "${VTP_BIN_DIR}" || ! runuser -u seasonalweather -- test -w "${VTP_BIN_DIR}"; then
+      warn "VoiceText Paul runtime directory is not writable by both seasonalweather and ${VTP_USER}: ${VTP_BIN_DIR}"
+      warn "Expected setgid seasonalweather group ownership; rerun bootstrap after checking user/group setup."
+      exit 1
+    fi
+
     VTP_STDERR="$(mktemp /tmp/voicetext-paul-smoke.XXXXXX.err)"
+    rm -f "${VTP_BIN_DIR}/output.wav" "${VTP_BIN_DIR}/input1.txt"
     if ! printf '%s\n' 'VoiceText Paul deployment test.' | runuser -u "${VTP_USER}" -- env \
         SEASONALWEATHER_DATA_BASE="${VTP_STATE_BASE}" \
         VOICETEXT_DEBUG="${VOICETEXT_DEBUG:-0}" \
@@ -441,7 +461,17 @@ if [[ "${SEASONAL_VOICETEXT_PAUL:-0}" == "1" && -f /etc/systemd/system/seasonalw
       rm -f "${VTP_STDERR}"
       exit 1
     fi
-    rm -f "${VTP_STDERR}" "${VTP_BIN_DIR}/output.wav" "${VTP_BIN_DIR}/input1.txt" 2>/dev/null || true
+    rm -f "${VTP_STDERR}"
+    if [[ ! -s "${VTP_BIN_DIR}/output.wav" ]]; then
+      warn "VoiceText Paul smoke test did not leave a usable output.wav for cross-user cleanup validation"
+      exit 1
+    fi
+    if ! runuser -u seasonalweather -- rm -f "${VTP_BIN_DIR}/output.wav"; then
+      warn "VoiceText Paul smoke test synthesized audio, but seasonalweather could not clean up output.wav"
+      warn "Check group ownership and setgid permissions on ${VTP_BIN_DIR}"
+      exit 1
+    fi
+    rm -f "${VTP_BIN_DIR}/input1.txt" "${VTP_BIN_DIR}/.voicetext_paul.flock" 2>/dev/null || true
     log "VoiceText Paul smoke test passed"
   else
     warn "Skipping VoiceText Paul smoke test (SEASONAL_VOICETEXT_PAUL_SMOKE=0)"
