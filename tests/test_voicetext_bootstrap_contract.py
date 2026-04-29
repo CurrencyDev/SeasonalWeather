@@ -24,7 +24,8 @@ def test_bootstrap_installs_and_enables_voicetext_xvfb_service() -> None:
     bootstrap = (REPO_ROOT / "scripts/00-bootstrap.sh").read_text()
 
     assert 'dpkg --add-architecture i386' in bootstrap
-    assert 'apt-get install -y --no-install-recommends wine wine64 wine32:i386 unzip xvfb x11-utils' in bootstrap
+    assert 'apt-get install -y --no-install-recommends wine wine32:i386 unzip xvfb x11-utils' in bootstrap
+    assert 'wine wine64 wine32:i386' not in bootstrap
     assert 'cp /opt/seasonalweather/app/systemd/seasonalweather-voicetext-xvfb.service /etc/systemd/system/seasonalweather-voicetext-xvfb.service' in bootstrap
     assert 'systemctl enable --now seasonalweather-voicetext-xvfb.service' in bootstrap
     assert 'VTP_SYSTEMD_DROPIN="${VTP_SYSTEMD_DROPIN_DIR}/10-voicetext-paul.conf"' in bootstrap
@@ -39,3 +40,12 @@ def test_bootstrap_smoke_tests_voicetext_paul_before_service_use() -> None:
     assert 'SEASONAL_VOICETEXT_PAUL_SMOKE:-1' in bootstrap
     assert 'VoiceText Paul smoke test failed; the backend is not safe to enable yet' in bootstrap
     assert 'runuser -u "${VTP_USER}" -- env' in bootstrap
+    assert 'Initializing VoiceText Paul Wine prefix' in bootstrap
+    assert 'wineboot --init; wineserver -w' in bootstrap
+
+
+def test_bootstrap_preserves_git_checkout_in_deployed_app_tree() -> None:
+    bootstrap = (REPO_ROOT / "scripts/00-bootstrap.sh").read_text()
+
+    assert 'rsync -a --delete "${SRC_DIR}/" /opt/seasonalweather/app/' in bootstrap
+    assert '--exclude ".git"' not in bootstrap

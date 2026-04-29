@@ -142,3 +142,18 @@ will immediately spam segment refresh failures.
 The wrapper no longer forces `WINEARCH=win32` for fresh prefixes. It uses Wine's
 default prefix behavior unless `VOICETEXT_PAUL_WINEARCH` is explicitly set for a
 host that has been validated to require a specific architecture.
+
+
+## VoiceText Paul fresh-deployment behavior
+
+Fresh VoiceText Paul deployments use a dedicated Wine prefix at
+`/var/lib/seasonalweather/wineprefixes/voicetext_paul_voicetext`.
+The wrapper defaults to a 32-bit Wine prefix because VoiceText Paul is a
+32-bit Windows runtime and small SeasonalWeather VMs do not have enough root
+partition budget for the full `wine64` package set.
+
+Bootstrap installs `wine` plus `wine32`, initializes the prefix with
+`wineboot --init`, and then runs a small synthesis smoke test before the backend
+is considered safe to enable. Operators may set `VOICETEXT_PAUL_WINEARCH=auto`
+to let Wine choose a prefix architecture, but that is not the default supported
+fresh-install path.

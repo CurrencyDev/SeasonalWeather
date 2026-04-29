@@ -22,13 +22,11 @@ PREFIX="${VOICETEXT_PAUL_WINEPREFIX:-${PREFIX_BASE}/${PREFIX_NAME}}"
 TMPD="${VOICETEXT_PAUL_TMPDIR:-${STATE_BASE}/tmp}"
 
 export WINEPREFIX="${PREFIX}"
-# Do not force WINEARCH by default. Canonical working deployments use Wine's
-# default WoW64-capable prefix behavior; forcing a pure win32 prefix has caused
-# fresh VoiceText Paul installs to abort with allocator crashes on some hosts.
-# Operators may still set VOICETEXT_PAUL_WINEARCH=win32 explicitly when they
-# have validated that a particular Wine build requires it.
-REQUESTED_WINEARCH="${VOICETEXT_PAUL_WINEARCH:-}"
-if [[ ! -f "${PREFIX}/system.reg" && -n "${REQUESTED_WINEARCH}" ]]; then
+# VoiceText Paul is a 32-bit Windows runtime. Default to a pure 32-bit prefix so
+# fresh deployments do not require the much larger wine64 package on small-root
+# VMs. Operators may set VOICETEXT_PAUL_WINEARCH=auto to let Wine choose.
+REQUESTED_WINEARCH="${VOICETEXT_PAUL_WINEARCH:-win32}"
+if [[ ! -f "${PREFIX}/system.reg" && "${REQUESTED_WINEARCH}" != "auto" ]]; then
   export WINEARCH="${REQUESTED_WINEARCH}"
 else
   unset WINEARCH
@@ -103,6 +101,15 @@ fi
 if ! command -v wine >/dev/null 2>&1; then
   echo "[voicetext_paul_synth] wine is not installed or not in PATH" >&2
   exit 1
+fi
+
+if [[ ! -f "${PREFIX}/system.reg" ]]; then
+  echo "[voicetext_paul_synth] initializing Wine prefix at ${PREFIX}" >&2
+  if ! timeout 60s wineboot --init >&2 2>&1; then
+    echo "[voicetext_paul_synth] wineboot --init failed for ${PREFIX}" >&2
+    exit 1
+  fi
+  wineserver -w || true
 fi
 
 set +e

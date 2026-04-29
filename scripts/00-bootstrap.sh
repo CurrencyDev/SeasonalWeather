@@ -91,7 +91,7 @@ install -d -o root            -g root            /etc/seasonalweather
 log "Syncing app to /opt/seasonalweather/app"
 install -d -o root -g root /opt/seasonalweather
 install -d -o root -g root /opt/seasonalweather/app
-rsync -a --delete --exclude ".git" "${SRC_DIR}/" /opt/seasonalweather/app/
+rsync -a --delete "${SRC_DIR}/" /opt/seasonalweather/app/
 
 # -----------------------------------------------------------------------------------------
 # Python venv
@@ -222,9 +222,14 @@ if [[ "${SEASONAL_VOICETEXT_PAUL:-0}" == "1" ]]; then
     dpkg --add-architecture i386
     apt-get update
   fi
-  if ! apt-get install -y --no-install-recommends wine wine64 wine32:i386 unzip xvfb x11-utils; then
+  if dpkg-query -W -f='${db:Status-Abbrev}' wine64 2>/dev/null | grep -qvE '^un|^pn'; then
+    warn "wine64 is installed or partially installed; VoiceText Paul does not require it and small-root deployments may need it removed"
+    warn "  To remove a broken/partial wine64 install manually: apt-get purge wine64 && apt-get autoremove"
+  fi
+
+  if ! apt-get install -y --no-install-recommends wine wine32:i386 unzip xvfb x11-utils; then
     warn "wine32:i386 install failed; retrying with distro wine32 package name"
-    apt-get install -y --no-install-recommends wine wine64 wine32 unzip xvfb x11-utils
+    apt-get install -y --no-install-recommends wine wine32 unzip xvfb x11-utils
   fi
 
   VTP_USER="voicetext"
@@ -240,6 +245,8 @@ if [[ "${SEASONAL_VOICETEXT_PAUL:-0}" == "1" ]]; then
   VTP_REFRESH="${SEASONAL_VOICETEXT_PAUL_REFRESH:-0}"
   VTP_SYNTH="/usr/local/bin/voicetext_paul_synth"
   VTP_WSKILL="/usr/local/bin/voicetext_paul_wineserver_kill"
+  VTP_WINEARCH="${VOICETEXT_PAUL_WINEARCH:-win32}"
+  VTP_WINEPREFIX="${VOICETEXT_PAUL_WINEPREFIX:-${VTP_STATE_BASE}/wineprefixes/voicetext_paul_voicetext}"
   VTP_SUDOERS="/etc/sudoers.d/seasonalweather-voicetext-paul"
   VTP_SYSTEMD_DROPIN_DIR="/etc/systemd/system/seasonalweather.service.d"
   VTP_SYSTEMD_DROPIN="${VTP_SYSTEMD_DROPIN_DIR}/10-voicetext-paul.conf"
@@ -393,6 +400,26 @@ systemctl daemon-reload
 if [[ "${SEASONAL_VOICETEXT_PAUL:-0}" == "1" && -f /etc/systemd/system/seasonalweather-voicetext-xvfb.service ]]; then
   log "Enabling seasonalweather-voicetext-xvfb service"
   systemctl enable --now seasonalweather-voicetext-xvfb.service
+
+  if [[ ! -f "${VTP_WINEPREFIX}/system.reg" || "${SEASONAL_VOICETEXT_PAUL_PREFIX_INIT:-1}" == "1" ]]; then
+    log "Initializing VoiceText Paul Wine prefix (${VTP_WINEPREFIX}, WINEARCH=${VTP_WINEARCH})"
+    VTP_BOOT_STDERR="$(mktemp /tmp/voicetext-paul-wineboot.XXXXXX.err)"
+    if ! runuser -u "${VTP_USER}" -- env \
+        SEASONALWEATHER_DATA_BASE="${VTP_STATE_BASE}" \
+        VOICETEXT_PAUL_WINEPREFIX="${VTP_WINEPREFIX}" \
+        VOICETEXT_PAUL_WINEARCH="${VTP_WINEARCH}" \
+        VOICETEXT_PAUL_DISPLAY="${VOICETEXT_PAUL_DISPLAY:-:99}" \
+        VOICETEXT_PAUL_WINEDEBUG="${VOICETEXT_PAUL_WINEDEBUG:--all}" \
+        VOICETEXT_PAUL_WINEDLLOVERRIDES="${VOICETEXT_PAUL_WINEDLLOVERRIDES:-mscoree,mshtml=}" \
+        bash -c 'set -euo pipefail; mkdir -p "${VOICETEXT_PAUL_WINEPREFIX}"; export WINEPREFIX="${VOICETEXT_PAUL_WINEPREFIX}" WINEARCH="${VOICETEXT_PAUL_WINEARCH}" DISPLAY="${VOICETEXT_PAUL_DISPLAY}" WINEDEBUG="${VOICETEXT_PAUL_WINEDEBUG}" WINEDLLOVERRIDES="${VOICETEXT_PAUL_WINEDLLOVERRIDES}"; wineboot --init; wineserver -w' \
+        2>"${VTP_BOOT_STDERR}"; then
+      warn "VoiceText Paul Wine prefix initialization failed"
+      sed 's/^/[voicetext-paul-wineboot] /' "${VTP_BOOT_STDERR}" >&2 || true
+      rm -f "${VTP_BOOT_STDERR}"
+      exit 1
+    fi
+    rm -f "${VTP_BOOT_STDERR}"
+  fi
 
   if [[ "${SEASONAL_VOICETEXT_PAUL_SMOKE:-1}" == "1" ]]; then
     log "Running VoiceText Paul smoke test"
