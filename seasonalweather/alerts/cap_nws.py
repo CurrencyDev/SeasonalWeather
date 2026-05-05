@@ -25,6 +25,11 @@ import httpx
 
 from .cap_ledger import CapLedger
 from ..database.core import SeasonalDatabase
+from ..same.locations import (
+    normalize_same_allow_set,
+    normalize_same_location,
+    same_locations_intersect_service_area,
+)
 
 log = logging.getLogger("seasonalweather.cap")
 
@@ -120,12 +125,7 @@ def _norm_same(s: str) -> str | None:
 
     Expected: PSSCCC (6 digits). We keep leading zeros.
     """
-    if s is None:
-        return None
-    x = "".join(ch for ch in str(s).strip() if ch.isdigit())
-    if len(x) != 6:
-        return None
-    return x
+    return normalize_same_location(s)
 
 
 def _same_state_fips(same6: str) -> str | None:
@@ -246,12 +246,7 @@ class NwsCapPoller:
         self.poll_seconds = max(15, int(poll_seconds))
         self.user_agent = user_agent.strip() or "SeasonalWeather (CAP monitor)"
 
-        allow_set: set[str] = set()
-        for raw in same_fips_allow:
-            s6 = _norm_same(str(raw))
-            if s6:
-                allow_set.add(s6)
-        self.allow_set = allow_set
+        self.allow_set = normalize_same_allow_set(same_fips_allow)
 
         self.area_states, self.marine_zones = _derive_query_filters(same_fips_allow)
 
@@ -458,7 +453,7 @@ class NwsCapPoller:
         if not self.allow_set:
             # If allow list is empty, treat as "match nothing" to avoid accidental whole-US spam.
             return False
-        return any(s in self.allow_set for s in same_list)
+        return same_locations_intersect_service_area(same_list, self.allow_set)
 
     def _event_from_feature(self, feat: dict[str, Any]) -> CapAlertEvent | None:
         props = feat.get("properties")

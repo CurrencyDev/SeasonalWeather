@@ -19,6 +19,11 @@ from .config import AppConfig, load_config
 from .broadcast.cycle import CycleBuilder
 from .database.assets import AudioAssetRepository
 from .tts.tts import TTS
+from .same.locations import (
+    normalize_same_allow_set,
+    normalize_same_location,
+    same_location_matches_service_area,
+)
 
 
 class ControlError(Exception):
@@ -212,14 +217,29 @@ class OrchestratorControl:
 
     def _same_codes_in_service_area(self, same_codes: list[str]) -> list[str]:
         allow = getattr(self.orch, "_same_fips_allow_set", set())
-        disallowed = [code for code in same_codes if code not in allow]
+        normalized: list[str] = []
+        disallowed: list[str] = []
+
+        for raw in same_codes:
+            code = normalize_same_location(raw)
+            if not code:
+                disallowed.append(str(raw))
+                continue
+            # Manual FULL EAS origination must not auto-wildcard a whole state.
+            # State-wide codes are allowed when explicitly configured, but not
+            # merely because one county in that state is configured.
+            if not same_location_matches_service_area(code, allow, allow_statewide_input=False):
+                disallowed.append(code)
+                continue
+            normalized.append(code)
+
         if disallowed:
             raise ControlError(
                 "same_code_out_of_service_area",
                 "One or more SAME codes are outside the configured service area.",
                 details={"same_codes": disallowed},
             )
-        return same_codes
+        return normalized
 
     def _validate_interrupt_policy(self, policy: str) -> None:
         if policy not in self._supported_interrupt_policies:
@@ -569,7 +589,7 @@ class OrchestratorControl:
     async def originate_text(self, req: OriginateTextRequest, *, actor: str) -> dict[str, Any]:
         same_codes = list(req.same_codes)
         if req.voice_mode == VoiceMode.FULL_EAS.value:
-            self._same_codes_in_service_area(same_codes)
+            same_codes = self._same_codes_in_service_area(same_codes)
 
         try:
             _ot_result = await self.orch.originate_manual_text(
@@ -622,7 +642,7 @@ class OrchestratorControl:
     async def originate_audio(self, req: OriginateAudioRequest, *, actor: str) -> dict[str, Any]:
         same_codes = list(req.same_codes)
         if req.voice_mode == VoiceMode.FULL_EAS.value:
-            self._same_codes_in_service_area(same_codes)
+            same_codes = self._same_codes_in_service_area(same_codes)
         meta = self._load_audio_asset(req.audio_asset_id)
         source_wav = Path(meta["path"])
         _work_dir, audio_dir, _cache_dir, _logs_dir = self._work_paths()
@@ -706,7 +726,7 @@ class OrchestratorControl:
             reference_points=new_cfg.cycle.reference_points,
             same_fips_all=new_cfg.service_area.same_fips_all,
         )
-        self.orch._same_fips_allow_set = {str(x).strip() for x in new_cfg.service_area.same_fips_all if str(x).strip()}
+        self.orch._same_fips_allow_set = normalize_same_allow_set(new_cfg.service_area.same_fips_all)
         self.orch._nwws_allowed_wfos = self.orch._norm_wfo_set(getattr(new_cfg.nwws, "allowed_wfos", []))
         self.orch.live_time_enabled = bool(getattr(self.orch, "live_time_enabled", False))
         self.orch.last_product_desc = (f"Config reloaded: {reason}" if reason else "Config reloaded")[:200]

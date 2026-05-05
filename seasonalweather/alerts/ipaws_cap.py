@@ -50,6 +50,11 @@ from typing import Any
 import httpx
 
 from .cap_ledger import CapLedger
+from ..same.locations import (
+    normalize_same_allow_set,
+    normalize_same_location,
+    same_locations_intersect_service_area,
+)
 
 log = logging.getLogger("seasonalweather.ipaws")
 
@@ -201,10 +206,7 @@ def _clean_ipaws_sender(raw: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 def _norm_same(s: str) -> str | None:
-    if s is None:
-        return None
-    x = "".join(ch for ch in str(s).strip() if ch.isdigit())
-    return x if len(x) == 6 else None
+    return normalize_same_location(s)
 
 
 # ---------------------------------------------------------------------------
@@ -333,12 +335,7 @@ class IpawsCapPoller:
         self.user_agent = user_agent.strip() or "SeasonalWeather (IPAWS monitor)"
         self.url = (url or "").strip() or self._DEFAULT_URL
 
-        allow_set: set[str] = set()
-        for raw in same_fips_allow:
-            s6 = _norm_same(str(raw))
-            if s6:
-                allow_set.add(s6)
-        self.allow_set = allow_set
+        self.allow_set = normalize_same_allow_set(same_fips_allow)
 
         # In-memory dedupe (fast path within one process lifetime)
         self._seen_keys: set[str] = set()
@@ -517,7 +514,7 @@ class IpawsCapPoller:
             return False
         if not self.allow_set:
             return False
-        return any(s in self.allow_set for s in same_list)
+        return same_locations_intersect_service_area(same_list, self.allow_set)
 
     def _dedupe_key(self, ev: IpawsCapEvent) -> str:
         # "IPAWS:" prefix keeps these separate from NWS CAP entries in the

@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
+from ..same.locations import normalize_same_allow_set, same_locations_intersect_service_area
+
 
 log = logging.getLogger("seasonalweather")
 
@@ -163,7 +165,7 @@ class ErnGwesMonitor:
         decoder_backend: str = "auto",
     ) -> None:
         self.out_queue = out_queue
-        self.same_fips_allow = set(str(x).strip() for x in (same_fips_allow or []) if str(x).strip())
+        self.same_fips_allow = normalize_same_allow_set(same_fips_allow)
         self.url = str(url).strip()
         self.sample_rate = int(sample_rate)
         self.dedupe_seconds = float(dedupe_seconds)
@@ -179,10 +181,7 @@ class ErnGwesMonitor:
     def _service_area_hit(self, locs: Sequence[str]) -> bool:
         if not self.same_fips_allow:
             return True  # if you ever run without config, don't hard-drop everything
-        for x in locs or []:
-            if x in self.same_fips_allow:
-                return True
-        return False
+        return same_locations_intersect_service_area(locs, self.same_fips_allow)
 
     def _parse_jsonl_line(self, line: str) -> Optional[ErnSameEvent]:
         try:

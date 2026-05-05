@@ -87,6 +87,10 @@ from .same.events import (
     org_broadcast_prefix as _eas_org_broadcast_prefix,
 )
 from .same import ugc as _ugc
+from .same.locations import (
+    filter_same_locations_to_service_area as _same_filter_locations_to_service_area,
+    normalize_same_allow_set as _normalize_same_allow_set,
+)
 
 # RWT/RMT scheduler
 from .broadcast.rwt_rmt import RwtRmtSchedule, RwtRmtScheduler
@@ -1543,7 +1547,7 @@ class Orchestrator:
         )
 
         # Fast membership checks for "in-area" targeting
-        self._same_fips_allow_set = {str(x).strip() for x in cfg.service_area.same_fips_all if str(x).strip()}
+        self._same_fips_allow_set = _normalize_same_allow_set(cfg.service_area.same_fips_all)
 
         # --- NWWS flood-gate controls ---
         self._nwws_logger = logging.getLogger("seasonalweather.nwws")
@@ -2209,26 +2213,25 @@ class Orchestrator:
         return out[:12]
 
     # ---- SAME location filtering (critical for ERN relay targeting) ----
-    def _filter_same_locations_to_service_area(self, locs: list[str] | tuple[str, ...] | None) -> list[str]:
+    def _filter_same_locations_to_service_area(
+        self,
+        locs: list[str] | tuple[str, ...] | None,
+        *,
+        allow_statewide_input: bool = True,
+    ) -> list[str]:
         """
         Keep ONLY SAME FIPS locations that are within our configured service area.
-        Preserves order and de-dupes.
+
+        State-wide 0SS000 inputs match when this service area contains at least
+        one concrete county/city SAME code in that state.  Matching state-wide
+        codes are preserved as 0SS000 for relay/output; they are not expanded
+        into county lists.
         """
-        if not locs:
-            return []
-        out: list[str] = []
-        seen: set[str] = set()
-        for raw in locs:
-            f = str(raw).strip()
-            if not f:
-                continue
-            if f not in self._same_fips_allow_set:
-                continue
-            if f in seen:
-                continue
-            seen.add(f)
-            out.append(f)
-        return out
+        return _same_filter_locations_to_service_area(
+            locs,
+            self._same_fips_allow_set,
+            allow_statewide_input=allow_statewide_input,
+        )
 
     # ---- Spoken-script post-processing (NWWS path) ----
     def _nws_header_issued_dt(self, text: str) -> dt.datetime | None:
@@ -6719,7 +6722,7 @@ class Orchestrator:
         if mode not in {"voice_only", "full_eas"}:
             raise ValueError(f"Unsupported voice mode: {voice_mode}")
 
-        same_codes = self._filter_same_locations_to_service_area(same_locations)
+        same_codes = self._filter_same_locations_to_service_area(same_locations, allow_statewide_input=False)
 
         async with self._cycle_lock:
             try:
@@ -6798,7 +6801,7 @@ class Orchestrator:
         code = _safe_event_code(event_code)
         mode = (voice_mode or "voice_only").strip().lower()
         if mode == "full_eas":
-            filtered_same = self._filter_same_locations_to_service_area(same_locations)
+            filtered_same = self._filter_same_locations_to_service_area(same_locations, allow_statewide_input=False)
             dummy = SimpleNamespace(product_type=code, awips_id=None, wfo="LOCAL", raw_text="")
             wav_path = await self._render_alert_audio(dummy, script_text, same_locations=filtered_same)
         else:
@@ -6843,7 +6846,7 @@ class Orchestrator:
         self._assert_station_wav_format(path)
 
         if mode == "full_eas":
-            filtered_same = self._filter_same_locations_to_service_area(same_locations)
+            filtered_same = self._filter_same_locations_to_service_area(same_locations, allow_statewide_input=False)
             out_wav = await self._render_pre_recorded_alert_audio(
                 event_code=code,
                 source_wav=path,
