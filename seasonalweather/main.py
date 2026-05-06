@@ -72,6 +72,7 @@ from .broadcast.product_text import (
 from .alerts.active import ActiveAlert, AlertTracker, _vtec_track_id
 from .database.bootstrap import bootstrap_database_from_config
 from .database.housekeeping import DatabaseHousekeeper
+from .database.station_feed import StationFeedRepository
 from .discord_log import DiscordLogger
 
 # VTEC policy + SAME event code libraries — Orchestrator defers to these.
@@ -120,7 +121,7 @@ except Exception:  # pragma: no cover
     IpawsCapEvent = None  # type: ignore
 
 
-# Optional Station Alert Feed (handled alerts JSON for radio UI)
+# Optional Station Alert Feed (handled alerts API read model + legacy JSON mirror)
 try:
     from .broadcast.station_feed import FeedSender, StationFeedAlert, atomic_write_json, build_station_feed_payload
 except Exception:
@@ -140,12 +141,13 @@ except Exception:  # pragma: no cover
 
 log = logging.getLogger("seasonalweather")
 
-# --- Station Alert Feed (handled alerts JSON for radio UI) ---
-# SeasonalWeather writes a tiny JSON file with the most recently *handled* alerts.
-# nginx serves it from /api/station/ so the radio site can display “what’s being aired”.
+# --- Station Alert Feed (handled alerts API read model + legacy JSON mirror) ---
+# SQLite is the preferred backing store for /v1/handled-alerts. The legacy
+# handled-alerts.json file remains a compatibility mirror for older consumers.
 
 _STATION_FEED_STATE = {}  # id -> (StationFeedAlert, expires_ts)
 _STATION_FEED_LAST_WRITE_TS = 0.0
+_STATION_FEED_REPO: StationFeedRepository | None = None
 
 
 def _sf_now_iso() -> str:
@@ -202,15 +204,78 @@ def _sf_cfg():
     return sf.station_id, sf.path, sf.source, sf.max_items, sf.ttl_seconds, sf.min_write_seconds
 
 
-def _sf_prune(now_ts: float, *, max_items: int) -> None:
+def _sf_set_repository(repo: StationFeedRepository | None) -> None:
+    global _STATION_FEED_REPO
+    _STATION_FEED_REPO = repo
+
+
+def _sf_alert_payload(alert):
+    station_id, _path, source, _max_items, _ttl_s, _min_write_s = _sf_cfg()
+    payload = build_station_feed_payload(
+        station_id=station_id,
+        source=source,
+        generated_at_iso=_sf_now_iso(),
+        alerts=[alert],
+    )
+    alerts = payload.get("alerts") if isinstance(payload, dict) else None
+    if isinstance(alerts, list) and alerts and isinstance(alerts[0], dict):
+        return alerts[0]
+    return {}
+
+
+def _sf_repo_upsert(alert, *, expires_at=None) -> None:
+    if _STATION_FEED_REPO is None:
+        return
+    try:
+        payload = _sf_alert_payload(alert)
+        if payload:
+            _STATION_FEED_REPO.upsert_alert(
+                alert_id=str(getattr(alert, "id", "") or ""),
+                payload=payload,
+                expires_at=expires_at or payload.get("expires") or payload.get("ends"),
+            )
+    except Exception:
+        log.exception("Station feed: failed to persist alert to SQLite read model")
+
+
+def _sf_repo_delete(ids) -> None:
+    if _STATION_FEED_REPO is None:
+        return
+    try:
+        _STATION_FEED_REPO.delete_alerts(str(x) for x in (ids or []))
+    except Exception:
+        log.exception("Station feed: failed to delete alerts from SQLite read model")
+
+
+def _sf_repo_housekeep(now_ts: float, *, max_items: int) -> int:
+    if _STATION_FEED_REPO is None:
+        return 0
+    try:
+        now = dt.datetime.fromtimestamp(float(now_ts), tz=dt.timezone.utc)
+        removed = _STATION_FEED_REPO.prune_expired(now=now, grace_seconds=_sf_hk_grace_s())
+        removed += _STATION_FEED_REPO.trim_to_max(max_items)
+        return removed
+    except Exception:
+        log.exception("Station feed housekeeping: SQLite read model prune failed")
+        return 0
+
+
+def _sf_prune(now_ts: float, *, max_items: int) -> list[str]:
+    removed: list[str] = []
     expired = [k for k, (_, exp) in _STATION_FEED_STATE.items() if exp <= now_ts]
     for k in expired:
-        _STATION_FEED_STATE.pop(k, None)
+        if _STATION_FEED_STATE.pop(k, None) is not None:
+            removed.append(str(k))
     if len(_STATION_FEED_STATE) > max_items:
         items = sorted(_STATION_FEED_STATE.items(), key=lambda kv: kv[1][1], reverse=True)
-        keep = dict(items[:max_items])
-        _STATION_FEED_STATE.clear()
-        _STATION_FEED_STATE.update(keep)
+        keep_keys = {str(k) for k, _v in items[:max_items]}
+        for k in list(_STATION_FEED_STATE.keys()):
+            if str(k) not in keep_keys:
+                _STATION_FEED_STATE.pop(k, None)
+                removed.append(str(k))
+    if removed:
+        _sf_repo_delete(removed)
+    return removed
 
 
 def _sf_write(now_ts: float) -> None:
@@ -240,9 +305,10 @@ def _sf_emit(alert, *, expires_at=None) -> None:
         exp_dt = _sf_parse_dt(expires_at)
         exp_ts = exp_dt.timestamp() if exp_dt else (now_ts + ttl_s)
         _STATION_FEED_STATE[alert.id] = (alert, exp_ts)
+        _sf_repo_upsert(alert, expires_at=exp_dt or expires_at or dt.datetime.fromtimestamp(exp_ts, tz=dt.timezone.utc))
         _sf_write(now_ts)
     except Exception:
-        log.exception("Station feed: failed to write handled-alerts.json")
+        log.exception("Station feed: failed to update handled-alerts feed")
 
 
 def _sf_remove_ids(ids) -> int:
@@ -251,12 +317,16 @@ def _sf_remove_ids(ids) -> int:
     removed = 0
     try:
         now_ts = time.time()
+        requested_ids = []
         for raw in ids or []:
             sid = str(raw or "").strip()
             if not sid:
                 continue
+            requested_ids.append(sid)
             if _STATION_FEED_STATE.pop(sid, None) is not None:
                 removed += 1
+        if requested_ids:
+            _sf_repo_delete(requested_ids)
         if removed:
             _sf_write(now_ts)
     except Exception:
@@ -932,8 +1002,10 @@ def _sf_station_feed_housekeeping_once():
         now_ts = time.time()
         _station_id, _path, _source, max_items, _ttl_s, _min_write_s = _sf_cfg()
 
-        # Keep the in-memory set tidy, but don't write from it here.
+        # Keep the in-memory set and SQLite read model tidy, but don't write
+        # from memory here. The JSON mirror is pruned in place for compatibility.
         _sf_prune(now_ts, max_items=max_items)
+        _sf_repo_housekeep(now_ts, max_items=max_items)
 
         # Prune the JSON file itself based on ends/expires so valid alerts survive restarts.
         _sf_hk_prune_json_file(now_ts)
@@ -1084,6 +1156,7 @@ def _sf_seed_memory_from_payload_file() -> int:
                 links=restored_links,
             )
             _STATION_FEED_STATE[str(alert.id)] = (alert, float(exp_ts))
+            _sf_repo_upsert(alert, expires_at=dt.datetime.fromtimestamp(float(exp_ts), tz=dt.timezone.utc))
             restored += 1
         except Exception:
             log.exception("Station feed: failed restoring one handled-alerts.json entry into memory")
@@ -1609,9 +1682,6 @@ class Orchestrator:
         self._nwws_seen = 0
         self._nwws_acted = 0
 
-        # Start station-feed housekeeping now that cfg is available
-        _sf_station_feed_hk_start()
-
         # --- NWS zone lookup (for NWWS UGC->SAME targeting) ---
         self._zone_client: httpx.AsyncClient | None = None
         self._zone_cache_same: dict[str, list[str]] = {}
@@ -1637,6 +1707,12 @@ class Orchestrator:
         # --- Embedded SQLite runtime state ---
         self.database = bootstrap_database_from_config(cfg) if getattr(cfg.database, "enabled", True) else None
         self.db_housekeeper = DatabaseHousekeeper(cfg, self.database) if self.database is not None else None
+        self.station_feed_repo = StationFeedRepository(self.database) if self.database is not None else None
+        _sf_set_repository(self.station_feed_repo)
+
+        # Start station-feed housekeeping after SQLite is ready so the public
+        # /v1/handled-alerts read model and legacy JSON mirror stay in sync.
+        _sf_station_feed_hk_start()
 
         # --- Persistent active alert tracker ---
         # Survives restarts: active watches/warnings are re-queued as cycle segments.
@@ -1820,6 +1896,7 @@ class Orchestrator:
                     links=links,
                 )
                 _STATION_FEED_STATE[str(alert.id)] = (alert, exp_ts)
+                _sf_repo_upsert(alert, expires_at=dt.datetime.fromtimestamp(exp_ts, tz=dt.timezone.utc))
                 existing_ids.add(str(alert.id))
                 if audio_path:
                     existing_wavs.add(audio_path)
@@ -3664,7 +3741,7 @@ class Orchestrator:
             meta = self._np_meta(title=title, kind="test", extra={"sw_alert_source": "local", "sw_event_code": code})
             self.telnet.push_alert(str(out_wav), meta=meta)
 
-        # --- Station feed note (radio UI: handled-alerts.json) ---
+        # --- Station feed note (radio UI/API handled-alerts feed) ---
         local_test_same_codes = self._test_same_codes_for_presentation()
         test_headline = f"Required {'Weekly' if code == 'RWT' else 'Monthly'} Test"
         test_area_text = str(self.cfg.station.service_area_name or "SeasonalWeather").strip() or "SeasonalWeather"

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 MIGRATIONS: dict[int, tuple[str, ...]] = {
     1: (
@@ -106,5 +106,19 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
     2: (
         "CREATE INDEX IF NOT EXISTS idx_api_commands_status_finished_at ON api_commands (status, finished_at)",
         "CREATE INDEX IF NOT EXISTS idx_audio_assets_expires_at ON audio_assets (expires_at)",
+    ),
+
+    3: (
+        """
+        CREATE TABLE IF NOT EXISTS station_feed_alerts (
+            alert_id TEXT PRIMARY KEY,
+            expires_at TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_station_feed_alerts_expires_at ON station_feed_alerts (expires_at)",
+        "CREATE INDEX IF NOT EXISTS idx_station_feed_alerts_updated_at ON station_feed_alerts (updated_at)",
     ),
 }

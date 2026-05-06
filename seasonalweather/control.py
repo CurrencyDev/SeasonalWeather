@@ -18,6 +18,7 @@ from .api.models import InterruptPolicy, OriginateAudioRequest, OriginateTextReq
 from .config import AppConfig, load_config
 from .broadcast.cycle import CycleBuilder
 from .database.assets import AudioAssetRepository
+from .database.station_feed import StationFeedRepository
 from .tts.tts import TTS
 from .same.locations import (
     normalize_same_allow_set,
@@ -61,6 +62,9 @@ class OrchestratorControl:
         self._supported_interrupt_policies = {InterruptPolicy.INTERRUPT_THEN_REFILL.value}
         db = getattr(self.orch, "database", None)
         self._audio_asset_repo = AudioAssetRepository(db) if db is not None else None
+        self._station_feed_repo = getattr(self.orch, "station_feed_repo", None)
+        if self._station_feed_repo is None and db is not None:
+            self._station_feed_repo = StationFeedRepository(db)
 
     def _now_utc(self) -> dt.datetime:
         return dt.datetime.now(dt.timezone.utc)
@@ -98,6 +102,14 @@ class OrchestratorControl:
 
     def _station_feed_path(self) -> Path:
         return Path(self.orch.cfg.station_feed.path)
+
+    def _empty_station_feed_payload(self) -> dict[str, Any]:
+        return {
+            "stationId": self.orch.cfg.station_feed.station_id,
+            "generatedAt": self._serialize_dt(self._now_utc()),
+            "source": self.orch.cfg.station_feed.source,
+            "alerts": [],
+        }
 
     def _asset_expiry_seconds(self) -> int:
         return max(300, min(self.orch.cfg.api.audio_ttl_seconds, 7 * 86400))
@@ -284,9 +296,30 @@ class OrchestratorControl:
             "config_sha256": self._config_file_hash(),
         }
 
-    async def get_station_feed(self) -> dict[str, Any]:
+    async def get_station_feed(self, *, missing_ok: bool = False) -> dict[str, Any]:
+        repo = self._station_feed_repo
+        if repo is not None:
+            try:
+                return {
+                    "stationId": self.orch.cfg.station_feed.station_id,
+                    "generatedAt": self._serialize_dt(self._now_utc()),
+                    "source": self.orch.cfg.station_feed.source,
+                    "alerts": repo.load_alerts(
+                        now=self._now_utc(),
+                        max_items=max(1, int(self.orch.cfg.station_feed.max_items or 1)),
+                    ),
+                }
+            except Exception as exc:
+                if not missing_ok:
+                    raise ControlError(
+                        "station_feed_database_error",
+                        "Station feed SQLite read model could not be loaded.",
+                    ) from exc
+
         path = self._station_feed_path()
         if not path.exists():
+            if missing_ok:
+                return self._empty_station_feed_payload()
             raise NotFoundError(
                 "station_feed_missing",
                 "Station feed JSON was not found.",
@@ -295,11 +328,16 @@ class OrchestratorControl:
         try:
             return json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
+            if missing_ok:
+                return self._empty_station_feed_payload()
             raise ControlError(
                 "station_feed_invalid_json",
                 "Station feed JSON exists but could not be parsed.",
                 details={"path": str(path)},
             ) from exc
+
+    async def get_public_handled_alerts(self) -> dict[str, Any]:
+        return await self.get_station_feed(missing_ok=True)
 
     async def get_config_summary(self) -> dict[str, Any]:
         cfg = self.orch.cfg

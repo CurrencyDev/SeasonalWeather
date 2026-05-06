@@ -65,7 +65,7 @@ Freeze products are supported natively. `FZ.W` maps to SAME `FZW` (**Freeze Warn
 
 - Runs under **systemd** (units included in `systemd/`).
 - HTTP control API (localhost-only by default) for status, cycle control, and audio injection.
-- Station feed JSON (`handled-alerts.json`) for external UI consumption.
+- Public handled-alerts feed API (`/v1/handled-alerts`) for external UI consumption, with `handled-alerts.json` kept as a legacy compatibility mirror.
 
 ---
 
@@ -128,7 +128,7 @@ This is the single source of truth for all runtime behaviour. The file is well-c
 | `tests` | RWT/RMT scheduling, gating, and postpone policy |
 | `zonecounty` | NWS UGC → SAME FIPS crosswalk |
 | `mareas` | Marine zone → SAME crosswalk |
-| `station_feed` | Alert feed JSON output for UI consumption |
+| `station_feed` | Public handled-alerts feed state, SQLite persistence, and legacy JSON mirror output |
 | `rebroadcast` | Periodic voice-only rebroadcast of active alerts |
 | `api` | HTTP control API settings |
 | `live_time` | Live time WAV update interval |

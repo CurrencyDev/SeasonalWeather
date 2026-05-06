@@ -316,15 +316,15 @@ mareas:
   url: "https://www.weather.gov/source/gis/Shapefiles/WSOM/mareas18mr25.txt"
   cache_days: 30
 
-# Station feed (JSON alert log written to disk for external consumption)
+# Station feed (SQLite-backed public API read model, plus legacy JSON mirror)
 station_feed:
   enabled: true
-  path: "/srv/seasonalweather/api/station/handled-alerts.json"
+  path: "/srv/seasonalweather/api/station/handled-alerts.json"  # legacy mirror; prefer /api/v1/handled-alerts
   station_id: "seasonalweather"
   source: "seasonalweather"
   max_items: 24
   ttl_seconds: 7200
-  min_write_seconds: 0.5
+  min_write_seconds: 0.5       # throttles legacy JSON mirror writes; API reads from SQLite when available
   fetch_nws: false             # attempt to fetch NWS alert detail on write
   debug: false
   ern_area_names: true         # include area name strings from ERN decoded alerts

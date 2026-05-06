@@ -139,6 +139,11 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
     async def v1_status(principal: ApiPrincipal = Depends(require_scopes("read:status"))) -> dict[str, Any]:
         return await control.get_status()
 
+    @app.get("/v1/handled-alerts")
+    async def v1_handled_alerts(response: Response) -> dict[str, Any]:
+        response.headers["Cache-Control"] = "public, max-age=2, stale-while-revalidate=30"
+        return await control.get_public_handled_alerts()
+
     @app.get("/v1/station-feed")
     async def v1_station_feed(principal: ApiPrincipal = Depends(require_scopes("read:alerts"))) -> dict[str, Any]:
         return await control.get_station_feed()
