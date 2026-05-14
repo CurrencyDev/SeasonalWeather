@@ -222,14 +222,9 @@ if [[ "${SEASONAL_VOICETEXT_PAUL:-0}" == "1" ]]; then
     dpkg --add-architecture i386
     apt-get update
   fi
-  if dpkg-query -W -f='${db:Status-Abbrev}' wine64 2>/dev/null | grep -qvE '^un|^pn'; then
-    warn "wine64 is installed or partially installed; VoiceText Paul does not require it and small-root deployments may need it removed"
-    warn "  To remove a broken/partial wine64 install manually: apt-get purge wine64 && apt-get autoremove"
-  fi
-
-  if ! apt-get install -y --no-install-recommends wine wine32:i386 unzip xvfb x11-utils; then
-    warn "wine32:i386 install failed; retrying with distro wine32 package name"
-    apt-get install -y --no-install-recommends wine wine32 unzip xvfb x11-utils
+  if ! apt-get install -y --no-install-recommends wine wine64 wine32:i386 unzip xvfb x11-utils; then
+    warn "wine64 + wine32:i386 install failed; retrying with distro wine32 package name"
+    apt-get install -y --no-install-recommends wine wine64 wine32 unzip xvfb x11-utils
   fi
 
   VTP_USER="voicetext"
@@ -245,11 +240,42 @@ if [[ "${SEASONAL_VOICETEXT_PAUL:-0}" == "1" ]]; then
   VTP_REFRESH="${SEASONAL_VOICETEXT_PAUL_REFRESH:-0}"
   VTP_SYNTH="/usr/local/bin/voicetext_paul_synth"
   VTP_WSKILL="/usr/local/bin/voicetext_paul_wineserver_kill"
-  VTP_WINEARCH="${VOICETEXT_PAUL_WINEARCH:-win32}"
+  # Default to Wine's native amd64/WOW64 prefix on fresh amd64 installs. A pure
+  # win32 prefix has proven crash-prone with the VoiceText/Cygwin runtime on
+  # Debian trixie/Wine 10. Operators may still force win32 explicitly.
+  VTP_WINEARCH="${VOICETEXT_PAUL_WINEARCH:-auto}"
   VTP_WINEPREFIX="${VOICETEXT_PAUL_WINEPREFIX:-${VTP_STATE_BASE}/wineprefixes/voicetext_paul_voicetext}"
   VTP_SUDOERS="/etc/sudoers.d/seasonalweather-voicetext-paul"
   VTP_SYSTEMD_DROPIN_DIR="/etc/systemd/system/seasonalweather.service.d"
   VTP_SYSTEMD_DROPIN="${VTP_SYSTEMD_DROPIN_DIR}/10-voicetext-paul.conf"
+
+  wine_prefix_arch() {
+    local prefix="$1"
+    if [[ -f "${prefix}/system.reg" ]]; then
+      awk -F= '/^#arch=/{print $2; exit}' "${prefix}/system.reg" 2>/dev/null || true
+    fi
+  }
+
+  wine_env_exports() {
+    cat <<'WINEENVEOF'
+set -euo pipefail
+mkdir -p "${VOICETEXT_PAUL_WINEPREFIX}"
+export WINEPREFIX="${VOICETEXT_PAUL_WINEPREFIX}"
+if [[ "${VOICETEXT_PAUL_WINEARCH}" != "auto" ]]; then
+  export WINEARCH="${VOICETEXT_PAUL_WINEARCH}"
+else
+  unset WINEARCH
+fi
+export DISPLAY="${VOICETEXT_PAUL_DISPLAY}"
+export WINEDEBUG="${VOICETEXT_PAUL_WINEDEBUG}"
+export WINEESYNC="${VOICETEXT_PAUL_WINEESYNC:-0}"
+export WINEFSYNC="${VOICETEXT_PAUL_WINEFSYNC:-0}"
+export WINE_DISABLE_WRITE_WATCH="${VOICETEXT_PAUL_DISABLE_WRITE_WATCH:-1}"
+export WINEDLLOVERRIDES="${VOICETEXT_PAUL_WINEDLLOVERRIDES}"
+wineboot --init
+wineserver -w
+WINEENVEOF
+  }
 
   if ! id -u "${VTP_USER}" >/dev/null 2>&1; then
     useradd --system --home "${VTP_HOME}" --create-home --shell /usr/sbin/nologin "${VTP_USER}"
@@ -327,6 +353,14 @@ if [[ "${SEASONAL_VOICETEXT_PAUL:-0}" == "1" ]]; then
     log "VoiceText Paul binary installed at ${VTP_EXE}"
   else
     log "VoiceText Paul binary already present - skipping runtime install"
+  fi
+
+  VTP_PREFIX_ARCH="$(wine_prefix_arch "${VTP_WINEPREFIX}")"
+  if [[ "${VTP_WINEARCH}" == "auto" && "${VTP_PREFIX_ARCH}" == "win32" && "${SEASONAL_VOICETEXT_PAUL_RECREATE_WIN32_PREFIX:-1}" == "1" ]]; then
+    warn "Existing VoiceText Paul Wine prefix is pure win32; recreating it as Wine's default WOW64-capable prefix"
+    warn "  Prefix: ${VTP_WINEPREFIX}"
+    warn "  Set SEASONAL_VOICETEXT_PAUL_RECREATE_WIN32_PREFIX=0 to keep the old prefix."
+    rm -rf "${VTP_WINEPREFIX:?}"
   fi
 
   log "Normalizing VoiceText Paul runtime permissions for seasonalweather + ${VTP_USER}"
@@ -417,14 +451,18 @@ if [[ "${SEASONAL_VOICETEXT_PAUL:-0}" == "1" && -f /etc/systemd/system/seasonalw
   if [[ ! -f "${VTP_WINEPREFIX}/system.reg" || "${SEASONAL_VOICETEXT_PAUL_PREFIX_INIT:-1}" == "1" ]]; then
     log "Initializing VoiceText Paul Wine prefix (${VTP_WINEPREFIX}, WINEARCH=${VTP_WINEARCH})"
     VTP_BOOT_STDERR="$(mktemp /tmp/voicetext-paul-wineboot.XXXXXX.err)"
-    if ! runuser -u "${VTP_USER}" -- env \
+    if ! wine_env_exports | runuser -u "${VTP_USER}" -- env \
         SEASONALWEATHER_DATA_BASE="${VTP_STATE_BASE}" \
+        HOME="${VTP_HOME}" \
         VOICETEXT_PAUL_WINEPREFIX="${VTP_WINEPREFIX}" \
         VOICETEXT_PAUL_WINEARCH="${VTP_WINEARCH}" \
         VOICETEXT_PAUL_DISPLAY="${VOICETEXT_PAUL_DISPLAY:-:99}" \
         VOICETEXT_PAUL_WINEDEBUG="${VOICETEXT_PAUL_WINEDEBUG:--all}" \
+        VOICETEXT_PAUL_WINEESYNC="${VOICETEXT_PAUL_WINEESYNC:-0}" \
+        VOICETEXT_PAUL_WINEFSYNC="${VOICETEXT_PAUL_WINEFSYNC:-0}" \
+        VOICETEXT_PAUL_DISABLE_WRITE_WATCH="${VOICETEXT_PAUL_DISABLE_WRITE_WATCH:-1}" \
         VOICETEXT_PAUL_WINEDLLOVERRIDES="${VOICETEXT_PAUL_WINEDLLOVERRIDES:-mscoree,mshtml=}" \
-        bash -c 'set -euo pipefail; mkdir -p "${VOICETEXT_PAUL_WINEPREFIX}"; export WINEPREFIX="${VOICETEXT_PAUL_WINEPREFIX}" WINEARCH="${VOICETEXT_PAUL_WINEARCH}" DISPLAY="${VOICETEXT_PAUL_DISPLAY}" WINEDEBUG="${VOICETEXT_PAUL_WINEDEBUG}" WINEDLLOVERRIDES="${VOICETEXT_PAUL_WINEDLLOVERRIDES}"; wineboot --init; wineserver -w' \
+        bash \
         2>"${VTP_BOOT_STDERR}"; then
       warn "VoiceText Paul Wine prefix initialization failed"
       sed 's/^/[voicetext-paul-wineboot] /' "${VTP_BOOT_STDERR}" >&2 || true
@@ -450,14 +488,16 @@ if [[ "${SEASONAL_VOICETEXT_PAUL:-0}" == "1" && -f /etc/systemd/system/seasonalw
     VTP_STDERR="$(mktemp /tmp/voicetext-paul-smoke.XXXXXX.err)"
     rm -f "${VTP_BIN_DIR}/output.wav" "${VTP_BIN_DIR}/input1.txt"
     if ! printf '%s\n' 'VoiceText Paul deployment test.' | runuser -u "${VTP_USER}" -- env \
+        HOME="${VTP_HOME}" \
         SEASONALWEATHER_DATA_BASE="${VTP_STATE_BASE}" \
         VOICETEXT_DEBUG="${VOICETEXT_DEBUG:-0}" \
+        VOICETEXT_PAUL_ATTEMPTS="${VOICETEXT_PAUL_ATTEMPTS:-3}" \
         "${VTP_SYNTH}" >/dev/null 2>"${VTP_STDERR}"; then
       warn "VoiceText Paul smoke test failed; the backend is not safe to enable yet"
       warn "Smoke stderr follows:"
       sed 's/^/[voicetext-paul-smoke] /' "${VTP_STDERR}" >&2 || true
-      warn "If this was a reinstall after an older failed bootstrap, remove ${VTP_STATE_BASE}/wineprefixes/voicetext_paul_voicetext and rerun bootstrap."
-      warn "If it still fails, provide a known-good runtime with SEASONAL_VOICETEXT_PAUL_SOURCE and optionally SEASONAL_VOICETEXT_PAUL_SHA256."
+      warn "VoiceText Paul segfaults are often stale-Wine-server/stateful failures; the wrapper retries crash rc=134/139 after wineserver -k."
+      warn "If all retry attempts still fail, provide a known-good runtime with SEASONAL_VOICETEXT_PAUL_SOURCE and optionally SEASONAL_VOICETEXT_PAUL_SHA256."
       rm -f "${VTP_STDERR}"
       exit 1
     fi

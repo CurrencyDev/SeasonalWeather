@@ -137,12 +137,17 @@ Bootstrap accepts these optional variables when `SEASONAL_VOICETEXT_PAUL=1`:
 When enabled, bootstrap starts `seasonalweather-voicetext-xvfb.service` and runs
 a small VoiceText Paul synthesis before declaring the backend installed. If the
 smoke test fails, bootstrap exits non-zero rather than leaving a service that
-will immediately spam segment refresh failures.
+will immediately spam segment refresh failures. The smoke path uses multiple
+wrapper attempts because VoiceText Paul/Wine failures have historically been
+stateful: crash exits such as rc=134 or rc=139 are retried after `wineserver -k`
+before bootstrap declares the backend unsafe.
 
-The wrapper defaults fresh prefixes to `WINEARCH=win32` because VoiceText Paul is
-a 32-bit Windows runtime and small SeasonalWeather VMs should not need the full
-`wine64` package set. Operators may set `VOICETEXT_PAUL_WINEARCH=auto` only after
-validating a host-specific need for Wine's default prefix behavior.
+The wrapper defaults fresh prefixes to `VOICETEXT_PAUL_WINEARCH=auto`, which lets
+Wine create its normal amd64/WOW64-capable prefix when `wine64` and `wine32` are
+installed. VoiceText Paul is a 32-bit Windows runtime, but pure `win32` prefixes
+have proven crash-prone with the bundled Cygwin executable on Debian trixie/Wine
+10. Operators may still force `VOICETEXT_PAUL_WINEARCH=win32` for a known-good
+legacy host, but that is not the default supported fresh-install path.
 
 The runtime directory is shared between two local users:
 
@@ -161,12 +166,14 @@ during the smoke test that `seasonalweather` can clean up the WAV produced by
 
 Fresh VoiceText Paul deployments use a dedicated Wine prefix at
 `/var/lib/seasonalweather/wineprefixes/voicetext_paul_voicetext`.
-The wrapper defaults to a 32-bit Wine prefix because VoiceText Paul is a
-32-bit Windows runtime and small SeasonalWeather VMs do not have enough root
-partition budget for the full `wine64` package set.
+The wrapper defaults to Wine's native amd64/WOW64-capable prefix behavior. The
+VoiceText Paul executable is 32-bit, so bootstrap installs both `wine64` and
+`wine32`; this avoids the pure-win32 prefix crash path observed on fresh Debian
+trixie/Wine 10 deployments.
 
-Bootstrap installs `wine` plus `wine32`, initializes the prefix with
-`wineboot --init`, and then runs a small synthesis smoke test before the backend
-is considered safe to enable. Operators may set `VOICETEXT_PAUL_WINEARCH=auto`
-to let Wine choose a prefix architecture, but that is not the default supported
-fresh-install path.
+Bootstrap initializes the prefix with `wineboot --init`, and then runs a small
+synthesis smoke test before the backend is considered safe to enable. Operators
+may set `VOICETEXT_PAUL_WINEARCH=win32` only for a known-good legacy host. When
+the default `auto` mode finds an old pure-win32 prefix, bootstrap recreates it by
+default; set `SEASONAL_VOICETEXT_PAUL_RECREATE_WIN32_PREFIX=0` to preserve it for
+forensics.

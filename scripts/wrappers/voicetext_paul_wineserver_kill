@@ -2,6 +2,12 @@
 set -euo pipefail
 
 STATE_BASE="${SEASONALWEATHER_DATA_BASE:-/var/lib/seasonalweather}"
+if [[ -z "${HOME:-}" || "${HOME}" == "/root" ]]; then
+  pw_home="$(getent passwd "$(id -u)" | awk -F: '{print $6}')"
+  if [[ -n "${pw_home}" && -d "${pw_home}" ]]; then
+    export HOME="${pw_home}"
+  fi
+fi
 ENGINE_DIR="${VOICETEXT_PAUL_BIN_DIR:-${STATE_BASE}/voices/voicetext_paul/WeatherRadioSuite-LIB/binary}"
 LOCK="${ENGINE_DIR}/.voicetext_paul.flock"
 PREFIX_BASE="${VOICETEXT_PAUL_PREFIX_BASE:-${STATE_BASE}/wineprefixes}"
@@ -10,7 +16,8 @@ PREFIX="${VOICETEXT_PAUL_WINEPREFIX:-${PREFIX_BASE}/${PREFIX_NAME}}"
 TMPD="${VOICETEXT_PAUL_TMPDIR:-${STATE_BASE}/tmp}"
 
 export WINEPREFIX="${PREFIX}"
-REQUESTED_WINEARCH="${VOICETEXT_PAUL_WINEARCH:-win32}"
+# Keep this default aligned with voicetext_paul_synth.
+REQUESTED_WINEARCH="${VOICETEXT_PAUL_WINEARCH:-auto}"
 if [[ ! -f "${PREFIX}/system.reg" && "${REQUESTED_WINEARCH}" != "auto" ]]; then
   export WINEARCH="${REQUESTED_WINEARCH}"
 else

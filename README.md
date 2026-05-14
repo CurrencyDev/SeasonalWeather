@@ -192,6 +192,16 @@ SEASONAL_DECTALK=1 sudo -E bash scripts/00-bootstrap.sh
 SEASONAL_VOICETEXT_PAUL=1 sudo -E bash scripts/00-bootstrap.sh
 ```
 
+VoiceText Paul is smoke-tested during bootstrap. The repo-owned wrapper retries
+stateful Wine crash exits such as rc=134/139 after resetting `wineserver`; if all
+attempts fail, refresh from a known-good runtime with `SEASONAL_VOICETEXT_PAUL_SOURCE`
+and `SEASONAL_VOICETEXT_PAUL_REFRESH=1`.
+
+VoiceText Paul fresh installs use Wine's default amd64/WOW64-capable prefix
+(`VOICETEXT_PAUL_WINEARCH=auto`) and install both `wine64` and `wine32`. This is
+intentional: pure `win32` prefixes have been observed to segfault the bundled
+VoiceText/Cygwin runtime on Debian trixie/Wine 10.
+
 ### 3) Configure the live files
 
 ```bash

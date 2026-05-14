@@ -28,15 +28,28 @@ def test_voicetext_wrappers_default_to_headless_display_service() -> None:
     assert 'ExecStart=/usr/bin/Xvfb :99 -screen 0 1024x768x24 -nolisten tcp -noreset -ac' in unit
 
 
-def test_voicetext_wrapper_defaults_to_win32_prefix_for_small_root_deployments() -> None:
+def test_voicetext_wrapper_defaults_to_wow64_capable_auto_prefix() -> None:
     synth = (REPO_ROOT / "scripts/wrappers/voicetext_paul_synth").read_text()
     kill = (REPO_ROOT / "scripts/wrappers/voicetext_paul_wineserver_kill").read_text()
 
-    assert 'REQUESTED_WINEARCH="${VOICETEXT_PAUL_WINEARCH:-win32}"' in synth
+    assert 'REQUESTED_WINEARCH="${VOICETEXT_PAUL_WINEARCH:-auto}"' in synth
     assert '[[ ! -f "${PREFIX}/system.reg" && "${REQUESTED_WINEARCH}" != "auto" ]]' in synth
-    assert 'VOICETEXT_PAUL_WINEARCH:-win32' in kill
+    assert 'VOICETEXT_PAUL_WINEARCH:-auto' in kill
     assert 'VOICETEXT_PAUL_WINEDLLOVERRIDES:-mscoree,mshtml=' in synth
     assert 'wineboot --init' in synth
+    assert 'unset WINEARCH' in synth
+
+
+def test_voicetext_wrapper_retries_stateful_wine_crashes() -> None:
+    synth = (REPO_ROOT / "scripts/wrappers/voicetext_paul_synth").read_text()
+    kill = (REPO_ROOT / "scripts/wrappers/voicetext_paul_wineserver_kill").read_text()
+
+    assert 'ATTEMPTS="${VOICETEXT_PAUL_ATTEMPTS:-2}"' in synth
+    assert 'RETRY_RCS=" ${VOICETEXT_PAUL_RETRY_RCS:-134 139} "' in synth
+    assert 'wineserver -k >/dev/null 2>&1 || true' in synth
+    assert 'wine attempt ${attempt}/${ATTEMPTS} failed rc=${rc1}' in synth
+    assert 'HOME="${pw_home}"' in synth
+    assert 'HOME="${pw_home}"' in kill
 
 
 def test_voicetext_runtime_serializes_python_side_access_to_shared_wav() -> None:
