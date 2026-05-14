@@ -461,10 +461,13 @@ _SEG_META_RE = re.compile(
 )
 _SEG_PPA_RE = re.compile(r"^PRECAUTIONARY/PREPAREDNESS ACTIONS", re.IGNORECASE)
 _SEG_LOC_RE = re.compile(r"^Locations?\s+(?:impacted|affected)\s+include", re.IGNORECASE)
-_SEG_UGC_RE = re.compile(r"^[A-Z]{2}[CZ]\d{3}(?:-\d{3})*-\d{6}-?$")
+_SEG_UGC_RE = re.compile(
+    r"^(?:[A-Z]{2}[CZ]\d{3}|\d{3})(?:-(?:[A-Z]{2}[CZ]\d{3}|\d{3}))*-\d{6}-?$",
+    re.IGNORECASE,
+)
 _SEG_TIMESTAMP_RE = re.compile(r"^\d{3,4}\s+(?:AM|PM)\s+[A-Z]{2,4}")
-_TZ_FIX_RE = re.compile(r"\b(Edt|Est|Cdt|Cst|Mdt|Mst|Pdt|Pst|Akdt|Akst|Hst)\b")
-_AMPM_FIX_RE = re.compile(r"\b(Am|Pm)\b")
+_TZ_FIX_RE = re.compile(r"\b(EDT|EST|CDT|CST|MDT|MST|PDT|PST|AKDT|AKST|HST)\b", re.IGNORECASE)
+_AMPM_FIX_RE = re.compile(r"\b(AM|PM)\b", re.IGNORECASE)
 
 
 def _fix_headline_case(h: str) -> str:
@@ -488,26 +491,99 @@ class NwwsProductSegment:
     expiry_phrase: str      # e.g. "315 PM EDT" extracted from headline
 
 
+def _split_nwws_vtec_sections(product_text: str) -> list[str]:
+    """Return $$-delimited NWWS sections that contain VTEC lines."""
+    text = (product_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    sections: list[str] = []
+
+    # $$ separates UGC/VTEC product segments.  Within a segment, && normally
+    # separates the narrative body from LAT/LON / tag metadata.
+    for chunk in re.split(r"(?m)^\s*\$\$\s*$", text):
+        if not _SEG_VTEC_RE.search(chunk):
+            continue
+        body = re.split(r"(?m)^\s*&&\s*$", chunk, maxsplit=1)[0].strip("\n")
+        if _SEG_VTEC_RE.search(body):
+            sections.append(body)
+
+    # Fallback for malformed/single-section products that lack a $$ close.
+    if not sections and _SEG_VTEC_RE.search(text):
+        sections.append(re.split(r"(?m)^\s*&&\s*$", text, maxsplit=1)[0].strip("\n"))
+
+    return sections
+
+
+def _extract_wrapped_headline(lines: list[str]) -> tuple[str, int, int]:
+    """Extract a possibly wrapped ...headline... block."""
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if not s.startswith("..."):
+            continue
+
+        parts = [s]
+        end_idx = i
+        if s.endswith("...") and len(s) > 6:
+            raw = s
+        else:
+            raw = s
+            for j in range(i + 1, len(lines)):
+                sj = lines[j].strip()
+                if not sj:
+                    break
+                parts.append(sj)
+                end_idx = j
+                raw = " ".join(parts)
+                if sj.endswith("..."):
+                    break
+
+        headline = raw.strip().strip(".").strip()
+        return _fix_headline_case(headline).rstrip("."), i, end_idx
+
+    return "", -1, -1
+
+
+def _clean_county_area_text(raw: str) -> str:
+    text = re.sub(r"\s+", " ", (raw or "").strip()).strip("-")
+    text = re.sub(r"-\s*", "; ", text).strip(" ;")
+    return text
+
+
+def _extract_county_area_text(lines: list[str]) -> str:
+    """Extract the county/city name line between VTEC and issuance time."""
+    area_parts: list[str] = []
+    after_vtec = False
+    for ln in lines:
+        s = ln.strip()
+        if not after_vtec:
+            if s.startswith("/") and s.endswith("/") and "." in s:
+                after_vtec = True
+            continue
+        if not s:
+            if area_parts:
+                break
+            continue
+        if _SEG_TIMESTAMP_RE.match(s) or s.startswith("..."):
+            break
+        if _SEG_UGC_RE.match(s) or (s.startswith("/") and s.endswith("/") and "." in s):
+            continue
+        area_parts.append(s)
+    return _clean_county_area_text(" ".join(area_parts))
+
+
 def parse_nwws_product_segments(product_text: str) -> list[NwwsProductSegment]:
     """
-    Split a multi-section NWWS product on && delimiters and parse each section.
+    Split a multi-section NWWS product into VTEC-bearing $$ sections.
 
-    NWS products use && to separate UGC/VTEC sections within a product and $$
-    to close the product.  We split on && so each UGC+VTEC block becomes its
-    own segment.  Sections without any VTEC lines are silently skipped.
+    NWS warning/statements commonly use $$ between UGC/VTEC sections and &&
+    inside a section before LAT/LON / machine-readable metadata.  Sections
+    without any VTEC lines are silently skipped.
 
     Used to generate per-action narration for products that carry mixed VTEC
-    actions (e.g. a partial CAN+CON in an MWS where some zones are cancelled
-    while others continue).
+    actions (e.g. a partial CAN+CON where some zones are cancelled while
+    others continue).
     """
     segments: list[NwwsProductSegment] = []
 
-    # Strip everything after the first $$ (LAT/LON block, signature) then
-    # split on && to get per-UGC-zone sections.
-    body = re.split(r"\$\$", product_text, maxsplit=1)[0]
-    raw_sections = re.split(r"&&", body)
-
-    for raw_sec in raw_sections:
+    for raw_sec in _split_nwws_vtec_sections(product_text):
         actions: set[str] = set()
         for m in _SEG_VTEC_RE.finditer(raw_sec):
             actions.add(m.group("act").upper())
@@ -516,15 +592,7 @@ def parse_nwws_product_segments(product_text: str) -> list[NwwsProductSegment]:
 
         lines = [ln.rstrip() for ln in raw_sec.splitlines()]
 
-        # Headline
-        headline = ""
-        headline_idx = -1
-        for i, ln in enumerate(lines):
-            hm = _SEG_HEADLINE_RE.match(ln.strip())
-            if hm:
-                headline = _fix_headline_case(hm.group(1).strip()).rstrip(".")
-                headline_idx = i
-                break
+        headline, headline_idx, headline_end_idx = _extract_wrapped_headline(lines)
 
         # Expiry phrase from headline
         expiry_phrase = ""
@@ -533,7 +601,7 @@ def parse_nwws_product_segments(product_text: str) -> list[NwwsProductSegment]:
             if um:
                 expiry_phrase = um.group(1).strip()
 
-        # Area text: lines after the area intro phrase, until blank line
+        # Area text: first prefer explicit phrases, then county/city lines after VTEC.
         area_parts: list[str] = []
         in_area = False
         area_done = False
@@ -556,21 +624,23 @@ def parse_nwws_product_segments(product_text: str) -> list[NwwsProductSegment]:
                 else:
                     area_done = True
 
-        area_text = "; ".join(p for p in area_parts if p)
+        area_text = "; ".join(p for p in area_parts if p) or _extract_county_area_text(lines)
 
         # Body / reason lines and precautionary text
         body_parts: list[str] = []
         precaution_parts: list[str] = []
         in_precautions = False
         in_area_skip = False
+        in_locations_skip = False
 
-        start = headline_idx + 1 if headline_idx >= 0 else 0
+        start = headline_end_idx + 1 if headline_end_idx >= 0 else 0
         for ln in lines[start:]:
             s = ln.strip()
             if s.startswith("&&") or s.startswith("$$"):
                 break
             if not s:
                 in_area_skip = False
+                in_locations_skip = False
                 continue
             if _SEG_UGC_RE.match(s) or _SEG_TIMESTAMP_RE.match(s):
                 continue
@@ -580,11 +650,15 @@ def parse_nwws_product_segments(product_text: str) -> list[NwwsProductSegment]:
                 continue
             if _SEG_PPA_RE.match(s):
                 in_precautions = True
+                in_locations_skip = False
                 continue
             if _SEG_AREA_INTRO_RE.match(s):
                 in_area_skip = True
                 continue
             if _SEG_LOC_RE.match(s):
+                in_locations_skip = True
+                continue
+            if in_locations_skip:
                 continue
             if in_area_skip:
                 if s.endswith("...") or re.match(r"^[A-Z][a-z]+,", s):

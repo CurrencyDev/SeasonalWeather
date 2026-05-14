@@ -26,6 +26,10 @@ _SPACE_RE = re.compile(r"[ \t]+")
 _URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)", re.IGNORECASE)
 _ANGLE_URL_RE = re.compile(r"<(https?://[^>]+)>", re.IGNORECASE)
+_NWS_COMPACT_CLOCK_RE = re.compile(
+    r"(?<![A-Z0-9])(?P<clock>\d{3,4})\s*(?P<ampm>AM|PM)\b",
+    re.IGNORECASE,
+)
 
 # Characters that commonly trail a URL in NWS product text but are not part of it.
 _URL_TRAIL_RE = re.compile(r"[.,;:)\]]+$")
@@ -51,6 +55,33 @@ def verbalize_url(url: str) -> str:
     u = u.replace("&", " and ")
     u = re.sub(r"\s+", " ", u).strip().lower()
     return u
+
+
+def normalize_nws_spoken_times(text: str) -> str:
+    """Normalize compact NWS local times like ``700 PM`` to ``7:00 PM``.
+
+    Many NWS products omit the colon in human-readable local times.  Some TTS
+    engines read those compact forms as raw numbers (for example, ``700 PM`` as
+    "seven hundred PM") instead of clock times.  This helper only touches
+    12-hour AM/PM forms and intentionally leaves VTEC/UTC timestamps such as
+    ``260513T2300Z`` or ``2251Z`` unchanged.
+    """
+    if not text:
+        return ""
+
+    def _repl(m: re.Match[str]) -> str:
+        raw_clock = m.group("clock")
+        ampm = m.group("ampm").upper()
+        hour = int(raw_clock[:-2])
+        minute = int(raw_clock[-2:])
+
+        if hour < 1 or hour > 12 or minute > 59:
+            return m.group(0)
+
+        return f"{hour}:{minute:02d} {ampm}"
+
+    return _NWS_COMPACT_CLOCK_RE.sub(_repl, text)
+
 
 def _compile_text_override_rx(spec: dict) -> re.Pattern[str]:
     match = str(spec.get("match", "") or "")
@@ -247,6 +278,9 @@ def clean_for_tts(text: str) -> str:
                 # In HWO, only drop meta-ish if it's a pure token (no spaces)
                 if " " not in line and not any(ch in line for ch in (".", ",", "!", "?", "'")):
                     continue
+
+        # Normalize compact NWS local times before VT-Paul or other TTS sees them.
+        line = normalize_nws_spoken_times(line)
 
         # Normalize whitespace *within* the line
         line = _SPACE_RE.sub(" ", line).strip()
