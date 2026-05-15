@@ -67,6 +67,7 @@ Agents working in this repository must prefer small, reversible changes that pre
 - `config/config.yaml` — repo example/default config
 - `scripts/wrappers/` — canonical runtime wrapper scripts installed to `/usr/local/bin/` by bootstrap; version-controlled here, do not regenerate inline
 - `scripts/preflight/` — preflight helper scripts installed to `/usr/local/sbin/` by bootstrap
+- `scripts/install-samedec.sh` — pinned Rust `samedec` installer used by bootstrap; keep version changes deliberate and documented
 - `scripts/00-bootstrap.sh` — single deploy entry point; uses `install_repo_wrapper` to install from `scripts/wrappers/`; see `docs/runtime-wrappers.md`
 
 ## Preferred change style

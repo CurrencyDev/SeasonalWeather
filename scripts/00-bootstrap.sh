@@ -14,6 +14,8 @@
 #   SEASONAL_VOICETEXT_PAUL=1   — also install the VoiceText Paul (Wine) TTS backend
 #   SEASONAL_DECTALK=1          — install DECtalk (builds from source; slow)
 #   SEASONAL_DECTALK_UPDATE=1   — pull latest DECtalk source before rebuilding
+#   SEASONAL_SAMEDEC=0          — skip installing the Rust samedec decoder
+#   SEASONAL_SAMEDEC_VERSION=x  — override pinned samedec crate version
 #
 set -euo pipefail
 
@@ -102,6 +104,16 @@ if [[ ! -d /opt/seasonalweather/venv ]]; then
 fi
 /opt/seasonalweather/venv/bin/python -m pip install --upgrade pip wheel
 /opt/seasonalweather/venv/bin/pip install -r /opt/seasonalweather/app/requirements.txt
+
+# -----------------------------------------------------------------------------------------
+# samedec SAME/EAS decoder
+# -----------------------------------------------------------------------------------------
+if [[ "${SEASONAL_SAMEDEC:-1}" == "1" ]]; then
+  log "Installing samedec decoder"
+  bash /opt/seasonalweather/app/scripts/install-samedec.sh
+else
+  log "Skipping samedec (set SEASONAL_SAMEDEC=1 to install)"
+fi
 
 # -----------------------------------------------------------------------------------------
 # Config files — never overwrite existing operator-edited files

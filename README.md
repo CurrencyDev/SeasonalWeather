@@ -192,6 +192,20 @@ SEASONAL_DECTALK=1 sudo -E bash scripts/00-bootstrap.sh
 SEASONAL_VOICETEXT_PAUL=1 sudo -E bash scripts/00-bootstrap.sh
 ```
 
+The bootstrap installs the pinned Rust `samedec` decoder by default because ERN/GWES
+monitoring uses it when available. To skip it on a minimal/native-decoder-only
+host, run:
+
+```bash
+SEASONAL_SAMEDEC=0 sudo -E bash scripts/00-bootstrap.sh
+```
+
+To deliberately refresh or change the pinned crate version:
+
+```bash
+SEASONAL_SAMEDEC_VERSION=0.4.2 sudo -E bash scripts/00-bootstrap.sh
+```
+
 VoiceText Paul is smoke-tested during bootstrap. The repo-owned wrapper retries
 stateful Wine crash exits such as rc=134/139 after resetting `wineserver`; if all
 attempts fail, refresh from a known-good runtime with `SEASONAL_VOICETEXT_PAUL_SOURCE`
@@ -282,6 +296,17 @@ Generate a test alert WAV and optionally push it into the Liquidsoap queue:
 
 ## GWES-ERN SAME decoding
 
-SeasonalWeather uses `samedec` (Rust) for fast SAME decoding from the ERN stream by default. To switch back to the pure-Python decoder, edit `seasonalweather/broadcast/ern_gwes.py` and find `_same_listen_module_cmd` — change `same.listen_samedec` to `same.listen` and restart.
+SeasonalWeather uses the Rust `samedec` binary for fast SAME decoding from the ERN stream when `ern.decoder_backend` is `auto` and the configured binary exists. Fresh bootstrap installs a pinned `samedec` crate release into `/opt/seasonalweather/samedec` and publishes `/usr/local/bin/samedec`.
 
-The `samedec` binary path and confidence threshold are configured in `config.yaml` under the `samedec:` section.
+The `samedec` binary path, confidence threshold, and timing offset are configured in `config.yaml` under the `samedec:` section. The ERN decoder backend is configured with `ern.decoder_backend`:
+
+- `auto` — use `samedec` when available, otherwise fall back to the native Python decoder.
+- `samedec` — require the Rust decoder.
+- `native` — force the pure-Python decoder.
+
+Operational checks:
+
+```bash
+/usr/local/bin/samedec --version
+/opt/seasonalweather/venv/bin/python -m seasonalweather.same.listen_samedec --help
+```
