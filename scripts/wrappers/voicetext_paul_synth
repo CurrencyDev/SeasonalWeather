@@ -12,6 +12,12 @@ fi
 if [[ "${VOICETEXT_DEBUG:-0}" == "1" ]]; then
   echo "[voicetext_paul_synth] core_limit=$(ulimit -c) (VOICETEXT_PAUL_CORE=${CORE})" >&2
 fi
+if [[ -z "${HOME:-}" || "${HOME}" == "/root" ]]; then
+  pw_home="$(getent passwd "$(id -u)" | awk -F: '{print $6}')"
+  if [[ -n "${pw_home}" && -d "${pw_home}" ]]; then
+    export HOME="${pw_home}"
+  fi
+fi
 
 STATE_BASE="${SEASONALWEATHER_DATA_BASE:-/var/lib/seasonalweather}"
 ENGINE_ROOT="${VOICETEXT_PAUL_ENGINE_ROOT:-${STATE_BASE}/voices/voicetext_paul/WeatherRadioSuite-LIB}"
@@ -117,15 +123,21 @@ ENGINE_USED="wine"
 if [[ "${DEBUG}" == "1" ]]; then
   echo "[voicetext_paul_synth] engine=${ENGINE_USED}" >&2
 fi
-rc1=0
-STAMP="$(date +%Y-%m-%d_%H%M%S)"
-WLOG="${TMPD}/voicetext_paul_wine.${STAMP}.log"
-timeout 25s wine voicetext_paul.exe >"${WLOG}" 2>&1
-rc1=$?
-if [[ ${rc1} -eq 0 ]]; then
-  rm -f "${WLOG}" 2>/dev/null || true
-else
-  echo "[voicetext_paul_synth] wine failed rc=${rc1}; log=${WLOG}" >&2
+ATTEMPTS="${VOICETEXT_PAUL_ATTEMPTS:-2}"
+RETRY_RCS=" ${VOICETEXT_PAUL_RETRY_RCS:-134 139} "
+rc1=1
+WLOG=""
+for attempt in $(seq 1 "${ATTEMPTS}"); do
+  STAMP="$(date +%Y-%m-%d_%H%M%S)"
+  WLOG="${TMPD}/voicetext_paul_wine.${STAMP}.attempt${attempt}.log"
+  timeout 25s wine voicetext_paul.exe >"${WLOG}" 2>&1
+  rc1=$?
+  if [[ ${rc1} -eq 0 ]]; then
+    rm -f "${WLOG}" 2>/dev/null || true
+    break
+  fi
+
+  echo "[voicetext_paul_synth] wine attempt ${attempt}/${ATTEMPTS} failed rc=${rc1}; log=${WLOG}" >&2
   if [[ -s "${WLOG}" ]]; then
     echo "[voicetext_paul_synth] wine log tail:" >&2
     tail -n 40 "${WLOG}" >&2 || true
@@ -133,7 +145,15 @@ else
   INLOG="${TMPD}/voicetext_paul_input.${STAMP}.txt"
   cp -a input1.txt "${INLOG}" 2>/dev/null || true
   echo "[voicetext_paul_synth] saved input=${INLOG}" >&2
-fi
+
+  if [[ "${RETRY_RCS}" == *" ${rc1} "* && "${attempt}" -lt "${ATTEMPTS}" ]]; then
+    wineserver -k >/dev/null 2>&1 || true
+    rm -f output.wav
+    sleep 0.5
+    continue
+  fi
+  break
+done
 set -e
 
 if [[ ! -s output.wav ]]; then

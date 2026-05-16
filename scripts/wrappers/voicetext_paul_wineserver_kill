@@ -17,7 +17,7 @@ TMPD="${VOICETEXT_PAUL_TMPDIR:-${STATE_BASE}/tmp}"
 
 export WINEPREFIX="${PREFIX}"
 # Keep this default aligned with voicetext_paul_synth.
-REQUESTED_WINEARCH="${VOICETEXT_PAUL_WINEARCH:-auto}"
+REQUESTED_WINEARCH="${VOICETEXT_PAUL_WINEARCH:-win32}"
 if [[ ! -f "${PREFIX}/system.reg" && "${REQUESTED_WINEARCH}" != "auto" ]]; then
   export WINEARCH="${REQUESTED_WINEARCH}"
 else

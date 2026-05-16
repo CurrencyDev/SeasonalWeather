@@ -211,10 +211,12 @@ stateful Wine crash exits such as rc=134/139 after resetting `wineserver`; if al
 attempts fail, refresh from a known-good runtime with `SEASONAL_VOICETEXT_PAUL_SOURCE`
 and `SEASONAL_VOICETEXT_PAUL_REFRESH=1`.
 
-VoiceText Paul fresh installs use Wine's default amd64/WOW64-capable prefix
-(`VOICETEXT_PAUL_WINEARCH=auto`) and install both `wine64` and `wine32`. This is
-intentional: pure `win32` prefixes have been observed to segfault the bundled
-VoiceText/Cygwin runtime on Debian trixie/Wine 10.
+VoiceText Paul fresh installs use a 32-bit Wine prefix
+(`VOICETEXT_PAUL_WINEARCH=win32`) and install the 32-bit Wine stack. Bootstrap
+also runs `loginctl enable-linger voicetext` so Wine subprocesses keep a stable
+systemd user runtime instead of having logind tear the user session state down
+between short-lived synth invocations. Operators may set
+`VOICETEXT_PAUL_WINEARCH=auto` only as a known-good fallback.
 
 ### 3) Configure the live files
 

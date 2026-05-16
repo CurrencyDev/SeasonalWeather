@@ -114,7 +114,9 @@ letting Wine abort without context.
 
 ## VoiceText Paul Wine/runtime notes
 
-Fresh VoiceText Paul installs provision i386 architecture and install the 32-bit Wine stack because the VoiceText runtime may require 32-bit Wine support on otherwise 64-bit hosts. The wrapper does not force `WINEARCH` by default; operators may explicitly set `VOICETEXT_PAUL_WINEARCH` only after validating that a specific Wine build requires it.
+Fresh VoiceText Paul installs provision i386 architecture and install the 32-bit Wine stack because VoiceText Paul is a 32-bit Windows runtime. The wrapper defaults fresh prefixes to `VOICETEXT_PAUL_WINEARCH=win32`; operators may explicitly set `VOICETEXT_PAUL_WINEARCH=auto` only as a known-good fallback for a specific Wine build.
+
+Bootstrap also enables systemd lingering for the dedicated `voicetext` account with `loginctl enable-linger voicetext`. This keeps the user runtime stable for the Wine subprocesses instead of letting logind repeatedly tear down the account's runtime state between short-lived invocations.
 
 The Xvfb unit is started with access control disabled for this private local display, and the wrapper probes the display with `xdpyinfo` when available. If Wine fails after those preflight checks, the wrapper prints the tail of the saved Wine log into journald and preserves the full log under `/var/lib/seasonalweather/tmp/`.
 
@@ -142,12 +144,11 @@ wrapper attempts because VoiceText Paul/Wine failures have historically been
 stateful: crash exits such as rc=134 or rc=139 are retried after `wineserver -k`
 before bootstrap declares the backend unsafe.
 
-The wrapper defaults fresh prefixes to `VOICETEXT_PAUL_WINEARCH=auto`, which lets
-Wine create its normal amd64/WOW64-capable prefix when `wine64` and `wine32` are
-installed. VoiceText Paul is a 32-bit Windows runtime, but pure `win32` prefixes
-have proven crash-prone with the bundled Cygwin executable on Debian trixie/Wine
-10. Operators may still force `VOICETEXT_PAUL_WINEARCH=win32` for a known-good
-legacy host, but that is not the default supported fresh-install path.
+The wrapper defaults fresh prefixes to `VOICETEXT_PAUL_WINEARCH=win32`, matching
+the 32-bit VoiceText Paul executable and avoiding a 64-bit/WOW64 Wine prefix as
+the primary runtime. Operators may still force `VOICETEXT_PAUL_WINEARCH=auto`
+for a known-good fallback host, but that is no longer the default supported
+fresh-install path.
 
 The runtime directory is shared between two local users:
 
@@ -166,14 +167,13 @@ during the smoke test that `seasonalweather` can clean up the WAV produced by
 
 Fresh VoiceText Paul deployments use a dedicated Wine prefix at
 `/var/lib/seasonalweather/wineprefixes/voicetext_paul_voicetext`.
-The wrapper defaults to Wine's native amd64/WOW64-capable prefix behavior. The
-VoiceText Paul executable is 32-bit, so bootstrap installs both `wine64` and
-`wine32`; this avoids the pure-win32 prefix crash path observed on fresh Debian
-trixie/Wine 10 deployments.
+The wrapper defaults to a pure 32-bit Wine prefix. The VoiceText Paul executable
+is 32-bit, so bootstrap installs the 32-bit Wine stack and does not install
+`wine64` as part of the primary path.
 
 Bootstrap initializes the prefix with `wineboot --init`, and then runs a small
 synthesis smoke test before the backend is considered safe to enable. Operators
-may set `VOICETEXT_PAUL_WINEARCH=win32` only for a known-good legacy host. When
-the default `auto` mode finds an old pure-win32 prefix, bootstrap recreates it by
-default; set `SEASONAL_VOICETEXT_PAUL_RECREATE_WIN32_PREFIX=0` to preserve it for
-forensics.
+may set `VOICETEXT_PAUL_WINEARCH=auto` only for a known-good fallback host. When
+the default `win32` mode finds an old non-win32 prefix, bootstrap recreates it by
+default; set `SEASONAL_VOICETEXT_PAUL_RECREATE_NON_WIN32_PREFIX=0` to preserve it
+for forensics.

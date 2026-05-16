@@ -234,9 +234,9 @@ if [[ "${SEASONAL_VOICETEXT_PAUL:-0}" == "1" ]]; then
     dpkg --add-architecture i386
     apt-get update
   fi
-  if ! apt-get install -y --no-install-recommends wine wine64 wine32:i386 unzip xvfb x11-utils; then
-    warn "wine64 + wine32:i386 install failed; retrying with distro wine32 package name"
-    apt-get install -y --no-install-recommends wine wine64 wine32 unzip xvfb x11-utils
+  if ! apt-get install -y --no-install-recommends wine wine32:i386 unzip xvfb x11-utils; then
+    warn "wine32:i386 install failed; retrying with distro wine32 package name"
+    apt-get install -y --no-install-recommends wine wine32 unzip xvfb x11-utils
   fi
 
   VTP_USER="voicetext"
@@ -252,10 +252,10 @@ if [[ "${SEASONAL_VOICETEXT_PAUL:-0}" == "1" ]]; then
   VTP_REFRESH="${SEASONAL_VOICETEXT_PAUL_REFRESH:-0}"
   VTP_SYNTH="/usr/local/bin/voicetext_paul_synth"
   VTP_WSKILL="/usr/local/bin/voicetext_paul_wineserver_kill"
-  # Default to Wine's native amd64/WOW64 prefix on fresh amd64 installs. A pure
-  # win32 prefix has proven crash-prone with the VoiceText/Cygwin runtime on
-  # Debian trixie/Wine 10. Operators may still force win32 explicitly.
-  VTP_WINEARCH="${VOICETEXT_PAUL_WINEARCH:-auto}"
+  # VoiceText Paul is a 32-bit Windows runtime. Default fresh prefixes to win32
+  # and keep Wine's 64-bit/WOW64 environment out of the primary install path.
+  # Operators may set VOICETEXT_PAUL_WINEARCH=auto only for a known-good fallback.
+  VTP_WINEARCH="${VOICETEXT_PAUL_WINEARCH:-win32}"
   VTP_WINEPREFIX="${VOICETEXT_PAUL_WINEPREFIX:-${VTP_STATE_BASE}/wineprefixes/voicetext_paul_voicetext}"
   VTP_SUDOERS="/etc/sudoers.d/seasonalweather-voicetext-paul"
   VTP_SYSTEMD_DROPIN_DIR="/etc/systemd/system/seasonalweather.service.d"
@@ -293,6 +293,13 @@ WINEENVEOF
     useradd --system --home "${VTP_HOME}" --create-home --shell /usr/sbin/nologin "${VTP_USER}"
   fi
   install -d -o "${VTP_USER}" -g "${VTP_USER}" "${VTP_HOME}"
+
+  if command -v loginctl >/dev/null 2>&1; then
+    log "Enabling persistent systemd user runtime for ${VTP_USER}"
+    loginctl enable-linger "${VTP_USER}"
+  else
+    warn "loginctl not found; VoiceText Paul may be unstable without lingering enabled for ${VTP_USER}"
+  fi
 
   if ! id -nG "${VTP_USER}" | tr ' ' '\n' | grep -qx seasonalweather; then
     log "Adding ${VTP_USER} to seasonalweather group for shared VoiceText runtime access"
@@ -368,10 +375,10 @@ WINEENVEOF
   fi
 
   VTP_PREFIX_ARCH="$(wine_prefix_arch "${VTP_WINEPREFIX}")"
-  if [[ "${VTP_WINEARCH}" == "auto" && "${VTP_PREFIX_ARCH}" == "win32" && "${SEASONAL_VOICETEXT_PAUL_RECREATE_WIN32_PREFIX:-1}" == "1" ]]; then
-    warn "Existing VoiceText Paul Wine prefix is pure win32; recreating it as Wine's default WOW64-capable prefix"
+  if [[ "${VTP_WINEARCH}" == "win32" && -n "${VTP_PREFIX_ARCH}" && "${VTP_PREFIX_ARCH}" != "win32" && "${SEASONAL_VOICETEXT_PAUL_RECREATE_NON_WIN32_PREFIX:-1}" == "1" ]]; then
+    warn "Existing VoiceText Paul Wine prefix is ${VTP_PREFIX_ARCH}; recreating it as a 32-bit prefix"
     warn "  Prefix: ${VTP_WINEPREFIX}"
-    warn "  Set SEASONAL_VOICETEXT_PAUL_RECREATE_WIN32_PREFIX=0 to keep the old prefix."
+    warn "  Set SEASONAL_VOICETEXT_PAUL_RECREATE_NON_WIN32_PREFIX=0 to preserve it for forensics."
     rm -rf "${VTP_WINEPREFIX:?}"
   fi
 

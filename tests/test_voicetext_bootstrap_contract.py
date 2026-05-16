@@ -37,7 +37,9 @@ def test_bootstrap_installs_and_enables_voicetext_xvfb_service() -> None:
     bootstrap = (REPO_ROOT / "scripts/00-bootstrap.sh").read_text()
 
     assert 'dpkg --add-architecture i386' in bootstrap
-    assert 'apt-get install -y --no-install-recommends wine wine64 wine32:i386 unzip xvfb x11-utils' in bootstrap
+    assert 'apt-get install -y --no-install-recommends wine wine32:i386 unzip xvfb x11-utils' in bootstrap
+    assert 'wine64' not in bootstrap
+    assert 'loginctl enable-linger "${VTP_USER}"' in bootstrap
     assert 'cp /opt/seasonalweather/app/systemd/seasonalweather-voicetext-xvfb.service /etc/systemd/system/seasonalweather-voicetext-xvfb.service' in bootstrap
     assert 'systemctl enable --now seasonalweather-voicetext-xvfb.service' in bootstrap
     assert 'VTP_SYSTEMD_DROPIN="${VTP_SYSTEMD_DROPIN_DIR}/10-voicetext-paul.conf"' in bootstrap
@@ -58,8 +60,8 @@ def test_bootstrap_smoke_tests_voicetext_paul_before_service_use() -> None:
     assert 'runuser -u seasonalweather -- rm -f "${VTP_BIN_DIR}/output.wav"' in bootstrap
     assert 'VoiceText Paul smoke test synthesized audio, but seasonalweather could not clean up output.wav' in bootstrap
     assert 'Initializing VoiceText Paul Wine prefix' in bootstrap
-    assert 'SEASONAL_VOICETEXT_PAUL_RECREATE_WIN32_PREFIX:-1' in bootstrap
-    assert 'Existing VoiceText Paul Wine prefix is pure win32' in bootstrap
+    assert 'SEASONAL_VOICETEXT_PAUL_RECREATE_NON_WIN32_PREFIX:-1' in bootstrap
+    assert 'Existing VoiceText Paul Wine prefix is ${VTP_PREFIX_ARCH}; recreating it as a 32-bit prefix' in bootstrap
     assert 'wineboot --init' in bootstrap
     assert 'wine_env_exports | runuser -u "${VTP_USER}" -- env' in bootstrap
 
