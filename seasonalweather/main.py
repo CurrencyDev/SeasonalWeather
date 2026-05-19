@@ -78,6 +78,7 @@ from .discord_log import DiscordLogger
 # VTEC policy + SAME event code libraries — Orchestrator defers to these.
 from .alerts.vtec import (
     toneout_policy as _vtec_toneout_policy,
+    same_codes_for_vtec as _vtec_same_codes_for_vtec,
     phen_sig_label as _vtec_phen_sig_label,
     VTEC_FIND_RE as _VTEC_FIND_RE,
     VTEC_PARSE_RE as _VTEC_PARSE_RE,
@@ -4051,18 +4052,21 @@ class Orchestrator:
 
             allowed_wfo = (not self._nwws_allowed_wfos) or (parsed.wfo in self._nwws_allowed_wfos)
             toneout = parsed.product_type in self.cfg.policy.toneout_product_types
+            raw_vtec = self._extract_vtec(parsed.raw_text or "")
+            vtec_lifecycle = (not toneout) and self._vtec_matches_configured_toneout_code(raw_vtec)
 
             first_n = max(0, int(self._nwws_decision_log_first_n))
             every = max(0, int(self._nwws_decision_log_every))
             if (first_n and self._nwws_seen <= first_n) or (every and (self._nwws_seen % every) == 0):
                 log.info(
-                    "NWWS decision: #%d type=%s awips=%s wfo=%s allowed=%s toneout=%s",
+                    "NWWS decision: #%d type=%s awips=%s wfo=%s allowed=%s toneout=%s vtec_lifecycle=%s",
                     self._nwws_seen,
                     parsed.product_type,
                     parsed.awips_id or "",
                     parsed.wfo,
                     allowed_wfo,
                     toneout,
+                    vtec_lifecycle,
                 )
 
             self.last_product_desc = f"{parsed.product_type} ({parsed.awips_id or ''})"
@@ -4088,7 +4092,15 @@ class Orchestrator:
             if not allowed_wfo:
                 continue
 
-            if toneout:
+            if toneout or vtec_lifecycle:
+                if vtec_lifecycle:
+                    log.info(
+                        "NWWS lifecycle carrier: type=%s awips=%s wfo=%s vtec=%s; routing to toneout handler",
+                        parsed.product_type,
+                        parsed.awips_id or "",
+                        parsed.wfo,
+                        ",".join(raw_vtec[:3]),
+                    )
                 await self._handle_toneout(parsed)
 
             # MWS (Marine Weather Statement) — Special Marine Warning lifecycle VTEC carrier.
@@ -4238,6 +4250,22 @@ class Orchestrator:
         return "SPS"
 
 
+    def _vtec_matches_configured_toneout_code(self, vtec: list[str]) -> bool:
+        """True when VTEC maps to a configured toneout event code.
+
+        Lifecycle products such as SVS/FFS/FLS/MWS often carry the VTEC for
+        the underlying warning/watch while their AWIPS product type is only a
+        statement carrier.  This lets CON/EXT/CAN/EXP products follow the same
+        handling path as the original NEW issuance without adding every carrier
+        product to policy.toneout_product_types.
+        """
+        if not vtec:
+            return False
+        allowed_codes = {str(x).strip().upper() for x in self.cfg.policy.toneout_product_types if str(x).strip()}
+        if not allowed_codes:
+            return False
+        return bool(set(_vtec_same_codes_for_vtec(vtec)) & allowed_codes)
+
     def _cap_should_full(self, ev: "CapAlertEvent") -> bool:  # type: ignore[name-defined]
         if not self._cap_full_enabled():
             return False
@@ -4294,9 +4322,9 @@ class Orchestrator:
         if mt not in {"update", "cancel"}:
             return False
         event = (ev.event or "").strip()
-        if event not in self._cap_full_events():
-            return False
         vtec = self._cap_vtec_list(ev)
+        if event not in self._cap_full_events() and not self._vtec_matches_configured_toneout_code(vtec):
+            return False
         tracks = self._vtec_tracks(vtec)
         update_actions = {"CON", "EXT", "CAN", "EXP"}
         vtec_actions = {act for (_t, act) in tracks} if tracks else set()
@@ -4455,9 +4483,11 @@ class Orchestrator:
 
         keys: list[str] = []
 
-        # Track-level dedupe (prevents CAP vs NWWS double-air)
-        for track_id, _act in tracks:
-            keys.append(f"TRACKFULL:{track_id}")
+        # Track/action-level dedupe prevents CAP vs NWWS double-air for the
+        # same lifecycle action while allowing later EXA/EXB updates on the
+        # same VTEC track to air when policy says they are FULL-worthy.
+        for track_id, act in tracks:
+            keys.append(f"TRACKFULL:{track_id}:{act or 'UNK'}")
 
         # Also keep raw VTEC strings (fine-grain)
         for v in vtec:
@@ -4778,8 +4808,8 @@ class Orchestrator:
 
         key_str = f"CAPUPDATE:{(ev.alert_id or '').strip()}:{(ev.sent or '').strip()}"
         keys = [key_str]
-        for track_id, _ in tracks:
-            keys.append(f"TRACKVOICE:{track_id}")
+        for track_id, act in tracks:
+            keys.append(f"TRACKVOICE:{track_id}:{act or 'UNK'}")
 
         ok, hit = await self._dedupe_reserve(keys)
         if not ok:
@@ -6084,9 +6114,11 @@ class Orchestrator:
             should_full = False
         keys: list[str] = []
 
-        # Track-level dedupe prevents CAP+NWWS double-air.
-        for track_id, _act in tracks:
-            keys.append(f"{'TRACKFULL' if should_full else 'TRACKVOICE'}:{track_id}")
+        # Track/action-level dedupe prevents CAP+NWWS double-air for the same
+        # lifecycle action while still allowing later CON -> EXP/CAN updates for
+        # the same VTEC track.
+        for track_id, act in tracks:
+            keys.append(f"{'TRACKFULL' if should_full else 'TRACKVOICE'}:{track_id}:{act or 'UNK'}")
 
         # Keep VTEC strings too (helps when track parse fails on weird edge cases)
         for v in vtec:

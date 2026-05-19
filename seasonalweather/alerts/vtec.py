@@ -586,6 +586,28 @@ def toneout_policy(vtec_strings: list[str]) -> ToneoutPolicy:
     )
 
 
+
+def same_codes_for_vtec(vtec_strings: list[str]) -> list[str]:
+    """
+    Return SAME/EAS event codes represented by parseable VTEC strings.
+
+    Unlike toneout_policy().same_code, this intentionally returns codes for
+    voice-only lifecycle actions too.  Example: /O.CON.KLWX.SV.W.0050.../
+    returns SVR even though CON itself is not a FULL/SAME action.  Callers use
+    this to recognize SVS/FFS/FLS/MWS lifecycle carrier products whose AWIPS
+    product type is not the underlying event code.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for v in parse_vtec_list(vtec_strings):
+        code = v.same_code
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        out.append(code)
+    return out
+
+
 def lookup_same_code(phen: str, sig: str) -> str | None:
     """
     Direct phen+sig lookup for callers that already have parsed fields.
