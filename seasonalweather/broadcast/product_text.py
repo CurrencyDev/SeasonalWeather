@@ -19,6 +19,7 @@ Design rules:
 """
 from __future__ import annotations
 
+import datetime as dt
 import re
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -741,6 +742,328 @@ def build_nwws_partial_cancel_script(
     return "\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
 
 
+# ---------------------------------------------------------------------------
+# NWWS WCN watch script helpers
+# ---------------------------------------------------------------------------
+_WATCH_VTEC_RE = re.compile(
+    r"/O\.(?P<action>[A-Z]{3})\.(?P<office>[A-Z]{4})\."
+    r"(?P<phen>[A-Z]{2})\.(?P<sig>[A-Z])\."
+    r"(?P<etn>\d{4})\."
+    r"(?P<start>\d{6,8}T\d{4}Z)-(?P<end>\d{6,8}T\d{4}Z)/"
+)
+
+_STATE_ABBR_BY_FULL = {v.upper(): k for k, v in STATE_NAME_FULL.items()}
+_STATE_ABBR_BY_FULL["DISTRICT OF COLUMBIA"] = "DC"
+_STATE_ABBR_BY_FULL["THE DISTRICT OF COLUMBIA"] = "DC"
+
+_WCN_AREA_STOP_RE = re.compile(
+    r"^(?:THIS INCLUDES THE CITIES|PRECAUTIONARY/PREPAREDNESS|&&|\$\$|LAT\.\.\.LON|TIME\.\.\.MOT\.\.\.LOC|NNNN\b)",
+    re.IGNORECASE,
+)
+_WCN_STATE_COUNT_RE = re.compile(
+    r"^IN (?P<state>[A-Z ]+?) THIS WATCH INCLUDES \d+ (?P<kind>COUNTY|COUNTIES|CITY|CITIES|INDEPENDENT CITIES)\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_watch_vtec(vtec: list[str] | None) -> dict[str, Any] | None:
+    for raw in vtec or []:
+        m = _WATCH_VTEC_RE.search(str(raw).strip().upper())
+        if not m:
+            continue
+        sig = m.group("sig")
+        phen = m.group("phen")
+        if sig != "A" or phen not in {"TO", "SV"}:
+            continue
+        try:
+            watch_number = int(m.group("etn"))
+        except Exception:
+            watch_number = None
+        return {
+            "kind": "tornado" if phen == "TO" else "severe",
+            "action": m.group("action"),
+            "watch_number": watch_number,
+            "end_utc": _parse_vtec_time_utc(m.group("end")),
+        }
+    return None
+
+
+def _parse_vtec_time_utc(token: str) -> dt.datetime | None:
+    s = (token or "").strip().upper()
+    m = re.fullmatch(r"(\d{6}|\d{8})T(\d{4})Z", s)
+    if not m:
+        return None
+    d, hm = m.group(1), m.group(2)
+    try:
+        if len(d) == 8:
+            year, month, day = int(d[:4]), int(d[4:6]), int(d[6:8])
+        else:
+            year, month, day = 2000 + int(d[:2]), int(d[2:4]), int(d[4:6])
+        return dt.datetime(year, month, day, int(hm[:2]), int(hm[2:]), tzinfo=dt.timezone.utc)
+    except Exception:
+        return None
+
+
+def _watch_time_phrase(end_utc: dt.datetime | None, *, local_tz: dt.tzinfo | None, now: dt.datetime | None = None) -> str:
+    if end_utc is None:
+        return ""
+    tz = local_tz or dt.timezone.utc
+    end_local = end_utc.astimezone(tz)
+    ref = now.astimezone(tz) if now is not None else dt.datetime.now(tz=tz)
+
+    hour12 = end_local.hour % 12 or 12
+    ampm = "AM" if end_local.hour < 12 else "PM"
+    t = f"{hour12} {ampm}" if end_local.minute == 0 else f"{hour12}:{end_local.minute:02d} {ampm}"
+
+    if end_local.hour < 12:
+        part = "morning"
+    elif end_local.hour < 17:
+        part = "afternoon"
+    elif end_local.hour < 21:
+        part = "evening"
+    else:
+        part = "tonight"
+
+    if end_local.date() == ref.date():
+        return f"{t} tonight" if part == "tonight" else f"{t} this {part}"
+    if (end_local.date() - ref.date()).days == 1:
+        return f"{t} tomorrow night" if part == "tonight" else f"{t} tomorrow {part}"
+    return f"{t} on {end_local.strftime('%A')}"
+
+
+def _clean_wcn_area_name(s: str) -> str:
+    out = re.sub(r"\s+", " ", (s or "").strip(" .;,-\t"))
+    if not out:
+        return ""
+    # WCN county lists are normally all-caps; title-case for speech while keeping
+    # common locality words readable.
+    out = out.title()
+    fixes = {
+        " Of ": " of ",
+        " And ": " and ",
+        " The ": " the ",
+        "Dc": "DC",
+    }
+    for a, b in fixes.items():
+        out = out.replace(a, b)
+    return out
+
+
+def _looks_like_wcn_area_name(line: str) -> bool:
+    s = (line or "").strip()
+    if not s:
+        return False
+    if not re.fullmatch(r"[A-Z][A-Z .'-]*(?:\s+[A-Z][A-Z .'-]*)*", s):
+        return False
+    bad_prefixes = (
+        "WATCH COUNTY NOTIFICATION",
+        "NATIONAL WEATHER SERVICE",
+        "SEVERE THUNDERSTORM WATCH",
+        "TORNADO WATCH",
+        "THE NATIONAL WEATHER SERVICE",
+        "EFFECTIVE",
+        "FOR THE FOLLOWING",
+        "AREAS",
+        "IN EFFECT",
+    )
+    return not any(s.startswith(p) for p in bad_prefixes)
+
+
+def _split_wcn_area_line(line: str) -> list[str]:
+    s = (line or "").strip()
+    if not s:
+        return []
+    # NOAA text columns usually separate names by repeated spaces. If spacing was
+    # flattened by a paste/repost, keep the line as one item rather than guessing
+    # county boundaries incorrectly.
+    parts = [p for p in re.split(r"\s{2,}", s) if p.strip()]
+    if not parts:
+        parts = [s]
+    return [_clean_wcn_area_name(p) for p in parts if _clean_wcn_area_name(p)]
+
+
+def _extract_wcn_area_desc(text: str) -> str:
+    """
+    Best-effort conversion of a WCN county block into CAP-like areaDesc.
+
+    WCN products list areas under state/region headings instead of CAP's clean
+    "County, ST; County, ST" format. This helper extracts enough structure for
+    the watch script to avoid reading the entire raw WCN blob when CAP has not
+    arrived yet.
+    """
+    lines = [re.sub(r"\s+", " ", (ln or "").strip()) for ln in (text or "").splitlines()]
+    if not lines:
+        return ""
+
+    start = None
+    for i, line in enumerate(lines):
+        if line.upper() == "AREAS" and "FOR THE FOLLOWING" in " ".join(x.upper() for x in lines[max(0, i - 3): i + 1]):
+            start = i + 1
+            break
+    if start is None:
+        for i, line in enumerate(lines):
+            if "FOR THE FOLLOWING AREAS" in line.upper():
+                start = i + 1
+                break
+    if start is None:
+        return ""
+
+    groups: dict[str, list[str]] = {}
+    order: list[str] = []
+    misc: list[str] = []
+    current_state: str | None = None
+
+    def add_group(st: str, name: str) -> None:
+        name2 = _clean_wcn_area_name(name)
+        if not name2:
+            return
+        if st not in groups:
+            groups[st] = []
+            order.append(st)
+        if name2 not in groups[st]:
+            groups[st].append(name2)
+
+    for line in lines[start:]:
+        s = (line or "").strip()
+        if not s:
+            continue
+        if _WCN_AREA_STOP_RE.match(s):
+            break
+        su = s.upper()
+        if su in {"THE DISTRICT OF COLUMBIA", "DISTRICT OF COLUMBIA"}:
+            misc.append("the District of Columbia")
+            current_state = None
+            continue
+        m_state = _WCN_STATE_COUNT_RE.match(su)
+        if m_state:
+            st_name = re.sub(r"\s+", " ", m_state.group("state").strip())
+            current_state = _STATE_ABBR_BY_FULL.get(st_name)
+            continue
+        if su.startswith("IN "):
+            # Regional heading, e.g. "IN CENTRAL MARYLAND".
+            continue
+        if not current_state:
+            continue
+        if not _looks_like_wcn_area_name(su):
+            continue
+        for part in _split_wcn_area_line(su):
+            add_group(current_state, part)
+
+    parts: list[str] = []
+    parts.extend(misc)
+    for st in order:
+        parts.extend(f"{name}, {st}" for name in groups.get(st, []))
+    return "; ".join(p for p in parts if p).strip()
+
+
+def _watch_area_sentence(area_desc: str) -> str:
+    groups, order, misc = parse_cap_area_by_state(area_desc or "")
+    lines: list[str] = []
+
+    if misc:
+        lines.append("This watch includes " + join_oxford(misc) + ".")
+
+    if groups:
+        if len(order) == 1:
+            st = order[0]
+            st_full = STATE_NAME_FULL.get(st, st)
+            county_list = join_oxford(groups.get(st, []))
+            if county_list:
+                lines.append(f"This watch includes the following counties, in {st_full}: {county_list}.")
+        else:
+            segs: list[str] = []
+            for st in order:
+                st_full = STATE_NAME_FULL.get(st, st)
+                county_list = join_oxford(groups.get(st, []))
+                if county_list:
+                    segs.append(f"in {st_full}: {county_list}")
+            if segs:
+                lines.append("This watch includes the following counties: " + "; ".join(segs) + ".")
+    elif area_desc:
+        lines.append(f"This watch includes the following areas: {area_desc.strip(' .')}.")
+
+    return "\n".join(lines).strip()
+
+
+def build_nwws_watch_vtec_script(
+    official_text: str,
+    vtec: list[str] | None,
+    *,
+    local_tz: dt.tzinfo | None = None,
+    area_text: str = "",
+    now: dt.datetime | None = None,
+) -> str:
+    """
+    Build NWR-style narration for NWWS WCN products carrying TO.A/SV.A VTEC.
+
+    This is the NWWS-side equivalent of the CAP watch formatter. It prevents
+    watch county notifications from being spoken as raw all-caps product text.
+    """
+    parsed = _parse_watch_vtec(vtec)
+    if not parsed:
+        return ""
+
+    kind = parsed["kind"]
+    action = str(parsed.get("action") or "").upper()
+    watch_number = parsed.get("watch_number")
+    until = _watch_time_phrase(parsed.get("end_utc"), local_tz=local_tz, now=now)
+    area_desc = (area_text or "").strip() or _extract_wcn_area_desc(official_text)
+    area_sentence = _watch_area_sentence(area_desc)
+
+    if kind == "tornado":
+        watch_label = "Tornado Watch"
+        remember = (
+            "Remember, a tornado watch means that conditions are favorable for the development of severe weather, "
+            "including tornadoes, large hail, and damaging winds, in and close to the watch area. "
+            "While severe weather may not be imminent, persons should remain alert for rapidly changing weather conditions, "
+            "and listen for later statements and possible warnings."
+        )
+    else:
+        watch_label = "Severe Thunderstorm Watch"
+        remember = (
+            "Remember, a severe thunderstorm watch means that conditions are favorable for the development of severe weather, "
+            "including large hail and damaging winds, in and close to the watch area. "
+            "While severe weather may not be imminent, persons should remain alert for rapidly changing weather conditions, "
+            "and listen for later statements and possible warnings."
+        )
+
+    label_with_num = f"{watch_label} Number {watch_number}" if watch_number is not None else watch_label
+    until_part = f" until {until}" if until else ""
+
+    lines: list[str] = []
+    if action in {"CAN"}:
+        lines.append(f"{label_with_num} has been cancelled for the following areas.")
+        if area_sentence:
+            lines.append(area_sentence)
+    elif action in {"EXP"}:
+        lines.append(f"{label_with_num} has been allowed to expire for the following areas.")
+        if area_sentence:
+            lines.append(area_sentence)
+    elif action in {"CON", "EXT"}:
+        lines.append(f"{label_with_num} remains in effect{until_part}.")
+        if area_sentence:
+            lines.append(area_sentence)
+    elif action in {"EXA", "EXB"}:
+        lines.append(f"{label_with_num} remains in effect{until_part}.")
+        lines.append("This watch now includes additional areas.")
+        if area_sentence:
+            lines.append(area_sentence)
+    else:
+        lines.append(f"The National Weather Service has issued {label_with_num}.")
+        if until:
+            lines.append(f"Effective until {until}.")
+        if area_sentence:
+            lines.append(area_sentence)
+        lines.append(remember)
+
+    lines.append(
+        "Stay tuned to NOAA Weather Radio, commercial radio, and television outlets, "
+        "or internet sources for the latest severe weather information."
+    )
+    lines.append("End of message.")
+    return "\n\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
+
+
 __all__ = [
     # Constants
     "STATE_NAME_FULL",
@@ -767,4 +1090,5 @@ __all__ = [
     "NwwsProductSegment",
     "parse_nwws_product_segments",
     "build_nwws_partial_cancel_script",
+    "build_nwws_watch_vtec_script",
 ]

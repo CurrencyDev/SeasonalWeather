@@ -65,6 +65,7 @@ from .broadcast.product_text import (
     build_statement_vtec_action_script as _build_statement_vtec_action_script_fn,
     build_warning_vtec_action_script as _build_warning_vtec_action_script_fn,
     build_nwws_partial_cancel_script as _build_nwws_partial_cancel_script,
+    build_nwws_watch_vtec_script as _build_nwws_watch_vtec_script,
     parse_nwws_product_segments as _parse_nwws_product_segments,
 )
 
@@ -296,6 +297,21 @@ def _sf_write(now_ts: float) -> None:
     _STATION_FEED_LAST_WRITE_TS = now_ts
 
 
+def _sf_try_write(now_ts: float, *, context: str) -> None:
+    try:
+        _sf_write(now_ts)
+    except PermissionError as exc:
+        _station_id, path, _source, _max_items, _ttl_s, _min_write_s = _sf_cfg()
+        log.warning(
+            "Station feed: legacy handled-alerts JSON mirror not writable during %s (path=%s); SQLite read model remains authoritative: %s",
+            context,
+            path,
+            exc,
+        )
+    except Exception:
+        log.exception("Station feed: failed to write legacy handled-alerts JSON mirror during %s", context)
+
+
 def _sf_emit(alert, *, expires_at=None) -> None:
     if not _sf_enabled():
         return
@@ -307,7 +323,7 @@ def _sf_emit(alert, *, expires_at=None) -> None:
         exp_ts = exp_dt.timestamp() if exp_dt else (now_ts + ttl_s)
         _STATION_FEED_STATE[alert.id] = (alert, exp_ts)
         _sf_repo_upsert(alert, expires_at=exp_dt or expires_at or dt.datetime.fromtimestamp(exp_ts, tz=dt.timezone.utc))
-        _sf_write(now_ts)
+        _sf_try_write(now_ts, context="update")
     except Exception:
         log.exception("Station feed: failed to update handled-alerts feed")
 
@@ -329,7 +345,7 @@ def _sf_remove_ids(ids) -> int:
         if requested_ids:
             _sf_repo_delete(requested_ids)
         if removed:
-            _sf_write(now_ts)
+            _sf_try_write(now_ts, context="remove")
     except Exception:
         log.exception("Station feed: failed removing ids=%s", ids)
     return removed
@@ -3839,7 +3855,7 @@ class Orchestrator:
             _sf_restored_file = _sf_seed_memory_from_payload_file()
             _sf_restored_tracker = self._station_feed_seed_from_alert_tracker()
             if (_sf_restored_file or _sf_restored_tracker) and _sf_enabled():
-                _sf_write(time.time())
+                _sf_try_write(time.time(), context="startup restore")
                 log.info(
                     "Station feed: restored %d alerts from handled-alerts.json and %d from AlertTracker on startup",
                     _sf_restored_file, _sf_restored_tracker,
@@ -6168,6 +6184,25 @@ class Orchestrator:
                 issuer=_sf_nwws_extract_issuer(official_text, fallback_wfo=parsed.wfo),
             )
 
+            try:
+                watch_script = _build_nwws_watch_vtec_script(
+                    official_text,
+                    vtec,
+                    local_tz=self._tz,
+                    area_text=sf_area_text,
+                )
+                if watch_script:
+                    spoken.script = watch_script
+                    log.info(
+                        "NWWS watch script normalized (type=%s awips=%s wfo=%s vtec=%s)",
+                        parsed.product_type,
+                        parsed.awips_id or "",
+                        parsed.wfo,
+                        ",".join(vtec[:2]) if vtec else "",
+                    )
+            except Exception:
+                log.exception("NWWS watch script normalization failed; continuing with original script")
+
             # --- Less-urgent polish / todos ---
             # SPS preamble: NWR-ish intro, avoid duplicated boilerplate.
             try:
@@ -6255,7 +6290,16 @@ class Orchestrator:
                         parsed.product_type,
                         parsed.wfo,
                     )
-                out_wav = await self._render_alert_audio(parsed, spoken.script, same_locations=same_for_render)
+                render_parsed = parsed
+                if _nw_policy.same_code and _nw_policy.same_code != (parsed.product_type or "").strip().upper():
+                    render_parsed = ParsedProduct(
+                        product_type=_nw_policy.same_code,
+                        wfo=parsed.wfo,
+                        awips_id=parsed.awips_id,
+                        vtec=parsed.vtec,
+                        raw_text=parsed.raw_text,
+                    )
+                out_wav = await self._render_alert_audio(render_parsed, spoken.script, same_locations=same_for_render)
             else:
                 # Voice-only always has no SAME headers by design.
                 out_wav = await self._render_voice_only_audio(spoken.script, prefix="nwwsvoice")
