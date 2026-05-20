@@ -6128,6 +6128,26 @@ class Orchestrator:
                 ",".join(zones[:12]) + ("..." if len(zones) > 12 else ""),
             )
             should_full = False
+
+        # WCN watch county notifications can legitimately have clean watch text
+        # and VTEC, but no UGC block in the NWWS carrier.  When that happens we
+        # cannot build SAME headers from NWWS alone.  Do not air a SAME-less FULL
+        # and reserve TRACKFULL, because the follow-up CAP alert usually carries
+        # explicit SAME/FIPS codes and must remain eligible to tone out.
+        _nw_is_wcn_watch_carrier = (
+            (parsed.product_type or "").strip().upper() == "WCN"
+            and should_full
+            and (_nw_policy.same_code or "").strip().upper() in {"SVA", "TOA"}
+        )
+        if _nw_is_wcn_watch_carrier and not in_area_same:
+            log.warning(
+                "NWWS WCN watch has no SAME targets; forcing voice-only to preserve CAP full-tone path type=%s wfo=%s vtec=%s",
+                parsed.product_type,
+                parsed.wfo,
+                ",".join(vtec[:2]) if vtec else "",
+            )
+            should_full = False
+
         keys: list[str] = []
 
         # Track/action-level dedupe prevents CAP+NWWS double-air for the same
