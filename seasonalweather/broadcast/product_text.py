@@ -462,6 +462,10 @@ _SEG_META_RE = re.compile(
 )
 _SEG_PPA_RE = re.compile(r"^PRECAUTIONARY/PREPAREDNESS ACTIONS", re.IGNORECASE)
 _SEG_LOC_RE = re.compile(r"^Locations?\s+(?:impacted|affected)\s+include", re.IGNORECASE)
+_SEG_ACTION_LABEL_RE = re.compile(r"^(?:CANCELLED|CONTINUED|EXPIRED)\.?$", re.IGNORECASE)
+_SEG_SCOPE_HEADER_RE = re.compile(
+    r"^FOR\s+[A-Z0-9 ,/\-]+(?:COUNTY|COUNTIES|PARISH|PARISHES|CITY|CITIES|BOROUGH|BOROUGHS)\.?\.?.*$"
+)
 _SEG_UGC_RE = re.compile(
     r"^(?:[A-Z]{2}[CZ]\d{3}|\d{3})(?:-(?:[A-Z]{2}[CZ]\d{3}|\d{3}))*-\d{6}-?$",
     re.IGNORECASE,
@@ -645,6 +649,8 @@ def parse_nwws_product_segments(product_text: str) -> list[NwwsProductSegment]:
                 continue
             if _SEG_UGC_RE.match(s) or _SEG_TIMESTAMP_RE.match(s):
                 continue
+            if _SEG_ACTION_LABEL_RE.match(s) or _SEG_SCOPE_HEADER_RE.match(s):
+                continue
             if s.startswith("/") and s.endswith("/") and "." in s:
                 continue
             if _SEG_HEADLINE_RE.match(s) or _SEG_META_RE.match(s):
@@ -667,14 +673,24 @@ def parse_nwws_product_segments(product_text: str) -> list[NwwsProductSegment]:
                 in_area_skip = False
             tag_m = re.match(r"^([A-Z]+)\.\.\.(.*?)\.?$", s)
             if tag_m and tag_m.group(1) in {"HAZARD", "SOURCE", "IMPACT"}:
-                body_parts.append(
-                    f"{tag_m.group(1).capitalize()}: {tag_m.group(2).strip().rstrip('.')}"
-                )
+                tag_text = tag_m.group(2).strip().rstrip(".")
+                if tag_text:
+                    body_parts.append(f"{tag_m.group(1).capitalize()}: {tag_text}.")
+                else:
+                    body_parts.append(f"{tag_m.group(1).capitalize()}.")
+                continue
+            if (
+                not in_precautions
+                and body_parts
+                and body_parts[-1].startswith(("Hazard:", "Source:", "Impact:"))
+                and ln[:1].isspace()
+            ):
+                body_parts[-1] = f"{body_parts[-1].rstrip('.')} {s.rstrip('.')}."
                 continue
             if in_precautions:
-                precaution_parts.append(s.rstrip("."))
+                precaution_parts.append(s)
             else:
-                body_parts.append(s.rstrip("."))
+                body_parts.append(s)
 
         segments.append(NwwsProductSegment(
             actions=actions,

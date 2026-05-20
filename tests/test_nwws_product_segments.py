@@ -118,3 +118,81 @@ def test_partial_can_con_script_says_cancelled_and_remains_in_effect():
     assert "remains in effect until 700 PM EDT" in script
     assert "Frederick VA; Clarke VA; City of Winchester VA; Jefferson WV; Berkeley WV" in script
     assert script.endswith("End of message.")
+
+KCTP_PARTIAL_CAN_CON_SVS = """930
+WWUS51 KCTP 201726
+SVSCTP
+
+Severe Weather Statement
+National Weather Service State College PA
+126 PM EDT Wed May 20 2026
+
+PAC057-201745-
+/O.CAN.KCTP.SV.W.0064.000000T0000Z-260520T1745Z/
+Fulton PA-
+126 PM EDT Wed May 20 2026
+
+...THE SEVERE THUNDERSTORM WARNING FOR FULTON COUNTY IS CANCELLED...
+
+CANCELLED
+
+The severe thunderstorm which prompted the warning has moved out of
+The warned area. Therefore, the warning has been cancelled.
+A Severe Thunderstorm Watch remains in effect until 800 PM EDT for
+south central Pennsylvania.
+
+&&
+
+LAT...LON 3990 7800
+TIME...MOT...LOC 1725Z 260DEG 22KT 3980 7800
+
+$$
+
+PAC055-201745-
+/O.CON.KCTP.SV.W.0064.000000T0000Z-260520T1745Z/
+Franklin PA-
+126 PM EDT Wed May 20 2026
+
+...A SEVERE THUNDERSTORM WARNING REMAINS IN EFFECT UNTIL 145 PM EDT
+FOR SOUTHWESTERN FRANKLIN COUNTY...
+
+FOR SOUTHWESTERN FRANKLIN COUNTY...
+
+At 125 PM EDT, a severe thunderstorm was located over Claylick,
+moving east at 25 mph.
+
+HAZARD...60 mph wind gusts and quarter size hail.
+
+SOURCE...Radar indicated.
+
+IMPACT...Hail damage to vehicles is expected. Expect wind damage to
+         roofs, siding, and trees.
+
+Locations impacted include...
+St. Thomas, Mercersburg, Claylick, Williamson, Upton, and Whitetail
+Ski Area.
+
+PRECAUTIONARY/PREPAREDNESS ACTIONS...
+
+Stay inside a well built structure and keep away from windows.
+
+&&
+
+LAT...LON 3990 7800
+TIME...MOT...LOC 1725Z 260DEG 22KT 3980 7800
+
+$$
+"""
+
+
+def test_partial_can_con_svs_preserves_sentence_boundaries_and_skips_labels():
+    segments = parse_nwws_product_segments(KCTP_PARTIAL_CAN_CON_SVS)
+    script = build_nwws_partial_cancel_script("Severe Thunderstorm Warning", segments)
+
+    assert "CANCELLED The severe thunderstorm" not in script
+    assert "warning has been cancelled. A Severe Thunderstorm Watch" in script
+    assert "COUNTY At 125 PM" not in script
+    assert "moving east at 25 mph. Hazard: 60 mph wind gusts" in script
+    assert "Hazard: 60 mph wind gusts and quarter size hail. Source: Radar indicated. Impact: Hail damage" in script
+    assert "Expect wind damage to roofs, siding, and trees." in script
+    assert "Stay inside a well built structure and keep away from windows." in script
