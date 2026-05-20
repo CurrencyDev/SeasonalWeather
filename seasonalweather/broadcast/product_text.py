@@ -249,6 +249,33 @@ def cap_full_opening_line(
 # Expiry / cancellation helpers
 # ---------------------------------------------------------------------------
 
+_EXPIRY_SUMMARY_TZ_RE = re.compile(
+    r"\b(EDT|EST|CDT|CST|MDT|MST|PDT|PST|AKDT|AKST|HST)\b",
+    re.IGNORECASE,
+)
+_EXPIRY_SUMMARY_AMPM_RE = re.compile(r"\b(AM|PM)\b", re.IGNORECASE)
+
+
+def _normalize_expiry_summary_line(line: str) -> str:
+    """Make NWS all-caps expiry headlines safe for TTS narration."""
+    s = str(line or "").strip()
+    if not s:
+        return ""
+
+    # SVS expiry headlines often arrive as all caps.  VoiceText Paul can spell
+    # short words such as "AT" as separate letters, so sentence-case the
+    # summary before the common TTS pipeline sees it.  Restore clock/time-zone
+    # abbreviations that should remain uppercase.
+    if s.upper() == s:
+        s = s.capitalize()
+        s = _EXPIRY_SUMMARY_AMPM_RE.sub(lambda m: m.group(1).upper(), s)
+        s = _EXPIRY_SUMMARY_TZ_RE.sub(lambda m: m.group(1).upper(), s)
+
+    if s and not s.endswith((".", "!", "?")):
+        s += "."
+    return s
+
+
 def cap_expiry_summary_line(text: str) -> str:
     """
     Extract a single-sentence expiry summary from product or headline text.
@@ -266,10 +293,7 @@ def cap_expiry_summary_line(text: str) -> str:
     )
     if not m:
         return ""
-    line = m.group(1).strip()
-    if line and not line.endswith((".", "!", "?")):
-        line += "."
-    return line
+    return _normalize_expiry_summary_line(m.group(1))
 
 
 def cap_prefers_statement_update_script(event: str, vtec_actions: set[str]) -> bool:

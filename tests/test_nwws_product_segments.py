@@ -1,8 +1,10 @@
 from seasonalweather.alerts.vtec import VTEC_FIND_RE, toneout_policy
 from seasonalweather.broadcast.product_text import (
     build_nwws_partial_cancel_script,
+    expiry_summary_script,
     parse_nwws_product_segments,
 )
+from seasonalweather.tts.tts import clean_for_tts
 
 
 PARTIAL_CAN_CON_SVS = """403
@@ -196,3 +198,50 @@ def test_partial_can_con_svs_preserves_sentence_boundaries_and_skips_labels():
     assert "Hazard: 60 mph wind gusts and quarter size hail. Source: Radar indicated. Impact: Hail damage" in script
     assert "Expect wind damage to roofs, siding, and trees." in script
     assert "Stay inside a well built structure and keep away from windows." in script
+
+
+EXP_SVS = """246
+WWUS51 KLWX 201855
+SVSLWX
+
+Severe Weather Statement
+National Weather Service Baltimore MD/Washington DC
+255 PM EDT Wed May 20 2026
+
+VAC069-WVC027-201904-
+/O.EXP.KLWX.SV.W.0053.000000T0000Z-260520T1900Z/
+Frederick VA-Hampshire WV-
+255 PM EDT Wed May 20 2026
+
+...THE SEVERE THUNDERSTORM WARNING FOR WEST CENTRAL FREDERICK COUNTY
+IN NORTHWESTERN VIRGINIA AND SOUTHEASTERN HAMPSHIRE COUNTIES IN
+EASTERN WEST VIRGINIA WILL EXPIRE AT 300 PM EDT...
+
+The storm which prompted the warning has weakened below severe
+limits, and no longer poses an immediate threat to life or property.
+Therefore, the warning will be allowed to expire.
+
+A Severe Thunderstorm Watch remains in effect until 800 PM EDT for
+northwestern Virginia...and eastern West Virginia.
+
+&&
+
+LAT...LON 3917 7858 3923 7860 3935 7838 3917 7832
+TIME...MOT...LOC 1854Z 253DEG 18KT 3924 7842
+
+$$
+
+Belak
+"""
+
+
+def test_expiry_summary_script_sentence_cases_all_caps_svs_headline_for_tts():
+    script = expiry_summary_script(EXP_SVS)
+
+    assert script is not None
+    assert "WILL EXPIRE AT" not in script
+    assert "will expire at 300 PM EDT." in script
+
+    spoken = clean_for_tts(script)
+    assert "will expire at 3:00 PM EDT." in spoken
+    assert " AT " not in spoken
