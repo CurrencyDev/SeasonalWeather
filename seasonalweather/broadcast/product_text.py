@@ -486,7 +486,7 @@ _SEG_META_RE = re.compile(
 )
 _SEG_PPA_RE = re.compile(r"^PRECAUTIONARY/PREPAREDNESS ACTIONS", re.IGNORECASE)
 _SEG_LOC_RE = re.compile(r"^Locations?\s+(?:impacted|affected)\s+include", re.IGNORECASE)
-_SEG_ACTION_LABEL_RE = re.compile(r"^(?:CANCELLED|CONTINUED|EXPIRED)\.?$", re.IGNORECASE)
+_SEG_ACTION_LABEL_RE = re.compile(r"^(?:CANCELLED|CONTINUED|EXPIRED)(?:\.{1,3})?$", re.IGNORECASE)
 _SEG_SCOPE_HEADER_RE = re.compile(
     r"^FOR\s+[A-Z0-9 ,/\-]+(?:COUNTY|COUNTIES|PARISH|PARISHES|CITY|CITIES|BOROUGH|BOROUGHS)\.?\.?.*$"
 )
@@ -660,7 +660,7 @@ def parse_nwws_product_segments(product_text: str) -> list[NwwsProductSegment]:
         precaution_parts: list[str] = []
         in_precautions = False
         in_area_skip = False
-        in_locations_skip = False
+        in_locations_block = False
 
         start = headline_end_idx + 1 if headline_end_idx >= 0 else 0
         for ln in lines[start:]:
@@ -669,7 +669,7 @@ def parse_nwws_product_segments(product_text: str) -> list[NwwsProductSegment]:
                 break
             if not s:
                 in_area_skip = False
-                in_locations_skip = False
+                in_locations_block = False
                 continue
             if _SEG_UGC_RE.match(s) or _SEG_TIMESTAMP_RE.match(s):
                 continue
@@ -681,15 +681,17 @@ def parse_nwws_product_segments(product_text: str) -> list[NwwsProductSegment]:
                 continue
             if _SEG_PPA_RE.match(s):
                 in_precautions = True
-                in_locations_skip = False
+                in_locations_block = False
                 continue
             if _SEG_AREA_INTRO_RE.match(s):
                 in_area_skip = True
                 continue
             if _SEG_LOC_RE.match(s):
-                in_locations_skip = True
+                body_parts.append("Locations impacted include.")
+                in_locations_block = True
                 continue
-            if in_locations_skip:
+            if in_locations_block:
+                body_parts.append(s)
                 continue
             if in_area_skip:
                 if s.endswith("...") or re.match(r"^[A-Z][a-z]+,", s):
@@ -752,25 +754,37 @@ def build_nwws_partial_cancel_script(
     exp_segs = [s for s in segments if "EXP" in s.actions]
     con_segs = [s for s in segments if "CON" in s.actions or "EXT" in s.actions]
 
+    def _headline_or_fallback(seg: NwwsProductSegment, fallback: str) -> str:
+        headline = (seg.headline or "").strip()
+        if headline:
+            return headline if headline.endswith((".", "!", "?")) else headline + "."
+        return fallback
+
     for seg in can_segs:
         area = seg.area_text or "some areas"
-        lines.append(f"The {event} has been cancelled for the following areas: {area}.")
+        lines.append(_headline_or_fallback(
+            seg,
+            f"The {event} has been cancelled for the following areas: {area}.",
+        ))
         if seg.reason_text:
             lines.append(f"{seg.reason_text.rstrip('.')}.")
 
     for seg in exp_segs:
         area = seg.area_text or "some areas"
-        lines.append(f"The {event} has been allowed to expire for the following areas: {area}.")
+        lines.append(_headline_or_fallback(
+            seg,
+            f"The {event} has been allowed to expire for the following areas: {area}.",
+        ))
         if seg.reason_text:
             lines.append(f"{seg.reason_text.rstrip('.')}.")
 
     for seg in con_segs:
         area = seg.area_text or "other areas"
         exp_part = f" until {seg.expiry_phrase}" if seg.expiry_phrase else ""
-        lines.append(
-            f"The {event} remains in effect{exp_part} "
-            f"for the following areas: {area}."
-        )
+        lines.append(_headline_or_fallback(
+            seg,
+            f"A {event} remains in effect{exp_part} for the following areas: {area}.",
+        ))
         if seg.reason_text:
             lines.append(f"{seg.reason_text.rstrip('.')}.")
         if seg.precautions:

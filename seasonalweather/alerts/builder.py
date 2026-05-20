@@ -174,9 +174,23 @@ def strip_nws_product_headers(raw: str) -> str:
             continue
         break
 
-    # Drop VTEC lines immediately after UGC (often multiple)
+    # Drop VTEC lines immediately after UGC (often multiple).  NWWS
+    # products then usually include human-readable county lines and an
+    # issuance timestamp before the real ...headline... block.  Those county
+    # lines are metadata for targeting, not part of the spoken headline.
+    saw_vtec = False
     while i < len(lines) and is_vtec_line(lines[i]):
+        saw_vtec = True
         i += 1
+
+    if saw_vtec:
+        headline_idx = None
+        for j in range(i, min(len(lines), i + 12)):
+            if lines[j].strip().startswith("..."):
+                headline_idx = j
+                break
+        if headline_idx is not None:
+            i = headline_idx
 
     # Drop a blank line after headers if present
     while i < len(lines) and lines[i].strip() == "":
@@ -243,7 +257,7 @@ def _find_body_start(lines: List[str]) -> int:
     # Prefer the NWS headline marker (often where meaningful narration begins)
     for i, ln in enumerate(lines):
         s = (ln or "").strip()
-        if s.startswith("...") and s.endswith("...") and len(s) >= 12:
+        if s.startswith("...") and len(s) >= 12:
             return i
 
     # Otherwise prefer the normal NWS narrative intro

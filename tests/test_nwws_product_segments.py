@@ -109,16 +109,18 @@ def test_partial_can_con_svs_segments_include_cancel_and_continuation_text():
     assert segments[1].expiry_phrase == "700 PM EDT"
     assert "60 mph wind gusts and quarter size hail" in segments[1].reason_text
     assert "For your protection move to an interior room" in segments[1].precautions
-    assert "Winchester, Martinsburg" not in segments[1].reason_text
+    assert "Locations impacted include. Winchester, Martinsburg" in segments[1].reason_text
 
 
 def test_partial_can_con_script_says_cancelled_and_remains_in_effect():
     segments = parse_nwws_product_segments(PARTIAL_CAN_CON_SVS)
     script = build_nwws_partial_cancel_script("Severe Thunderstorm Warning", segments)
 
-    assert "has been cancelled for the following areas: Morgan WV; Hampshire WV" in script
-    assert "remains in effect until 700 PM EDT" in script
-    assert "Frederick VA; Clarke VA; City of Winchester VA; Jefferson WV; Berkeley WV" in script
+    assert "has been cancelled for the following areas: Morgan WV; Hampshire WV" not in script
+    assert "The severe thunderstorm warning for southeastern morgan and southeastern hampshire counties is cancelled." in script
+    assert "A severe thunderstorm warning remains in effect until 700 PM EDT" in script
+    assert "The Severe Thunderstorm Warning remains in effect" not in script
+    assert "Locations impacted include. Winchester, Martinsburg" in script
     assert script.endswith("End of message.")
 
 KCTP_PARTIAL_CAN_CON_SVS = """930
@@ -305,7 +307,95 @@ def test_spoken_alert_sentence_cases_all_caps_svs_continuation_body_for_tts():
 
     assert "FOR SOUTH CENTRAL" not in spoken.script
     assert "A SEVERE THUNDERSTORM WARNING" not in spoken.script
+    assert "Shenandoah VA-Page VA-" not in spoken.script
     assert "For south central shenandoah" in spoken.script
     assert "Hazard: 60 mph wind gusts." in spoken.script
     assert "Source: Radar indicated." in spoken.script
     assert "Impact: Damaging winds will cause" in spoken.script
+
+
+KLWX_PARTIAL_CAN_CON_SVS = """704
+WWUS51 KLWX 202021
+SVSLWX
+
+Severe Weather Statement
+National Weather Service Baltimore MD/Washington DC
+421 PM EDT Wed May 20 2026
+
+VAC043-202031-
+/O.CAN.KLWX.SV.W.0060.000000T0000Z-260520T2045Z/
+Clarke VA-
+421 PM EDT Wed May 20 2026
+
+...THE SEVERE THUNDERSTORM WARNING FOR SOUTHEASTERN CLARKE COUNTY IS
+CANCELLED...
+
+The severe thunderstorm which prompted the warning has moved out of
+The warned area. Therefore, the warning has been cancelled.
+A Severe Thunderstorm Watch remains in effect until 800 PM EDT for
+northern Virginia.
+
+&&
+
+LAT...LON 3895 7783 3907 7788 3913 7757 3898 7748
+TIME...MOT...LOC 2021Z 255DEG 15KT 3901 7776
+
+$$
+
+VAC061-107-202045-
+/O.CON.KLWX.SV.W.0060.000000T0000Z-260520T2045Z/
+Loudoun VA-Fauquier VA-
+421 PM EDT Wed May 20 2026
+
+...A SEVERE THUNDERSTORM WARNING REMAINS IN EFFECT UNTIL 445 PM EDT
+FOR CENTRAL LOUDOUN AND NORTH CENTRAL FAUQUIER COUNTIES...
+
+At 421 PM EDT, a severe thunderstorm was located over Middleburg, or
+12 miles west of Brambleton, moving east at 20 mph.
+
+HAZARD...60 mph wind gusts.
+
+SOURCE...Radar indicated.
+
+IMPACT...Damaging winds will cause some trees and large branches to
+         fall. This could injure those outdoors, as well as damage
+         homes and vehicles. Roadways may become blocked by downed
+         trees. Localized power outages are possible. Unsecured
+         light objects may become projectiles.
+
+Locations impacted include...
+Leesburg, Broadlands, Brambleton, Ashburn, Middleburg, Oatlands,
+Saint Louis, Gleedsville, Aldie, Philomont, and Hughesville.
+
+PRECAUTIONARY/PREPAREDNESS ACTIONS...
+
+For your protection move to an interior room on the lowest floor of a
+building.
+
+&&
+
+LAT...LON 3895 7783 3907 7788 3913 7757 3898 7748
+TIME...MOT...LOC 2021Z 255DEG 15KT 3901 7776
+
+HAIL THREAT...RADAR INDICATED
+MAX HAIL SIZE...<.75 IN
+WIND THREAT...RADAR INDICATED
+MAX WIND GUST...60 MPH
+
+$$
+
+Belak
+"""
+
+
+def test_partial_can_con_klwx_preserves_nws_headlines_and_locations():
+    segments = parse_nwws_product_segments(KLWX_PARTIAL_CAN_CON_SVS)
+    script = build_nwws_partial_cancel_script("Severe Thunderstorm Warning", segments)
+
+    assert "CANCELLED..." not in script
+    assert "The severe thunderstorm warning for southeastern clarke county is cancelled." in script
+    assert "The Severe Thunderstorm Warning has been cancelled for the following areas" not in script
+    assert "A severe thunderstorm warning remains in effect until 445 PM EDT for central loudoun and north central fauquier counties." in script
+    assert "The Severe Thunderstorm Warning remains in effect until 445 PM EDT for the following areas" not in script
+    assert "Locations impacted include. Leesburg, Broadlands" in script
+    assert "For your protection move to an interior room" in script
