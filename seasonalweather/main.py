@@ -66,6 +66,7 @@ from .broadcast.product_text import (
     build_warning_vtec_action_script as _build_warning_vtec_action_script_fn,
     build_nwws_partial_cancel_script as _build_nwws_partial_cancel_script,
     build_nwws_watch_vtec_script as _build_nwws_watch_vtec_script,
+    build_nwws_watch_partial_cancel_script as _build_nwws_watch_partial_cancel_script,
     extract_nwws_wcn_area_desc as _extract_nwws_wcn_area_desc,
     match_nwws_wcn_area_same as _match_nwws_wcn_area_same,
     parse_nwws_product_segments as _parse_nwws_product_segments,
@@ -6300,24 +6301,48 @@ class Orchestrator:
 
                         if has_continuation:
                             # Partial cancel: some zones cancelled, others active.
-                            segs = _parse_nwws_product_segments(official_text)
-                            partial_script = _build_nwws_partial_cancel_script(sf_event_label, segs)
-                            if partial_script:
-                                spoken.script = partial_script
-                                log.info(
-                                    'NWWS partial cancel script built (act=%s type=%s awips=%s wfo=%s segs=%d)',
-                                    ','.join(sorted(vtec_actions))[:64],
-                                    parsed.product_type,
-                                    parsed.awips_id or '',
-                                    parsed.wfo,
-                                    len(segs),
+                            # WCN watch products do not have SVS/MWS-style headline
+                            # markers, so keep them on the watch-specific formatter.
+                            if (parsed.product_type or "").strip().upper() == "WCN":
+                                watch_partial_script = _build_nwws_watch_partial_cancel_script(
+                                    official_text,
+                                    vtec,
+                                    local_tz=self._tz,
                                 )
+                                if watch_partial_script:
+                                    spoken.script = watch_partial_script
+                                    log.info(
+                                        'NWWS WCN watch partial cancel script built (act=%s type=%s awips=%s wfo=%s)',
+                                        ','.join(sorted(vtec_actions))[:64],
+                                        parsed.product_type,
+                                        parsed.awips_id or '',
+                                        parsed.wfo,
+                                    )
+                                else:
+                                    log.warning(
+                                        'NWWS WCN watch partial cancel: watch parser empty, preserving prior watch script (act=%s type=%s)',
+                                        ','.join(sorted(vtec_actions))[:64],
+                                        parsed.product_type,
+                                    )
                             else:
-                                log.warning(
-                                    'NWWS partial cancel: segment parse empty, using raw script (act=%s type=%s)',
-                                    ','.join(sorted(vtec_actions))[:64],
-                                    parsed.product_type,
-                                )
+                                segs = _parse_nwws_product_segments(official_text)
+                                partial_script = _build_nwws_partial_cancel_script(sf_event_label, segs)
+                                if partial_script:
+                                    spoken.script = partial_script
+                                    log.info(
+                                        'NWWS partial cancel script built (act=%s type=%s awips=%s wfo=%s segs=%d)',
+                                        ','.join(sorted(vtec_actions))[:64],
+                                        parsed.product_type,
+                                        parsed.awips_id or '',
+                                        parsed.wfo,
+                                        len(segs),
+                                    )
+                                else:
+                                    log.warning(
+                                        'NWWS partial cancel: segment parse empty, using raw script (act=%s type=%s)',
+                                        ','.join(sorted(vtec_actions))[:64],
+                                        parsed.product_type,
+                                    )
 
                         elif self._cap_prefers_statement_update_script(sf_event_label, vtec_actions):
                             # Advisory / statement / message — lighter style.

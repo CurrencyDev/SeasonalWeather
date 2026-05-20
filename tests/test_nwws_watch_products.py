@@ -3,6 +3,7 @@ from zoneinfo import ZoneInfo
 
 from seasonalweather.broadcast.product_text import (
     build_nwws_watch_vtec_script,
+    build_nwws_watch_partial_cancel_script,
     extract_nwws_wcn_area_desc,
     match_nwws_wcn_area_same,
 )
@@ -143,3 +144,103 @@ def test_wcn_watch_without_ugc_can_recover_service_area_same_from_county_block()
     )
 
     assert matched == ["024011", "024029", "024035", "024041"]
+
+
+WCN_SVA_MIXED_CAN_CON = """WWUS61 KLWX 202041
+WCNLWX
+
+WATCH COUNTY NOTIFICATION FOR WATCH 234
+NATIONAL WEATHER SERVICE BALTIMORE MD/WASHINGTON DC
+441 PM EDT WED MAY 20 2026
+
+MDC001-023-043-210000-
+/O.CAN.KLWX.SV.A.0234.000000T0000Z-260521T0000Z/
+
+THE NATIONAL WEATHER SERVICE HAS CANCELLED SEVERE THUNDERSTORM
+WATCH 234 FOR THE FOLLOWING AREAS
+
+IN MARYLAND THIS CANCELS 3 COUNTIES
+
+IN NORTH CENTRAL MARYLAND
+WASHINGTON
+
+IN WESTERN MARYLAND
+ALLEGANY                       GARRETT
+
+THIS INCLUDES THE CITIES OF CUMBERLAND, FROSTBURG, HAGERSTOWN,
+AND OAKLAND.
+
+$$
+
+DCC001-MDC003-005-013-015-021-025-027-031-033-510-
+VAC013-043-047-059-061-069-079-107-113-139-153-157-
+165-171-187-510-600-610-660-210000-
+/O.CON.KLWX.SV.A.0234.000000T0000Z-260521T0000Z/
+
+SEVERE THUNDERSTORM WATCH 234 REMAINS VALID UNTIL 8 PM EDT THIS
+EVENING FOR THE FOLLOWING AREAS
+
+THE DISTRICT OF COLUMBIA
+
+IN MARYLAND THIS WATCH INCLUDES 10 COUNTIES
+
+IN CENTRAL MARYLAND
+ANNE ARUNDEL                       HOWARD
+MONTGOMERY                         PRINCE GEORGES
+
+IN NORTH CENTRAL MARYLAND
+CARROLL                       FREDERICK
+
+IN NORTHEAST MARYLAND
+CECIL
+
+IN NORTHERN MARYLAND
+BALTIMORE BALTIMORE CITY HARFORD
+
+IN VIRGINIA THIS WATCH INCLUDES 4 COUNTIES
+
+IN NORTHERN VIRGINIA
+CLARKE                       FAUQUIER
+LOUDOUN                      PRINCE WILLIAM
+
+THIS INCLUDES THE CITIES OF ANNAPOLIS, BALTIMORE, FREDERICK,
+LEESBURG, MANASSAS, WASHINGTON, AND WESTMINSTER.
+
+$$
+
+ANZ530>532-535-538-539-210000-
+/O.CON.KLWX.SV.A.0234.000000T0000Z-260521T0000Z/
+
+SEVERE THUNDERSTORM WATCH 234 REMAINS VALID UNTIL 8 PM EDT THIS
+EVENING FOR THE FOLLOWING AREAS
+
+THIS WATCH INCLUDES THE FOLLOWING ADJACENT COASTAL WATERS
+CHESAPEAKE BAY NORTH OF POOLES ISLAND MD
+CHESAPEAKE BAY FROM POOLES ISLAND TO SANDY POINT MD
+
+$$
+"""
+
+
+def test_wcn_mixed_can_con_uses_watch_specific_partial_script():
+    script = build_nwws_watch_partial_cancel_script(
+        WCN_SVA_MIXED_CAN_CON,
+        [
+            "/O.CAN.KLWX.SV.A.0234.000000T0000Z-260521T0000Z/",
+            "/O.CON.KLWX.SV.A.0234.000000T0000Z-260521T0000Z/",
+        ],
+        local_tz=ZoneInfo("America/New_York"),
+        now=dt.datetime(2026, 5, 20, 16, 41, tzinfo=ZoneInfo("America/New_York")),
+    )
+
+    assert "Severe Thunderstorm Watch Number 234 has been cancelled" in script
+    assert "in Maryland: Washington, Allegany, and Garrett" in script
+    assert "Severe Thunderstorm Watch Number 234 remains in effect until 8 PM this evening." in script
+    assert "This watch includes the District of Columbia." in script
+    assert "in Virginia: Clarke, Fauquier, Loudoun, and Prince William" in script
+    assert "404 WWUS61" not in script
+    assert "WATCH COUNTY NOTIFICATION" not in script
+    assert "DCC001" not in script
+    assert "MDC001" not in script
+    assert "THE NATIONAL WEATHER SERVICE HAS CANCELLED" not in script
+    assert script.endswith("End of message.")

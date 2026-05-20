@@ -815,7 +815,8 @@ _WCN_AREA_STOP_RE = re.compile(
     re.IGNORECASE,
 )
 _WCN_STATE_COUNT_RE = re.compile(
-    r"^IN (?P<state>[A-Z ]+?) THIS WATCH INCLUDES \d+ (?P<kind>COUNTY|COUNTIES|CITY|CITIES|INDEPENDENT CITIES)\b",
+    r"^IN (?P<state>[A-Z ]+?) THIS (?:WATCH INCLUDES|CANCELS) \d+ "
+    r"(?P<kind>COUNTY|COUNTIES|CITY|CITIES|INDEPENDENT CITIES)\b",
     re.IGNORECASE,
 )
 
@@ -1108,6 +1109,122 @@ def match_nwws_wcn_area_same(area_desc: str, same_label_by_code: dict[str, str])
             out.append(c)
     return out
 
+
+
+def _watch_label_and_remember(kind: str, watch_number: int | None) -> tuple[str, str, str]:
+    """Return (watch_label, numbered_label, remember_text) for TO.A/SV.A watches."""
+    if kind == "tornado":
+        watch_label = "Tornado Watch"
+        remember = (
+            "Remember, a tornado watch means that conditions are favorable for the development of severe weather, "
+            "including tornadoes, large hail, and damaging winds, in and close to the watch area. "
+            "While severe weather may not be imminent, persons should remain alert for rapidly changing weather conditions, "
+            "and listen for later statements and possible warnings."
+        )
+    else:
+        watch_label = "Severe Thunderstorm Watch"
+        remember = (
+            "Remember, a severe thunderstorm watch means that conditions are favorable for the development of severe weather, "
+            "including large hail and damaging winds, in and close to the watch area. "
+            "While severe weather may not be imminent, persons should remain alert for rapidly changing weather conditions, "
+            "and listen for later statements and possible warnings."
+        )
+    label_with_num = f"{watch_label} Number {watch_number}" if watch_number is not None else watch_label
+    return watch_label, label_with_num, remember
+
+
+def _watch_section_script_lines(
+    *,
+    parsed: dict[str, Any],
+    area_desc: str,
+    local_tz: dt.tzinfo | None = None,
+    now: dt.datetime | None = None,
+) -> list[str]:
+    """Build one clean WCN lifecycle statement from one VTEC-bearing WCN section."""
+    action = str(parsed.get("action") or "").upper()
+    _watch_label, label_with_num, _remember = _watch_label_and_remember(
+        str(parsed.get("kind") or "severe"),
+        parsed.get("watch_number"),
+    )
+    until = _watch_time_phrase(parsed.get("end_utc"), local_tz=local_tz, now=now)
+    until_part = f" until {until}" if until else ""
+    area_sentence = _watch_area_sentence(area_desc)
+
+    lines: list[str] = []
+    if action == "CAN":
+        lines.append(f"{label_with_num} has been cancelled for the following areas.")
+    elif action == "EXP":
+        lines.append(f"{label_with_num} has been allowed to expire for the following areas.")
+    elif action in {"CON", "EXT"}:
+        lines.append(f"{label_with_num} remains in effect{until_part}.")
+    elif action in {"EXA", "EXB"}:
+        lines.append(f"{label_with_num} remains in effect{until_part}.")
+        lines.append("This watch now includes additional areas.")
+    else:
+        return []
+
+    if area_sentence:
+        lines.append(area_sentence)
+    return lines
+
+
+def build_nwws_watch_partial_cancel_script(
+    official_text: str,
+    vtec: list[str] | None,
+    *,
+    local_tz: dt.tzinfo | None = None,
+    now: dt.datetime | None = None,
+) -> str:
+    """
+    Build clean narration for mixed-action WCN products, such as CAN+CON.
+
+    Generic NWWS partial-cancel parsing expects warning/SVS-style segments with
+    ``...headline...`` markers.  WCN products usually do not have those markers,
+    so feeding WCN text to that parser can read WMO headers, UGC lines, county
+    columns, and all-caps product prose.  This parser keeps WCN on the watch
+    script path and formats each VTEC section with watch-specific wording.
+    """
+    parsed_sections: list[tuple[dict[str, Any], str]] = []
+    for section in _split_nwws_vtec_sections(official_text):
+        sec_vtecs = [m.group(0) for m in _WATCH_VTEC_RE.finditer(section)]
+        parsed = _parse_watch_vtec(sec_vtecs)
+        if not parsed:
+            continue
+        action = str(parsed.get("action") or "").upper()
+        if action not in {"CAN", "EXP", "CON", "EXT", "EXA", "EXB"}:
+            continue
+        parsed_sections.append((parsed, _extract_wcn_area_desc(section)))
+
+    if not parsed_sections:
+        return ""
+
+    actions = {str(parsed.get("action") or "").upper() for parsed, _area in parsed_sections}
+    if not (actions & {"CAN", "EXP"} and actions & {"CON", "EXT", "EXA", "EXB"}):
+        return ""
+
+    lines: list[str] = []
+    for parsed, area_desc in parsed_sections:
+        # Do not create duplicate bare continuation lines for sections where we
+        # could not recover any speakable area text, e.g. adjacent coastal-water
+        # tails outside the configured SAME service-area context.
+        if not area_desc and lines:
+            continue
+        lines.extend(_watch_section_script_lines(
+            parsed=parsed,
+            area_desc=area_desc,
+            local_tz=local_tz,
+            now=now,
+        ))
+
+    if not lines:
+        return ""
+    lines.append(
+        "Stay tuned to NOAA Weather Radio, commercial radio, and television outlets, "
+        "or internet sources for the latest severe weather information."
+    )
+    lines.append("End of message.")
+    return "\n\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
+
 def build_nwws_watch_vtec_script(
     official_text: str,
     vtec: list[str] | None,
@@ -1133,24 +1250,7 @@ def build_nwws_watch_vtec_script(
     area_desc = (area_text or "").strip() or _extract_wcn_area_desc(official_text)
     area_sentence = _watch_area_sentence(area_desc)
 
-    if kind == "tornado":
-        watch_label = "Tornado Watch"
-        remember = (
-            "Remember, a tornado watch means that conditions are favorable for the development of severe weather, "
-            "including tornadoes, large hail, and damaging winds, in and close to the watch area. "
-            "While severe weather may not be imminent, persons should remain alert for rapidly changing weather conditions, "
-            "and listen for later statements and possible warnings."
-        )
-    else:
-        watch_label = "Severe Thunderstorm Watch"
-        remember = (
-            "Remember, a severe thunderstorm watch means that conditions are favorable for the development of severe weather, "
-            "including large hail and damaging winds, in and close to the watch area. "
-            "While severe weather may not be imminent, persons should remain alert for rapidly changing weather conditions, "
-            "and listen for later statements and possible warnings."
-        )
-
-    label_with_num = f"{watch_label} Number {watch_number}" if watch_number is not None else watch_label
+    _watch_label, label_with_num, remember = _watch_label_and_remember(kind, watch_number)
     until_part = f" until {until}" if until else ""
 
     lines: list[str] = []
@@ -1216,4 +1316,5 @@ __all__ = [
     "extract_nwws_wcn_area_desc",
     "match_nwws_wcn_area_same",
     "build_nwws_watch_vtec_script",
+    "build_nwws_watch_partial_cancel_script",
 ]
