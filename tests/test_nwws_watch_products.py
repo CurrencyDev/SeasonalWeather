@@ -1,7 +1,11 @@
 import datetime as dt
 from zoneinfo import ZoneInfo
 
-from seasonalweather.broadcast.product_text import build_nwws_watch_vtec_script
+from seasonalweather.broadcast.product_text import (
+    build_nwws_watch_vtec_script,
+    extract_nwws_wcn_area_desc,
+    match_nwws_wcn_area_same,
+)
 from seasonalweather.same.ugc import extract_ugc_zones
 
 
@@ -115,5 +119,27 @@ def test_wcn_watch_without_ugc_can_format_text_but_has_no_same_target_source():
 
     assert "The National Weather Service has issued Severe Thunderstorm Watch Number 235." in script
     assert "Effective until 9 PM tonight." in script
-    assert "in Delaware: Kent New Castle Sussex" in script
-    assert "in Maryland: Caroline Kent Queen Anne'S and Talbot" in script
+    assert "in Delaware: Kent, New Castle, and Sussex" in script
+    assert "in Maryland: Caroline, Kent, Queen Anne's, and Talbot" in script
+
+
+def test_wcn_watch_without_ugc_can_recover_service_area_same_from_county_block():
+    area_desc = extract_nwws_wcn_area_desc(WCN_SVA_NO_UGC)
+
+    assert "Caroline, MD" in area_desc
+    assert "Kent, MD" in area_desc
+    assert "Queen Anne's, MD" in area_desc
+    assert "Talbot, MD" in area_desc
+
+    matched = match_nwws_wcn_area_same(
+        area_desc,
+        {
+            "024011": "Caroline, MD",
+            "024029": "Kent, MD",
+            "024035": "Queen Anne's, MD",
+            "024041": "Talbot, MD",
+            "024031": "Montgomery, MD",
+        },
+    )
+
+    assert matched == ["024011", "024029", "024035", "024041"]

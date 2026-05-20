@@ -66,6 +66,8 @@ from .broadcast.product_text import (
     build_warning_vtec_action_script as _build_warning_vtec_action_script_fn,
     build_nwws_partial_cancel_script as _build_nwws_partial_cancel_script,
     build_nwws_watch_vtec_script as _build_nwws_watch_vtec_script,
+    extract_nwws_wcn_area_desc as _extract_nwws_wcn_area_desc,
+    match_nwws_wcn_area_same as _match_nwws_wcn_area_same,
     parse_nwws_product_segments as _parse_nwws_product_segments,
 )
 
@@ -3029,6 +3031,36 @@ class Orchestrator:
 
         in_area = self._filter_same_locations_to_service_area(dedup)
         return (zones, in_area, src, any_mapped, ugc_expires_utc)
+
+    async def _nwws_wcn_watch_same_targets_from_area_desc(self, official_text: str) -> list[str]:
+        """
+        Derive in-area SAME codes for WCN watch products that lack a UGC block.
+
+        Some NWWS WCN watch county notifications carry clean county/state body
+        text but no UGC county-zone line.  We only need to recover the local
+        service-area intersection for SAME tone generation, so resolve configured
+        SAME codes to county labels and match those labels against the WCN area
+        block.
+        """
+        area_desc = _extract_nwws_wcn_area_desc(official_text or "")
+        if not area_desc:
+            return []
+
+        candidates = [str(x).strip() for x in (self.cfg.service_area.same_fips_all or []) if str(x).strip()]
+        # Statewide/wildcard SAME entries cannot be matched to specific WCN counties.
+        candidates = [c for c in candidates if re.fullmatch(r"\d{6}", c) and not c.endswith("000")]
+        if not candidates:
+            return []
+
+        labels = await asyncio.gather(*(self._same6_area_label(c) for c in candidates), return_exceptions=True)
+        label_by_code: dict[str, str] = {}
+        for code, label in zip(candidates, labels):
+            if isinstance(label, Exception) or not label:
+                continue
+            label_by_code[str(code).strip()] = str(label).strip()
+
+        matched = _match_nwws_wcn_area_same(area_desc, label_by_code)
+        return self._filter_same_locations_to_service_area(matched)
 
 
     # ---- Rebroadcast rotation (no re-tone) ----
@@ -6063,6 +6095,23 @@ class Orchestrator:
                 len(in_area_same),
             )
 
+        vtec_preview = self._extract_vtec(official_text)
+        _pre_policy = _vtec_toneout_policy(vtec_preview)
+        _pre_is_wcn_watch = (
+            (parsed.product_type or "").strip().upper() == "WCN"
+            and (_pre_policy.same_code or "").strip().upper() in {"SVA", "TOA"}
+        )
+        if _pre_is_wcn_watch and not in_area_same:
+            area_same = await self._nwws_wcn_watch_same_targets_from_area_desc(official_text or "")
+            if area_same:
+                in_area_same = area_same
+                mapped_ok = True
+                src = "wcn-area"
+                log.info(
+                    "NWWS WCN watch targeting recovered from county block: in_area_same=%d",
+                    len(in_area_same),
+                )
+
         # If we successfully mapped zones -> SOME SAME codes, and none are in-area => out-of-area, skip entirely.
         if zones and mapped_ok and not in_area_same:
             preview = ",".join(zones[:20]) + ("..." if len(zones) > 20 else "")
@@ -6074,7 +6123,7 @@ class Orchestrator:
             )
             return
 
-        vtec = self._extract_vtec(official_text)
+        vtec = vtec_preview
         tracks = self._vtec_tracks(vtec)
         exp_utc = self._best_expiry_from_vtec(vtec)
 

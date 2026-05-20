@@ -859,6 +859,7 @@ def _clean_wcn_area_name(s: str) -> str:
         " And ": " and ",
         " The ": " the ",
         "Dc": "DC",
+        "'S": "'s",
     }
     for a, b in fixes.items():
         out = out.replace(a, b)
@@ -907,7 +908,10 @@ def _extract_wcn_area_desc(text: str) -> str:
     the watch script to avoid reading the entire raw WCN blob when CAP has not
     arrived yet.
     """
-    lines = [re.sub(r"\s+", " ", (ln or "").strip()) for ln in (text or "").splitlines()]
+    # Preserve repeated spacing in county rows; WCN uses columns where two or
+    # more spaces separate county names.  State/stop-line checks normalise a
+    # separate uppercase copy below.
+    lines = [(ln or "").strip() for ln in (text or "").splitlines()]
     if not lines:
         return ""
 
@@ -945,7 +949,7 @@ def _extract_wcn_area_desc(text: str) -> str:
             continue
         if _WCN_AREA_STOP_RE.match(s):
             break
-        su = s.upper()
+        su = re.sub(r"\s+", " ", s).upper()
         if su in {"THE DISTRICT OF COLUMBIA", "DISTRICT OF COLUMBIA"}:
             misc.append("the District of Columbia")
             current_state = None
@@ -962,7 +966,7 @@ def _extract_wcn_area_desc(text: str) -> str:
             continue
         if not _looks_like_wcn_area_name(su):
             continue
-        for part in _split_wcn_area_line(su):
+        for part in _split_wcn_area_line(s):
             add_group(current_state, part)
 
     parts: list[str] = []
@@ -1000,6 +1004,71 @@ def _watch_area_sentence(area_desc: str) -> str:
 
     return "\n".join(lines).strip()
 
+
+
+def extract_nwws_wcn_area_desc(text: str) -> str:
+    """Public wrapper for extracting CAP-like areaDesc from an NWWS WCN product."""
+    return _extract_wcn_area_desc(text)
+
+
+def _wcn_area_match_key(name: str, state: str = "") -> str:
+    """Normalise county/city + state labels for WCN areaDesc ↔ SAME-label matching."""
+    n = str(name or "").strip().replace("’", "'")
+    st = str(state or "").strip().upper()
+    # NWS zone names sometimes include suffixes while WCN text usually omits them.
+    n = re.sub(r"\b(?:COUNTY|CITY|PARISH|BOROUGH|MUNICIPALITY)\b", " ", n, flags=re.IGNORECASE)
+    n = re.sub(r"\bTHE\b", " ", n, flags=re.IGNORECASE)
+    blob = f"{n} {st}"
+    return re.sub(r"[^a-z0-9]+", "", blob.lower())
+
+
+def match_nwws_wcn_area_same(area_desc: str, same_label_by_code: dict[str, str]) -> list[str]:
+    """
+    Match extracted WCN county/state area text against known SAME code labels.
+
+    This intentionally uses caller-provided SAME labels, usually the configured
+    service-area SAME list resolved through api.weather.gov county zones.  That
+    keeps the matcher local to the deployment's allowed area instead of carrying
+    a hard-coded national county FIPS table.
+    """
+    groups, _order, misc = parse_cap_area_by_state(area_desc or "")
+    wanted: set[str] = set()
+    for st, names in groups.items():
+        for name in names:
+            key = _wcn_area_match_key(name, st)
+            if key:
+                wanted.add(key)
+    for raw in misc:
+        m = str(raw or "").strip()
+        if not m:
+            continue
+        key = _wcn_area_match_key(m, "")
+        if key:
+            wanted.add(key)
+        if "district of columbia" in m.lower():
+            wanted.add(_wcn_area_match_key("District of Columbia", "DC"))
+
+    if not wanted:
+        return []
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for code, label in (same_label_by_code or {}).items():
+        c = re.sub(r"\D+", "", str(code or ""))
+        if len(c) != 6 or c in seen:
+            continue
+        lab = str(label or "").strip()
+        if not lab:
+            continue
+        if "," in lab:
+            name, st = lab.rsplit(",", 1)
+            key = _wcn_area_match_key(name, st)
+        else:
+            key = _wcn_area_match_key(lab, "")
+        if key in wanted:
+            seen.add(c)
+            out.append(c)
+    return out
 
 def build_nwws_watch_vtec_script(
     official_text: str,
@@ -1106,5 +1175,7 @@ __all__ = [
     "NwwsProductSegment",
     "parse_nwws_product_segments",
     "build_nwws_partial_cancel_script",
+    "extract_nwws_wcn_area_desc",
+    "match_nwws_wcn_area_same",
     "build_nwws_watch_vtec_script",
 ]
