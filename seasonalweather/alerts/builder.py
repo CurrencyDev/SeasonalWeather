@@ -26,6 +26,59 @@ _PRODUCT_MASTHEAD_RE = re.compile(
 # "PRECAUTIONARY/PREPAREDNESS ACTIONS..." header (we don't speak the header)
 _PPA_RE = re.compile(r"^PRECAUTIONARY/PREPAREDNESS ACTIONS\b", re.IGNORECASE)
 
+_TZ_ABBR_RE = re.compile(
+    r"\b(EDT|EST|CDT|CST|MDT|MST|PDT|PST|AKDT|AKST|HST)\b",
+    re.IGNORECASE,
+)
+_AMPM_ABBR_RE = re.compile(r"\b(AM|PM)\b", re.IGNORECASE)
+_STATE_ABBRS = {
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
+    "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
+    "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+    "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
+    "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
+    "DC",
+}
+# Do not restore ambiguous state abbreviations that are common words after
+# lower-casing all-caps prose.  VoiceText correctness is better with "in"/"or"
+# as words than with accidental spelled-letter output.
+_STATE_ABBRS -= {"IN", "OR"}
+_STATE_ABBR_RE = re.compile(r"\b(" + "|".join(sorted(_STATE_ABBRS)) + r")\b", re.IGNORECASE)
+
+
+def _looks_like_all_caps_prose(s: str) -> bool:
+    """Return true for NWS all-caps narrative lines that should not be spelled."""
+    t = (s or "").strip()
+    letters = re.sub(r"[^A-Za-z]+", "", t)
+    if len(letters) < 3:
+        return False
+    if any(ch.islower() for ch in letters):
+        return False
+    # Avoid converting compact identifiers / product IDs.  Multi-word warning
+    # headlines and FOR-scope lines still pass this test.
+    return bool(re.search(r"\s", t)) or t.startswith("...")
+
+
+def _sentence_case_all_caps_prose(s: str) -> str:
+    """Make all-caps NWS prose safe for VoiceText without killing acronyms."""
+    t = (s or "").strip()
+    if not _looks_like_all_caps_prose(t):
+        return t
+
+    # Headline wrappers are visual markup, not words to speak.
+    t = re.sub(r"^\.\.\.\s*", "", t)
+    if t.endswith("..."):
+        t = t[:-3].rstrip() + "."
+
+    t = t.lower()
+    if t:
+        t = t[0].upper() + t[1:]
+
+    t = _AMPM_ABBR_RE.sub(lambda m: m.group(1).upper(), t)
+    t = _TZ_ABBR_RE.sub(lambda m: m.group(1).upper(), t)
+    t = _STATE_ABBR_RE.sub(lambda m: m.group(1).upper(), t)
+    return t
+
 
 _META_SKIP_PREFIXES = (
     "LAT...LON",
@@ -214,16 +267,20 @@ def _clean_line(s: str) -> str:
     if _PPA_RE.match(s2):
         return ""
 
-    # Convert marker ellipses to CAP-ish punctuation
+    # Convert marker ellipses to CAP-ish punctuation.  Keep labels mixed-case
+    # because VoiceText Paul may spell short all-caps tokens as letters.
     for tag in _TAGS:
         if s2.startswith(tag + "..."):
             rest = s2[len(tag + "...") :].lstrip()
-            s2 = f"{tag}. {rest}" if rest else f"{tag}."
+            label = tag.capitalize()
+            s2 = f"{label}: {rest}" if rest else f"{label}."
             break
 
-    # If a line ends with "...", turn that into a sentence-ish period
+    # If a line ends with "...", turn that into a sentence-ish period.
     if s2.endswith("..."):
         s2 = s2[:-3].rstrip() + "."
+
+    s2 = _sentence_case_all_caps_prose(s2)
 
     # Squash weird spacing
     s2 = _SPACE_RE.sub(" ", s2).strip()

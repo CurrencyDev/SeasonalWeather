@@ -245,3 +245,67 @@ def test_expiry_summary_script_sentence_cases_all_caps_svs_headline_for_tts():
     spoken = clean_for_tts(script)
     assert "will expire at 3:00 PM EDT." in spoken
     assert " AT " not in spoken
+
+KLWX_CON_SVS = """435
+WWUS51 KLWX 201903
+SVSLWX
+
+Severe Weather Statement
+National Weather Service Baltimore MD/Washington DC
+303 PM EDT Wed May 20 2026
+
+VAC139-171-201915-
+/O.CON.KLWX.SV.W.0054.000000T0000Z-260520T1915Z/
+Shenandoah VA-Page VA-
+303 PM EDT Wed May 20 2026
+
+...A SEVERE THUNDERSTORM WARNING REMAINS IN EFFECT UNTIL 315 PM EDT
+FOR SOUTH CENTRAL SHENANDOAH AND NORTH CENTRAL PAGE COUNTIES...
+
+At 303 PM EDT, a severe thunderstorm was located near Luray, or 9
+miles south of Woodstock, moving east at 20 mph.
+
+HAZARD...60 mph wind gusts.
+
+SOURCE...Radar indicated.
+
+IMPACT...Damaging winds will cause some trees and large branches to
+         fall. This could injure those outdoors, as well as damage
+         homes and vehicles. Roadways may become blocked by downed
+         trees. Localized power outages are possible. Unsecured
+         light objects may become projectiles.
+
+Locations impacted include...
+Luray and Kings Crossing.
+
+PRECAUTIONARY/PREPAREDNESS ACTIONS...
+
+For your protection move to an interior room on the lowest floor of a
+building.
+
+&&
+
+LAT...LON 3866 7857 3873 7858 3881 7846 3867 7842
+TIME...MOT...LOC 1903Z 253DEG 18KT 3874 7851
+
+$$
+
+Belak
+"""
+
+
+def test_spoken_alert_sentence_cases_all_caps_svs_continuation_body_for_tts():
+    from seasonalweather.alerts.builder import build_spoken_alert
+    from seasonalweather.alerts.product import parse_product_text
+
+    parsed = parse_product_text(KLWX_CON_SVS)
+    assert parsed is not None
+
+    spoken = build_spoken_alert(parsed, KLWX_CON_SVS)
+
+    assert "FOR SOUTH CENTRAL" not in spoken.script
+    assert "A SEVERE THUNDERSTORM WARNING" not in spoken.script
+    assert "For south central shenandoah" in spoken.script
+    assert "Hazard: 60 mph wind gusts." in spoken.script
+    assert "Source: Radar indicated." in spoken.script
+    assert "Impact: Damaging winds will cause" in spoken.script
