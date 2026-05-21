@@ -72,6 +72,7 @@ log = logging.getLogger("seasonalweather.segment_refresher")
 # Default refresh intervals (seconds).  Override via refresh_intervals kwarg.
 _DEFAULT_INTERVALS: Dict[str, int] = {
     "id":         60,
+    "health":      60,
     "status":     180,
     "hwo":        3600,
     "spc":        1800,
@@ -92,11 +93,12 @@ _BUILD_CACHE_TTL_S: float = 20.0
 # All segment keys managed by the refresher (excluding live "time" and
 # dynamic "_alert_*" keys which have their own paths).
 _ALL_CONTENT_KEYS: List[str] = [
-    "id", "status", "hwo", "spc", "zfp", "fcst", "cwf", "obs", "marine_obs",
+    "id", "health", "status", "hwo", "spc", "zfp", "fcst", "cwf", "obs", "marine_obs",
 ]
 
 _SEGMENT_TITLES: Dict[str, str] = {
     "id":         "Station identification.",
+    "health":     "Data feed status.",
     "status":     "Overall station status and alerts.",
     "hwo":        "Hazardous weather outlook for the service area.",
     "spc":        "Severe weather outlook for the service area.",
@@ -241,6 +243,8 @@ class SegmentRefresher:
         try:
             if key == "id":
                 await self._refresh_id()
+            elif key == "health":
+                await self._refresh_via_build("health")
             elif key == "status":
                 await self._refresh_via_build("status")
             elif key == "hwo":
@@ -273,7 +277,9 @@ class SegmentRefresher:
         time so the spoken time is always accurate.
         """
         ctx = self._ctx_fn()
-        if ctx.mode == "heightened":
+        if getattr(ctx, "health_detached_loop_only", False):
+            text = (getattr(ctx, "health_notice", None) or "SeasonalWeather is temporarily unable to receive current National Weather Service information. Please use another weather information source or visit weather.gov for the latest information.").strip()
+        elif ctx.mode == "heightened":
             text = (
                 f"This is the SeasonalNet I P Weather Radio Station, {self._station_name}, "
                 f"with station programming and streaming facilities originating from SeasonalNet, "
@@ -335,10 +341,11 @@ class SegmentRefresher:
         only when the cache has expired or the mode has changed.
         """
         now = time.time()
+        cache_mode = f"{ctx.mode}|{getattr(ctx, 'health_mode', 'normal')}|{bool(getattr(ctx, 'health_detached_loop_only', False))}"
         if (
             self._seg_cache is not None
             and (now - self._seg_cache_ts) < _BUILD_CACHE_TTL_S
-            and self._seg_cache_mode == ctx.mode
+            and self._seg_cache_mode == cache_mode
         ):
             return self._seg_cache
 
@@ -350,7 +357,7 @@ class SegmentRefresher:
         )
         self._seg_cache = segs
         self._seg_cache_ts = now
-        self._seg_cache_mode = ctx.mode
+        self._seg_cache_mode = cache_mode
         return segs
 
     # ------------------------------------------------------------------

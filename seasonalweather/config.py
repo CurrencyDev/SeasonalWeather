@@ -263,6 +263,61 @@ class NwsConfig:
     user_agent: str
 
 
+# --- pns ---
+
+@dataclass(frozen=True)
+class PnsSubtypeConfig:
+    name: str
+    enabled: bool
+    audio: bool
+    event: str
+    code: str
+    key_prefix: str
+    intro: str
+    headline_contains: List[str]
+    body_contains_all: List[str]
+    body_contains_any: List[str]
+    reject_contains: List[str]
+    max_fresh_hours: float
+    require_same_day: bool
+    max_chars: int
+
+
+@dataclass(frozen=True)
+class PnsConfig:
+    enabled: bool
+    default_expire_hours: float
+    hard_stop_delimiter: str
+    suppress_unknown_audio: bool
+    reject_audio_keywords: List[str]
+    subtypes: List[PnsSubtypeConfig]
+
+
+# --- health state machine ---
+
+@dataclass(frozen=True)
+class HealthSourceConfig:
+    name: str
+    enabled: bool
+    role: str
+    stale_after_seconds: int
+    failure_threshold: int
+    critical: bool
+
+
+@dataclass(frozen=True)
+class HealthConfig:
+    enabled: bool
+    check_interval_seconds: int
+    min_hold_seconds: int
+    detached_loop_only: bool
+    source_impaired_message: str
+    degraded_message: str
+    critical_message: str
+    detached_message: str
+    sources: List[HealthSourceConfig]
+
+
 # --- policy ---
 
 @dataclass(frozen=True)
@@ -688,6 +743,8 @@ class AppConfig:
     observations: ObservationsConfig
     nwws: NWWSConfig
     nws: NwsConfig
+    pns: PnsConfig
+    health: HealthConfig
     policy: PolicyConfig
     tts: TTSConfig
     audio: AudioConfig
@@ -903,6 +960,146 @@ def load_config(path: str) -> AppConfig:
     # ------------------------------------------------------------------
     nws_raw = raw.get("nws", {})
     nws = NwsConfig(user_agent=str(nws_raw.get("user_agent", "")))
+
+    # ------------------------------------------------------------------
+    # pns
+    # ------------------------------------------------------------------
+    pns_raw = raw.get("pns", {})
+    default_pns_subtypes = [
+        {
+            "name": "severe_weather_safety_rules",
+            "enabled": True,
+            "audio": True,
+            "event": "Severe Weather Safety Rules",
+            "code": "SPS",
+            "key_prefix": "PNS_SAFETY",
+            "intro": "The National Weather Service has issued the following public information statement.",
+            "headline_contains": ["...SEVERE WEATHER SAFETY RULES..."],
+            "body_contains_all": [],
+            "body_contains_any": [],
+            "reject_contains": [],
+            "max_fresh_hours": 18.0,
+            "require_same_day": True,
+            "max_chars": 2400,
+        },
+        {
+            "name": "nwr_transmitter_outage",
+            "enabled": True,
+            "audio": True,
+            "event": "NOAA Weather Radio Service Announcement",
+            "code": "SPS",
+            "key_prefix": "PNS_NWR_SERVICE",
+            "intro": "This is a service announcement from the National Weather Service concerning NOAA Weather Radio transmitters in the service area.",
+            "headline_contains": [],
+            "body_contains_all": ["NOAA Weather Radio", "transmitter"],
+            "body_contains_any": ["off the air", "offline", "out of service", "technical difficulties", "maintenance"],
+            "reject_contains": [],
+            "max_fresh_hours": 48.0,
+            "require_same_day": False,
+            "max_chars": 1400,
+        },
+        {
+            "name": "nwr_transmitter_restoration",
+            "enabled": True,
+            "audio": True,
+            "event": "NOAA Weather Radio Service Announcement",
+            "code": "SPS",
+            "key_prefix": "PNS_NWR_SERVICE",
+            "intro": "This is a service announcement from the National Weather Service concerning NOAA Weather Radio transmitters in the service area.",
+            "headline_contains": [],
+            "body_contains_all": ["NOAA Weather Radio", "transmitter"],
+            "body_contains_any": ["returned to service", "back on the air", "service has been restored", "restored"],
+            "reject_contains": [],
+            "max_fresh_hours": 24.0,
+            "require_same_day": False,
+            "max_chars": 1200,
+        },
+    ]
+
+    def _str_list(value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value] if value.strip() else []
+        if isinstance(value, list):
+            return [str(v) for v in value if str(v).strip()]
+        return []
+
+    pns_subtypes = []
+    for item in (pns_raw.get("subtypes") or default_pns_subtypes):
+        if not isinstance(item, dict):
+            continue
+        pns_subtypes.append(PnsSubtypeConfig(
+            name=str(item.get("name", "pns_subtype") or "pns_subtype"),
+            enabled=bool(item.get("enabled", True)),
+            audio=bool(item.get("audio", True)),
+            event=str(item.get("event", "Public Information Statement") or "Public Information Statement"),
+            code=str(item.get("code", "SPS") or "SPS").strip().upper()[:3] or "SPS",
+            key_prefix=str(item.get("key_prefix", "PNS") or "PNS"),
+            intro=str(item.get("intro", "The National Weather Service has issued the following public information statement.") or ""),
+            headline_contains=_str_list(item.get("headline_contains")),
+            body_contains_all=_str_list(item.get("body_contains_all")),
+            body_contains_any=_str_list(item.get("body_contains_any")),
+            reject_contains=_str_list(item.get("reject_contains")),
+            max_fresh_hours=float(item.get("max_fresh_hours", 18.0)),
+            require_same_day=bool(item.get("require_same_day", False)),
+            max_chars=int(item.get("max_chars", 1800)),
+        ))
+
+    pns = PnsConfig(
+        enabled=bool(pns_raw.get("enabled", True)),
+        default_expire_hours=float(pns_raw.get("default_expire_hours", 4.0)),
+        hard_stop_delimiter=str(pns_raw.get("hard_stop_delimiter", "&&") or "&&"),
+        suppress_unknown_audio=bool(pns_raw.get("suppress_unknown_audio", True)),
+        reject_audio_keywords=_str_list(pns_raw.get("reject_audio_keywords")) or [
+            "spotter reports",
+            "storm reports",
+            "preliminary local storm report",
+            "metadata",
+        ],
+        subtypes=pns_subtypes,
+    )
+
+    # ------------------------------------------------------------------
+    # health state machine
+    # ------------------------------------------------------------------
+    health_raw = raw.get("health", {})
+    health_sources_raw = health_raw.get("sources") or {
+        "nwws_oi": {"enabled": True, "role": "alert_redundant", "stale_after_seconds": 600, "failure_threshold": 2, "critical": False},
+        "cap_api": {"enabled": True, "role": "alert", "stale_after_seconds": 300, "failure_threshold": 3, "critical": True},
+        "nws_api": {"enabled": True, "role": "forecast", "stale_after_seconds": 900, "failure_threshold": 3, "critical": False},
+    }
+    health_sources: List[HealthSourceConfig] = []
+    if isinstance(health_sources_raw, dict):
+        iter_sources = health_sources_raw.items()
+    else:
+        iter_sources = ((str((item or {}).get("name", "")), item) for item in health_sources_raw if isinstance(item, dict))
+    for name, item in iter_sources:
+        if not isinstance(item, dict):
+            continue
+        source_name = str(item.get("name", name) or name).strip()
+        if not source_name:
+            continue
+        health_sources.append(HealthSourceConfig(
+            name=source_name,
+            enabled=bool(item.get("enabled", True)),
+            role=str(item.get("role", "general") or "general"),
+            stale_after_seconds=int(item.get("stale_after_seconds", 600)),
+            failure_threshold=int(item.get("failure_threshold", 3)),
+            critical=bool(item.get("critical", False)),
+        ))
+
+    health = HealthConfig(
+        enabled=bool(health_raw.get("enabled", True)),
+        check_interval_seconds=int(health_raw.get("check_interval_seconds", 30)),
+        min_hold_seconds=int(health_raw.get("min_hold_seconds", 300)),
+        detached_loop_only=bool(health_raw.get("detached_loop_only", True)),
+        source_impaired_message=str(health_raw.get("source_impaired_message", "SeasonalWeather is operating with reduced data-feed redundancy. Some information may be delayed.")),
+        degraded_message=str(health_raw.get("degraded_message", "SeasonalWeather is operating in a degraded mode. Some National Weather Service data may be delayed or unavailable.")),
+        critical_message=str(health_raw.get("critical_message", "SeasonalWeather is operating in a degraded mode. Current watches, warnings, and advisories may be delayed or unavailable.")),
+        detached_message=str(health_raw.get("detached_message", "SeasonalWeather is temporarily unable to receive current National Weather Service information. Please use another weather information source or visit weather.gov for the latest information.")),
+        sources=health_sources,
+    )
 
     # ------------------------------------------------------------------
     # policy
@@ -1341,6 +1538,8 @@ def load_config(path: str) -> AppConfig:
         observations=observations,
         nwws=nwws,
         nws=nws,
+        pns=pns,
+        health=health,
         policy=policy,
         tts=tts,
         audio=audio,

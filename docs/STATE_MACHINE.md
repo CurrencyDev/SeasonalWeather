@@ -1,42 +1,67 @@
-# SeasonalWeather state machine (v0.9)
+# SeasonalWeather state machines
 
-The system is intentionally simple and NWR-inspired:
+SeasonalWeather now has three distinct runtime state machines. Keep them separate so alert routing, PNS policy, and service-health presentation do not contaminate each other.
 
-## States
-- **NORMAL**
-  - Default mode.
-  - Cycle refresh interval = `cycle.normal_interval_seconds` (default 300s).
-  - Content = station ID + status + HWO summary + forecast highlights + observations.
+## Broadcast mode state
 
-- **HEIGHTENED**
-  - Entered when a “tone-out” product is received (warnings/watches; configurable list).
-  - Cycle refresh interval = `cycle.heightened_interval_seconds` (default 180s).
-  - Stays in HEIGHTENED until `now >= heightened_until`.
+### NORMAL
+- Default mode.
+- Cycle refresh interval = `cycle.normal_interval_seconds`.
+- Content = station ID, optional health notice, status, HWO, outlook/synopsis/forecast/observations, and active cycle-only alerts.
 
-## Inputs
-- **NWWS-OI XMPP products** (primary trigger)
-  - Parsed for WFO (KLWX) and product type (SVR/FFW/TOR/etc).
-  - If product type is in `policy.toneout_product_types`, the product becomes an **interrupt**.
+### HEIGHTENED
+- Entered when a tone-out product is received.
+- Tone-out products are controlled by `policy.toneout_product_types`.
+- Cycle refresh interval = `cycle.heightened_interval_seconds`.
+- Stays in HEIGHTENED until `now >= heightened_until` unless another tone-out extends it.
 
-- **Timers**
-  - Every refresh, the current cycle audio is rebuilt and re-queued.
+### Broadcast transitions
+- `NORMAL -> HEIGHTENED`: tone-out product airs.
+- `HEIGHTENED -> NORMAL`: `heightened_until` expires.
 
-## Outputs
-- **Interrupt plane** (Liquidsoap `alert` queue)
-  - Attention tone → spoken alert → EOM beep → post-alert silence.
-  - Preempts by flushing the cycle queue right before pushing the alert.
+## PNS audio policy state
 
-- **Cycle plane** (Liquidsoap `cycle` queue)
-  - One pre-rendered WAV at a time; the queue is flushed before pushing the latest cycle.
+Public Information Statement handling is driven by `pns:` in `config.yaml` and implemented in `seasonalweather/pns.py`.
 
-## Transitions
-- NORMAL → HEIGHTENED:
-  - On receipt of a tone-out product.
-  - Sets `last_heightened_at = now` and `heightened_until = now + min_heightened_seconds`.
+PNS is treated as a broad container product, not as inherently broadcast-safe prose. The PNS state machine classifies each product and returns one of these actions:
 
-- HEIGHTENED → NORMAL:
-  - When `now >= heightened_until` and no newer tone-out extended it.
+- `audio`: configured subtype matched and the body passed coherence checks.
+- `ui_only`: useful product, but not safe for spoken-cycle audio.
+- `drop`: no useful coherent text could be synthesized.
+- `no_match` / `stale` / `disabled`: no cycle audio.
 
-## Notes
-- The “tone-out” list is configurable. Start conservative (warnings only) and expand later.
-- The service area filter uses SAME/FIPS codes from LWX transmitters (KEC-83, KHB-36, WXM-42, WXM-43).
+Default audio-enabled subtypes:
+
+- Severe Weather Safety Rules.
+- NOAA Weather Radio transmitter outage.
+- NOAA Weather Radio transmitter restoration.
+
+Hard reject/downrank signals include tabular report structure, `METADATA`, `TIME/DATE` table headers, report tokens such as `PKGUST`, dense numeric blocks, aligned observation rows, and configured reject keywords such as `spotter reports`.
+
+The delimiter line `&&` is treated as a hard spoken-text boundary before metadata-style content unless a future subtype explicitly handles that content.
+
+## Health state machine
+
+Source-health presentation is driven by `health:` in `config.yaml` and implemented in `seasonalweather/health_state.py`.
+
+### NORMAL
+- Required sources are fresh enough.
+- No degraded notice is inserted.
+
+### SOURCE_IMPAIRED
+- A redundant alert source is impaired, but a primary alert source remains healthy.
+- The cycle includes a reduced-redundancy service notice.
+
+### DEGRADED
+- One or more important data classes are stale or failing, but normal programming remains useful.
+- The cycle includes a degraded-mode service notice.
+
+### CRITICAL_DEGRADED
+- A primary/critical alert source is impaired while other sources still exist.
+- The cycle warns that watches, warnings, and advisories may be delayed or unavailable.
+
+### DETACHED
+- All enabled alert-feed paths are impaired.
+- If `health.detached_loop_only` is true, normal programming is suppressed and the cycle becomes a clear service-unavailable notice until source health recovers.
+
+Health transitions use failure thresholds, stale timers, and `health.min_hold_seconds` hysteresis so the cycle does not flap from a single transient HTTP/XMPP failure.

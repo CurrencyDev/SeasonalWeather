@@ -114,6 +114,109 @@ nwws:
 nws:
   user_agent: ""   # leave empty to use the built-in default
 
+# Public Information Statement policy. PNS is a broad/free-form product
+# family; only explicitly configured, coherent subtypes are allowed into
+# cycle audio. Tabular/report-style PNS products are suppressed from TTS.
+pns:
+  enabled: true
+  default_expire_hours: 4
+  hard_stop_delimiter: "&&"
+  suppress_unknown_audio: true
+  reject_audio_keywords:
+    - "spotter reports"
+    - "storm reports"
+    - "preliminary local storm report"
+    - "metadata"
+  subtypes:
+    - name: "severe_weather_safety_rules"
+      enabled: true
+      audio: true
+      event: "Severe Weather Safety Rules"
+      code: "SPS"
+      key_prefix: "PNS_SAFETY"
+      intro: "The National Weather Service has issued the following public information statement."
+      headline_contains:
+        - "...SEVERE WEATHER SAFETY RULES..."
+      body_contains_all: []
+      body_contains_any: []
+      reject_contains: []
+      max_fresh_hours: 18
+      require_same_day: true
+      max_chars: 2400
+    - name: "nwr_transmitter_outage"
+      enabled: true
+      audio: true
+      event: "NOAA Weather Radio Service Announcement"
+      code: "SPS"
+      key_prefix: "PNS_NWR_SERVICE"
+      intro: "This is a service announcement from the National Weather Service concerning NOAA Weather Radio transmitters in the service area."
+      headline_contains: []
+      body_contains_all:
+        - "NOAA Weather Radio"
+        - "transmitter"
+      body_contains_any:
+        - "off the air"
+        - "offline"
+        - "out of service"
+        - "technical difficulties"
+        - "maintenance"
+      reject_contains: []
+      max_fresh_hours: 48
+      require_same_day: false
+      max_chars: 1400
+    - name: "nwr_transmitter_restoration"
+      enabled: true
+      audio: true
+      event: "NOAA Weather Radio Service Announcement"
+      code: "SPS"
+      key_prefix: "PNS_NWR_SERVICE"
+      intro: "This is a service announcement from the National Weather Service concerning NOAA Weather Radio transmitters in the service area."
+      headline_contains: []
+      body_contains_all:
+        - "NOAA Weather Radio"
+        - "transmitter"
+      body_contains_any:
+        - "returned to service"
+        - "back on the air"
+        - "service has been restored"
+        - "restored"
+      reject_contains: []
+      max_fresh_hours: 24
+      require_same_day: false
+      max_chars: 1200
+
+# Runtime source-health state machine. This does not originate alerts; it
+# controls degraded-cycle presentation when SeasonalWeather loses confidence
+# in one or more upstream NWS feed paths.
+health:
+  enabled: true
+  check_interval_seconds: 30
+  min_hold_seconds: 300
+  detached_loop_only: true
+  source_impaired_message: "SeasonalWeather is operating with reduced data-feed redundancy. Some information may be delayed."
+  degraded_message: "SeasonalWeather is operating in a degraded mode. Some National Weather Service data may be delayed or unavailable."
+  critical_message: "SeasonalWeather is operating in a degraded mode. Current watches, warnings, and advisories may be delayed or unavailable."
+  detached_message: "SeasonalWeather is temporarily unable to receive current National Weather Service information. Please use another weather information source or visit weather.gov for the latest information."
+  sources:
+    nwws_oi:
+      enabled: true
+      role: "alert_redundant"
+      stale_after_seconds: 600
+      failure_threshold: 2
+      critical: false
+    cap_api:
+      enabled: true
+      role: "alert"
+      stale_after_seconds: 300
+      failure_threshold: 3
+      critical: true
+    nws_api:
+      enabled: true
+      role: "forecast"
+      stale_after_seconds: 900
+      failure_threshold: 3
+      critical: false
+
 # KLWX tone-out product types (matches the NWR tone table)
 policy:
   toneout_product_types:

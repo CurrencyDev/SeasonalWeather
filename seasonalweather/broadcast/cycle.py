@@ -448,6 +448,10 @@ class CycleContext:
     mode: str  # "normal" | "heightened"
     last_heightened_ago: Optional[str]
     last_product_desc: Optional[str]
+    health_mode: str = "normal"
+    health_notice: Optional[str] = None
+    health_status_line: Optional[str] = None
+    health_detached_loop_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -1266,6 +1270,16 @@ class CycleBuilder:
         # time_str / tz_short removed — time is now spoken by CycleConductor's
         # live 'time' segment and no longer embedded in the station ID.
 
+        # In detached/dead-feed mode, do not synthesize normal programming from
+        # potentially stale upstream products.  The conductor will keep looping
+        # this explicit service notice until source health recovers.
+        if getattr(ctx, "health_detached_loop_only", False):
+            notice = (getattr(ctx, "health_notice", None) or "SeasonalWeather is temporarily unable to receive current National Weather Service information. Please use another weather information source or visit weather.gov for the latest information.").strip()
+            return [
+                CycleSegment(key="id", title="Station service notice", text=notice),
+                CycleSegment(key="health", title="Data feed status", text=notice),
+            ]
+
         # --- Active alerts (filter to our SAME/FIPS list) ---
         alerts = await self.api.active_alerts(self.alert_areas)
         active_titles: List[str] = []
@@ -1494,6 +1508,9 @@ class CycleBuilder:
 
         # --- Station ID ---
         # --- Station ID ---
+        health_notice = (getattr(ctx, "health_notice", None) or "").strip()
+        health_status_line = (getattr(ctx, "health_status_line", None) or "").strip()
+
         if ctx.mode == "heightened":
             station_id = (
                 f"This is the SeasonalNet I P Weather Radio Station, {station_name}, "
@@ -1522,6 +1539,8 @@ class CycleBuilder:
             line = _last_product_status_line(ctx.last_product_desc, max_chars=self._cycle_cfg.last_product_max_chars if self._cycle_cfg else 260)
             if line:
                 status_bits.append(line)
+        if health_status_line:
+            status_bits.append(health_status_line)
         if active_titles:
             status_bits.append("These are the active watches, warnings, and advisories in effect: " + ", ".join(active_titles) + ".")
         else:
@@ -1531,8 +1550,10 @@ class CycleBuilder:
 
         segments: List[CycleSegment] = [
             CycleSegment(key="id", title="Station ID", text=station_id),
-            CycleSegment(key="status", title="Status", text=status_text),
         ]
+        if health_notice:
+            segments.append(CycleSegment(key="health", title="Data feed status", text=health_notice))
+        segments.append(CycleSegment(key="status", title="Status", text=status_text))
 
         # --- HWO ---
         if hwo_text:

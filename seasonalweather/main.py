@@ -78,6 +78,8 @@ from .database.bootstrap import bootstrap_database_from_config
 from .database.housekeeping import DatabaseHousekeeper
 from .database.station_feed import StationFeedRepository
 from .discord_log import DiscordLogger
+from .health_state import HealthStateMachine
+from .pns import PnsStateMachine
 
 # VTEC policy + SAME event code libraries — Orchestrator defers to these.
 from .alerts.vtec import (
@@ -1603,6 +1605,11 @@ class Orchestrator:
         self._tz = ZoneInfo(cfg.station.timezone)
         self.local_tz = self._tz  # alias for newer code paths (rebroadcast, etc.)
 
+        # Isolated policy/state machines. main.py only wires inputs/outputs;
+        # classification and health decisions live in their own modules.
+        self.pns_state = PnsStateMachine(cfg.pns, tz=self._tz)
+        self.health_state = HealthStateMachine(cfg.health)
+
         # NWWS-OI
         self.jid = cfg.secrets.nwws_jid
         self.password = cfg.secrets.nwws_password
@@ -2032,10 +2039,15 @@ class Orchestrator:
         Used by SegmentRefresher so it can build segments without holding
         a reference to the full Orchestrator.
         """
+        health = self.health_state.context()
         return CycleContext(
             mode=self.mode,
             last_heightened_ago=self._heightened_ago_str(),
             last_product_desc=self.last_product_desc,
+            health_mode=health.mode,
+            health_notice=health.notice,
+            health_status_line=health.status_line,
+            health_detached_loop_only=health.detached_loop_only,
         )
 
     def _update_mode(self) -> None:
@@ -2331,53 +2343,6 @@ class Orchestrator:
         )
 
     # ---- Spoken-script post-processing (NWWS path) ----
-    def _nws_header_issued_dt(self, text: str) -> dt.datetime | None:
-        """Parse an NWS issued-time header into local time for freshness checks."""
-        if not text:
-            return None
-        for raw in (text or "").splitlines()[:40]:
-            s = raw.strip()
-            m = _NWS_HEADER_ISSUED_RE.match(s)
-            if not m:
-                continue
-            hhmm = m.group("hhmm")
-            ampm = (m.group("ampm") or "").upper()
-            mon = m.group("mon")
-            day = int(m.group("day"))
-            year = int(m.group("year"))
-            hhmm_i = int(hhmm)
-            hour = hhmm_i // 100
-            minute = hhmm_i % 100
-            if ampm == "PM" and hour != 12:
-                hour += 12
-            if ampm == "AM" and hour == 12:
-                hour = 0
-            try:
-                naive = dt.datetime.strptime(f"{year} {mon} {day} {hour:02d}:{minute:02d}", "%Y %b %d %H:%M")
-                return naive.replace(tzinfo=self._tz)
-            except Exception:
-                continue
-        return None
-
-    def _pns_safety_is_fresh(self, text: str, parsed_issued: object = None) -> bool:
-        """Only air severe-weather safety-rules PNS products while they are still same-day and fresh."""
-        now_local = dt.datetime.now(self._tz)
-        issued_local = self._nws_header_issued_dt(text)
-        if issued_local is None:
-            issued_dt = _sf_parse_dt(parsed_issued)
-            if issued_dt is not None:
-                if issued_dt.tzinfo is None:
-                    issued_dt = issued_dt.replace(tzinfo=dt.timezone.utc)
-                issued_local = issued_dt.astimezone(self._tz)
-        if issued_local is None:
-            return False
-        age = now_local - issued_local
-        if age.total_seconds() < -300:
-            return False
-        if age > dt.timedelta(hours=18):
-            return False
-        return issued_local.date() == now_local.date()
-
     def _nws_header_issued_phrase(self, text: str) -> str | None:
         """
         Extract a nicer spoken timestamp from an NWS header line like:
@@ -3898,6 +3863,29 @@ class Orchestrator:
 
         tasks: list[asyncio.Task] = []
 
+        async def _health_probe_cap_api() -> None:
+            await self.api.active_alerts(self.cycle_builder.alert_areas)
+
+        async def _health_probe_nws_api() -> None:
+            await self.api.latest_product_id("HWO", "LWX")
+
+        self.health_state.register_probe("cap_api", _health_probe_cap_api)
+        self.health_state.register_probe("nws_api", _health_probe_nws_api)
+
+        if self.cfg.nwws.credentials_defaulted or not self.cfg.nwws.enabled:
+            self.health_state.mark_disabled("nwws_oi", "nwws_disabled")
+        if not self._cap_enabled():
+            self.health_state.mark_disabled("cap_api", "cap_disabled")
+
+        def _health_changed(_ctx) -> None:
+            try:
+                self.refresher.trigger_immediate("id", "health", "status")
+                self._schedule_cycle_refill("health-state-change")
+            except Exception:
+                log.exception("Health state change refresh failed")
+
+        tasks.append(asyncio.create_task(self.health_state.run_forever(on_change=_health_changed), name="health_state"))
+
         # CycleConductor + SegmentRefresher replace _cycle_loop,
         # _queue_cycle_once, and the old live_time_loop.
         tasks.append(asyncio.create_task(self.conductor.run(), name="conductor"))
@@ -4083,6 +4071,7 @@ class Orchestrator:
     async def _consume_nwws(self) -> None:
         while True:
             raw = await self.nwws_queue.get()
+            self.health_state.mark_success("nwws_oi")
 
             # Flood-gate: allow the client logs for the first N messages, then silence them.
             self._nwws_raw_seen += 1
@@ -4181,8 +4170,8 @@ class Orchestrator:
                 except Exception:
                     log.exception("NWWS MWS VTEC check failed wfo=%s awips=%s", parsed.wfo, parsed.awips_id or "")
 
-            # PNS cycle injection — SEVERE WEATHER SAFETY RULES bulletins go into
-            # the broadcast cycle as a voice-only segment (no cut-in, no tones).
+            # PNS cycle injection — delegated to the configurable PNS state machine.
+            # Only explicitly allowed, coherent PNS subtypes become cycle audio.
             elif (parsed.product_type or "").strip().upper() == "PNS":
                 try:
                     official_pns = parsed.raw_text
@@ -4195,43 +4184,59 @@ class Orchestrator:
                     except Exception:
                         pass
 
-                    if self._is_safety_rules_pns(official_pns):
-                        if not self._pns_safety_is_fresh(official_pns, getattr(parsed, "issued", None)):
-                            log.info("PNS safety rules skipped (stale product) wfo=%s awips=%s", parsed.wfo, parsed.awips_id or "")
-                            continue
-                        pns_script = self._build_pns_safety_script(official_pns)
-                        if pns_script.strip():
-                            pns_key = f"PNS_SAFETY:{(parsed.wfo or '').strip()}:{self._sha1_12(official_pns[:800])}"
-                            ok_pns, _ = await self._dedupe_reserve([pns_key])
-                            if ok_pns:
-                                try:
-                                    pns_exp_utc = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=4)
-                                    pns_ae = ActiveAlert(
-                                        id=pns_key,
-                                        source="PNS_CYCLE",
-                                        event="Severe Weather Safety Rules",
-                                        code="SPS",
-                                        vtec=[],
-                                        headline="Severe Weather Safety Rules",
-                                        script_text=pns_script,
-                                        audio_path=None,
-                                        expires=pns_exp_utc.isoformat(),
-                                        issued=dt.datetime.now(dt.timezone.utc).isoformat(),
-                                        same_locs=list(self.cfg.service_area.same_fips_all or []),
-                                        cycle_only=True,
-                                    )
-                                    self.alert_tracker.add_or_update(pns_ae)
-                                    self._schedule_cycle_refill("pns-safety-rules")
-                                    log.info(
-                                        "PNS SAFETY RULES queued for cycle id=%s wfo=%s awips=%s",
-                                        pns_key, parsed.wfo, parsed.awips_id or "",
-                                    )
-                                except Exception:
-                                    log.exception("PNS safety rules cycle inject failed")
-                            else:
-                                log.info("PNS safety rules skipped (dedupe) wfo=%s", parsed.wfo)
+                    decision = self.pns_state.evaluate(
+                        official_pns,
+                        wfo=parsed.wfo or "",
+                        awips_id=parsed.awips_id or "",
+                        issued=getattr(parsed, "issued", None),
+                    )
+                    if not decision.is_audio:
+                        log.info(
+                            "PNS audio suppressed; wfo=%s awips=%s action=%s subtype=%s reason=%s signals=%s",
+                            parsed.wfo,
+                            parsed.awips_id or "",
+                            decision.action,
+                            decision.subtype,
+                            decision.reason,
+                            ",".join(decision.signals) or "-",
+                        )
+                        continue
+
+                    ok_pns, _ = await self._dedupe_reserve([decision.key])
+                    if not ok_pns:
+                        log.info("PNS skipped (dedupe) id=%s subtype=%s wfo=%s", decision.key, decision.subtype, parsed.wfo)
+                        continue
+
+                    pns_exp_utc = decision.expires_utc or (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=4))
+                    pns_issued_utc = decision.issued_utc or dt.datetime.now(dt.timezone.utc)
+                    pns_ae = ActiveAlert(
+                        id=decision.key,
+                        source="PNS_CYCLE",
+                        event=decision.event,
+                        code=decision.code,
+                        vtec=[],
+                        headline=decision.headline or decision.event,
+                        script_text=decision.script_text,
+                        audio_path=None,
+                        expires=pns_exp_utc.isoformat(),
+                        issued=pns_issued_utc.isoformat(),
+                        same_locs=list(self.cfg.service_area.same_fips_all or []),
+                        cycle_only=True,
+                    )
+                    self.alert_tracker.add_or_update(pns_ae)
+                    self._schedule_cycle_refill(f"pns-{decision.subtype}")
+                    log.info(
+                        "PNS queued for cycle id=%s subtype=%s event=%s wfo=%s awips=%s expires=%s signals=%s",
+                        decision.key,
+                        decision.subtype,
+                        decision.event,
+                        parsed.wfo,
+                        parsed.awips_id or "",
+                        pns_exp_utc.isoformat(),
+                        ",".join(decision.signals) or "-",
+                    )
                 except Exception:
-                    log.exception("PNS safety rules handler error wfo=%s", parsed.wfo)
+                    log.exception("PNS handler error wfo=%s", parsed.wfo)
 
     def _cap_is_actionable(self, ev: "CapAlertEvent") -> bool:  # type: ignore[name-defined]
         try:
@@ -5405,52 +5410,6 @@ class Orchestrator:
             watch_number=watch_number,
             kind=kind,
         )
-
-    def _is_safety_rules_pns(self, text: str) -> bool:
-        """Return True if this is an NWR-style SEVERE WEATHER SAFETY RULES PNS."""
-        t = (text or "").upper()
-        return "...SEVERE WEATHER SAFETY RULES..." in t
-
-    def _build_pns_safety_script(self, official_text: str) -> str:
-        """
-        Extract clean broadcast text from a SEVERE WEATHER SAFETY RULES PNS.
-        Uses the existing alert_builder strip-and-parse pipeline.
-        """
-        from .alerts.builder import strip_nws_product_headers, _unwrap_soft_wrap, _collapse_blank_lines, _clean_line
-        from .tts.tts import clean_for_tts
-        import re as _re
-
-        text = strip_nws_product_headers(official_text or "")
-        lines_raw = [ln.rstrip() for ln in text.splitlines()]
-        lines = _unwrap_soft_wrap(lines_raw)
-
-        body: list[str] = []
-        in_body = False
-        for ln in lines:
-            s = (ln or "").strip()
-            if not in_body:
-                # Start reading at the headline marker or "National Weather Service" line
-                if s.startswith("...") or "national weather service" in s.lower():
-                    in_body = True
-                else:
-                    continue
-            if s.startswith(("&&", "$$")):
-                break
-            if not s:
-                body.append("")
-                continue
-            cleaned = _clean_line(s)
-            if cleaned:
-                body.append(cleaned)
-
-        body = _collapse_blank_lines(body)
-        script_raw = "\n".join(body)
-
-        intro = "The National Weather Service has issued the following public information statement."
-        script = clean_for_tts(script_raw)
-        if not script.strip():
-            return ""
-        return intro + "\n\n" + script
 
     def _build_cap_full_script(self, ev: "CapAlertEvent") -> str:  # type: ignore[name-defined]
         event = self._clean_cap_text(ev.event or "", limit=120)
