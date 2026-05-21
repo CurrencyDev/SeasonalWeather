@@ -79,7 +79,7 @@ from .database.housekeeping import DatabaseHousekeeper
 from .database.station_feed import StationFeedRepository
 from .discord_log import DiscordLogger
 from .health_state import HealthStateMachine
-from .pns import PnsStateMachine
+from .broadcast.pns import PnsStateMachine
 
 # VTEC policy + SAME event code libraries — Orchestrator defers to these.
 from .alerts.vtec import (

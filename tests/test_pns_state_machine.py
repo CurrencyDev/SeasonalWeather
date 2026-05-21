@@ -2,7 +2,7 @@ import datetime as dt
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
-from seasonalweather.pns import PnsStateMachine
+from seasonalweather.broadcast.pns import PnsStateMachine
 
 
 def _cfg():

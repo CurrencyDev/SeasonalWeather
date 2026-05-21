@@ -15,15 +15,15 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 from zoneinfo import ZoneInfo
 
-from .alerts.builder import (
+from ..alerts.builder import (
     _clean_line,
     _collapse_blank_lines,
     _unwrap_soft_wrap,
     strip_nws_product_headers,
 )
-from .tts.tts import clean_for_tts
+from ..tts.tts import clean_for_tts
 
-log = logging.getLogger("seasonalweather.pns")
+log = logging.getLogger("seasonalweather.broadcast.pns")
 
 _NWS_HEADER_ISSUED_RE = re.compile(
     r"^(?P<hhmm>\d{3,4})\s*(?P<ampm>AM|PM)\s*(?P<tz>[A-Z]{2,4})\s+"
