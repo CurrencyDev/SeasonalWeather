@@ -413,7 +413,7 @@ class PnsStateMachine:
         self.policy = policy_from_config(cfg)
         self.tz = tz
 
-    def evaluate(self, raw_text: str, *, wfo: str = "", awips_id: str = "", issued: Any = None) -> PnsDecision:
+    def evaluate(self, raw_text: str, *, wfo: str = "", awips_id: str = "", issued: Any = None, now: Any = None) -> PnsDecision:
         if not self.policy.enabled:
             return PnsDecision(action="disabled", reason="pns_disabled")
 
@@ -423,7 +423,10 @@ class PnsStateMachine:
 
         issued_utc = parse_nws_header_issued_dt(text, fallback=issued)
         exp_utc = parse_ugc_expiry_utc(text, issued_utc)
-        now_utc = dt.datetime.now(dt.timezone.utc)
+        if now is None:
+            now_utc = dt.datetime.now(dt.timezone.utc)
+        else:
+            now_utc = _parse_dt(now) or dt.datetime.now(dt.timezone.utc)
         if exp_utc is None:
             base = issued_utc or now_utc
             exp_utc = base + dt.timedelta(hours=max(0.25, self.policy.default_expire_hours))
@@ -478,7 +481,7 @@ class PnsStateMachine:
                 expires_utc=exp_utc,
             )
 
-        now_local = dt.datetime.now(self.tz)
+        now_local = now_utc.astimezone(self.tz)
         if issued_utc is None:
             return PnsDecision(action="stale", subtype=subtype.name, event=subtype.event, code=subtype.code, reason="missing_issued_time", signals=signals, expires_utc=exp_utc)
         issued_local = issued_utc.astimezone(self.tz)

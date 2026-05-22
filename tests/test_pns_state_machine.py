@@ -34,7 +34,13 @@ will be offline until further notice due to technical difficulties.
 $$
 """
     pns = PnsStateMachine(_cfg(), tz=ZoneInfo("America/New_York"))
-    decision = pns.evaluate(text, wfo="KLWX", awips_id="PNSLWX", issued=dt.datetime.now(dt.timezone.utc).isoformat())
+    decision = pns.evaluate(
+        text,
+        wfo="KLWX",
+        awips_id="PNSLWX",
+        issued=dt.datetime(2026, 5, 21, 13, 0, tzinfo=dt.timezone.utc).isoformat(),
+        now=dt.datetime(2026, 5, 21, 14, 0, tzinfo=dt.timezone.utc),
+    )
 
     assert decision.action == "audio"
     assert decision.subtype == "nwr_transmitter_outage"
@@ -79,7 +85,13 @@ MARYLAND
 $$
 """
     pns = PnsStateMachine(_cfg(), tz=ZoneInfo("America/New_York"))
-    decision = pns.evaluate(text, wfo="KLWX", awips_id="PNSLWX", issued=dt.datetime.now(dt.timezone.utc).isoformat())
+    decision = pns.evaluate(
+        text,
+        wfo="KLWX",
+        awips_id="PNSLWX",
+        issued=dt.datetime(2026, 5, 21, 13, 0, tzinfo=dt.timezone.utc).isoformat(),
+        now=dt.datetime(2026, 5, 21, 14, 0, tzinfo=dt.timezone.utc),
+    )
 
     assert decision.action == "ui_only"
     assert not decision.is_audio

@@ -68,6 +68,7 @@ Agents working in this repository must prefer small, reversible changes that pre
 - `scripts/wrappers/` — canonical runtime wrapper scripts installed to `/usr/local/bin/` by bootstrap; version-controlled here, do not regenerate inline
 - `scripts/preflight/` — preflight helper scripts installed to `/usr/local/sbin/` by bootstrap
 - `scripts/install-samedec.sh` — pinned Rust `samedec` installer used by bootstrap; keep version changes deliberate and documented
+- Future Rust SAME encoder tooling is named `samegen`; keep the Python SAME encoder as the safe fallback unless explicitly changing that contract.
 - `scripts/00-bootstrap.sh` — single deploy entry point; uses `install_repo_wrapper` to install from `scripts/wrappers/`; see `docs/runtime-wrappers.md`
 
 ## Preferred change style
@@ -83,6 +84,7 @@ Before considering a change complete, verify:
 - the service restarts cleanly
 - handled-alerts JSON still renders valid objects
 - Discord logging still produces sane embeds when applicable
+- generated-audio housekeeping does not delete DB-referenced active/cycle audio
 - no new absolute paths or local environment assumptions were introduced
 
 ## Avoid

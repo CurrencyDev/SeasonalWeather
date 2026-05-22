@@ -33,6 +33,21 @@ DEFAULT_ORG = "WXR"
 DEFAULT_SENDER = "SEASNWXR"         # must be 8 chars in the header; we clamp/pad
 
 
+def _normalize_three_char_code(value: str, default: str) -> str:
+    s = (value or "").strip().upper()
+    s = "".join(ch for ch in s if ("A" <= ch <= "Z") or ("0" <= ch <= "9"))
+    if len(s) != 3:
+        return default
+    return s
+
+
+def _normalize_same_location(value: str) -> str | None:
+    digits = "".join(ch for ch in str(value or "").strip() if ch.isdigit())
+    if not digits:
+        return None
+    return digits.zfill(6)[:6]
+
+
 def _clamp_sender(sender: str) -> str:
     s = (sender or "").strip().upper()
     if not s:
@@ -71,10 +86,10 @@ def chunk_locations(locs: Sequence[str], max_per: int = SAME_MAX_LOCS) -> List[L
         if not s:
             continue
         # SAME PSSCCC are 6 digits (P + state + county); keep numeric only, zero-pad
-        s = "".join(ch for ch in s if ch.isdigit())
-        if not s:
+        loc = _normalize_same_location(s)
+        if loc is None:
             continue
-        cleaned.append(s.zfill(6)[:6])
+        cleaned.append(loc)
     cleaned = sorted(set(cleaned))
     if not cleaned:
         return [[]]
@@ -94,8 +109,8 @@ class SameHeader:
     issued_utc: datetime
 
     def as_ascii(self) -> str:
-        org = (self.org or DEFAULT_ORG).strip().upper()[:3]
-        event = (self.event or "CEM").strip().upper()[:3]
+        org = _normalize_three_char_code(self.org, DEFAULT_ORG)
+        event = _normalize_three_char_code(self.event, "CEM")
 
         dt = self.issued_utc.astimezone(timezone.utc)
         jjj = _julian_day(dt)
@@ -105,7 +120,8 @@ class SameHeader:
 
         # ZCZC-ORG-EEE-PSSCCC-PSSCCC+TTTT-JJJHHMM-LLLLLLLL-
         # NOTE: The spec’s spaces are for clarity only; do not include spaces.
-        loc_part = "-".join(self.locations) if self.locations else "000000"
+        locs = [_normalize_same_location(x) for x in self.locations]
+        loc_part = "-".join(x for x in locs if x is not None) or "000000"
         return f"ZCZC-{org}-{event}-{loc_part}+{tttt}-{jjj:03d}{hhmm}-{llllllll}-"
 
 

@@ -690,6 +690,9 @@ class DatabaseHousekeepingConfig:
     startup_delay_seconds: int
     api_command_retention_days: int
     audio_asset_grace_seconds: int
+    generated_audio_retention_seconds: int
+    generated_audio_max_bytes: int
+    tmp_file_grace_seconds: int
     wal_checkpoint: bool
 
 
@@ -1450,6 +1453,9 @@ def load_config(path: str) -> AppConfig:
             startup_delay_seconds=int(db_hk_raw.get("startup_delay_seconds", 45)),
             api_command_retention_days=int(db_hk_raw.get("api_command_retention_days", 14)),
             audio_asset_grace_seconds=int(db_hk_raw.get("audio_asset_grace_seconds", 900)),
+            generated_audio_retention_seconds=int(db_hk_raw.get("generated_audio_retention_seconds", 86400)),
+            generated_audio_max_bytes=int(db_hk_raw.get("generated_audio_max_bytes", 1073741824)),
+            tmp_file_grace_seconds=int(db_hk_raw.get("tmp_file_grace_seconds", 900)),
             wal_checkpoint=bool(db_hk_raw.get("wal_checkpoint", True)),
         ),
     )
