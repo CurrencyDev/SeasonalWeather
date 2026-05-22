@@ -32,7 +32,8 @@ SeasonalWeather can generate **valid SAME headers** and **1050 Hz attention tone
 
 - **NWWS-OI (XMPP)** ingest — room monitoring for alert payloads from NWS.
 - **NWS API** ingest — forecasts, observations, hazardous weather outlooks, area forecast discussions.
-- **CAP ingest** — active alerts polling via `api.weather.gov/alerts/active`.
+- **NWS JSON-LD/GeoJSON ingest** — active alerts polling via `api.weather.gov/alerts/active`.
+- **FEMA CAP ingest** - CAP XML formatted alerts polling via `https://apps.fema.gov/IPAWSOPEN_EAS_SERVICE/rest/eas/recent/`
 - **GWES-ERN / ERN-JON** — Level 3 stream monitoring; decodes live SAME headers from a radio stream and relays qualifying events.
 
 ### Alert behavior
@@ -295,6 +296,19 @@ Generate a test alert WAV and optionally push it into the Liquidsoap queue:
 ```
 
 ---
+
+## SAME encoding
+
+SeasonalWeather uses a custom Rust `samegen` binary for fast SAME encoding for alerts it generates with SAME tones when `native_encoder` is enabled and the binary is installed and present. 
+
+The `samegen` binary is located in `tools/samegen` from the repo root, and is currently not installed by default. 
+
+Configuration flags:
+
+- `enabled:` — use `samegen` when available, otherwise, fall back to the Python encoder.
+- `bin:` — What custom binary to use.
+- `timeout_seconds:` — self explanatory time out for waiting for the Rust encoder to finish.
+- `fallback_to_python:` — use Python native encoder if `samegen` binary is not present but enabled.
 
 ## GWES-ERN SAME decoding
 
