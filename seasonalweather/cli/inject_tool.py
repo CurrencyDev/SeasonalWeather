@@ -270,6 +270,7 @@ def _render_alert_block_wav(
         amplitude=float(same_amp),
         burst_count=3,
         inter_burst_pause_seconds=float(same_pause),
+        native_encoder=cfg.same.native_encoder,
     )
     render_same_eom_wav(
         same_eom,
@@ -277,6 +278,7 @@ def _render_alert_block_wav(
         amplitude=float(same_amp),
         burst_count=3,
         inter_burst_pause_seconds=float(same_pause),
+        native_encoder=cfg.same.native_encoder,
     )
 
     tts = TTS(

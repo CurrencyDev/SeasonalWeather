@@ -58,3 +58,96 @@ def test_render_same_bursts_wav_writes_stereo_pcm(tmp_path) -> None:
         assert wf.getsampwidth() == 2
         assert wf.getframerate() == 48000
         assert wf.getnframes() > 0
+
+from types import SimpleNamespace
+
+import pytest
+
+from seasonalweather.same.same import SameNativeEncoderError, render_same_eom_wav
+
+
+def _write_fake_samegen(path, *, exit_code: int = 0) -> None:
+    if exit_code == 0:
+        body = """#!/usr/bin/env python3
+import sys
+import wave
+from pathlib import Path
+
+args = sys.argv[1:]
+out = Path(args[args.index('--out') + 1])
+out.parent.mkdir(parents=True, exist_ok=True)
+with wave.open(str(out), 'wb') as wf:
+    wf.setnchannels(2)
+    wf.setsampwidth(2)
+    wf.setframerate(48000)
+    wf.writeframes((123).to_bytes(2, 'little', signed=True) * 2)
+"""
+    else:
+        body = f"""#!/usr/bin/env python3
+import sys
+print('fake samegen failed', file=sys.stderr)
+sys.exit({exit_code})
+"""
+    path.write_text(body, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def test_render_same_bursts_uses_native_samegen_when_enabled(tmp_path) -> None:
+    fake = tmp_path / "samegen"
+    _write_fake_samegen(fake)
+    out = tmp_path / "native.wav"
+
+    render_same_bursts_wav(
+        out,
+        "ZCZC-WXR-RWT-024033+0015-1421345-SEASNWXR-",
+        sample_rate=48000,
+        native_encoder=SimpleNamespace(
+            enabled=True,
+            bin=str(fake),
+            timeout_seconds=10.0,
+            fallback_to_python=False,
+        ),
+    )
+
+    with wave.open(str(out), "rb") as wf:
+        assert wf.getnframes() == 1
+
+
+def test_render_same_bursts_falls_back_to_python_when_native_fails(tmp_path) -> None:
+    fake = tmp_path / "samegen"
+    _write_fake_samegen(fake, exit_code=9)
+    out = tmp_path / "fallback.wav"
+
+    render_same_bursts_wav(
+        out,
+        "ZCZC-WXR-RWT-024033+0015-1421345-SEASNWXR-",
+        sample_rate=48000,
+        burst_count=1,
+        inter_burst_pause_seconds=0.0,
+        native_encoder=SimpleNamespace(
+            enabled=True,
+            bin=str(fake),
+            timeout_seconds=10.0,
+            fallback_to_python=True,
+        ),
+    )
+
+    with wave.open(str(out), "rb") as wf:
+        assert wf.getnframes() > 1
+
+
+def test_render_same_bursts_raises_when_native_fallback_disabled(tmp_path) -> None:
+    fake = tmp_path / "samegen"
+    _write_fake_samegen(fake, exit_code=9)
+
+    with pytest.raises(SameNativeEncoderError):
+        render_same_eom_wav(
+            tmp_path / "no-fallback.wav",
+            sample_rate=48000,
+            native_encoder=SimpleNamespace(
+                enabled=True,
+                bin=str(fake),
+                timeout_seconds=10.0,
+                fallback_to_python=False,
+            ),
+        )

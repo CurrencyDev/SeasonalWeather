@@ -76,7 +76,7 @@ class DatabaseHousekeeper:
         return max(60, int(getattr(self.cfg.database.housekeeping, "audio_asset_grace_seconds", 900) or 900))
 
     def _generated_audio_retention_seconds(self) -> int:
-        return max(3600, int(getattr(self.cfg.database.housekeeping, "generated_audio_retention_seconds", 86400) or 86400))
+        return max(3600, int(getattr(self.cfg.database.housekeeping, "generated_audio_retention_seconds", 10800) or 86400))
 
     def _generated_audio_max_bytes(self) -> int:
         return max(0, int(getattr(self.cfg.database.housekeeping, "generated_audio_max_bytes", 1073741824) or 0))

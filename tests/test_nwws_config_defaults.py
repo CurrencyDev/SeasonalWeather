@@ -37,3 +37,17 @@ def test_real_nwws_credentials_keep_nwws_enabled(monkeypatch) -> None:
 
     assert cfg.nwws.enabled is True
     assert cfg.nwws.credentials_defaulted is False
+
+
+def test_same_native_encoder_defaults_to_safe_python_fallback(monkeypatch) -> None:
+    _set_required_env(
+        monkeypatch,
+        nwws_jid="test-user@nwws-oi.weather.gov",
+        nwws_password="not-the-default",
+    )
+
+    cfg = load_config(str(REPO_ROOT / "config/config.yaml"))
+
+    assert cfg.same.native_encoder.enabled is False
+    assert cfg.same.native_encoder.bin == "samegen"
+    assert cfg.same.native_encoder.fallback_to_python is True

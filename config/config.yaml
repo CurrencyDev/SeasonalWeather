@@ -263,6 +263,11 @@ same:
   sender: "SEASNWXR"          # 8-char SAME sender ID
   duration_minutes: 60         # default event duration hint
   amplitude: 0.35              # SAME burst amplitude (0.0–1.0)
+  native_encoder:
+    enabled: false             # optional Rust samegen encoder; Python remains fallback
+    bin: "samegen"
+    timeout_seconds: 5.0
+    fallback_to_python: true
 
 # CAP ingest via NWS alerts API
 cap:
@@ -540,7 +545,7 @@ database:
     startup_delay_seconds: 45    # give startup/import a moment before first pass
     api_command_retention_days: 14
     audio_asset_grace_seconds: 900
-    generated_audio_retention_seconds: 86400  # prune unreferenced generated WAVs older than 24h
+    generated_audio_retention_seconds: 10800  # prune unreferenced generated WAVs older than 3h
     generated_audio_max_bytes: 1073741824     # soft cap: delete oldest unreferenced generated WAVs above 1GiB
     tmp_file_grace_seconds: 900               # prune stale temp files after 15m
     wal_checkpoint: true

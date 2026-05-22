@@ -6652,6 +6652,7 @@ class Orchestrator:
                             hdr_msg,
                             sample_rate=self.cfg.audio.sample_rate,
                             amplitude=self._same_amplitude(),
+                            native_encoder=self.cfg.same.native_encoder,
                         )
                         hdr_wavs.append(hw)
 
@@ -6674,6 +6675,7 @@ class Orchestrator:
                         same_eom_wav,
                         sample_rate=self.cfg.audio.sample_rate,
                         amplitude=self._same_amplitude(),
+                        native_encoder=self.cfg.same.native_encoder,
                     )
 
                     log.info(
@@ -6787,6 +6789,7 @@ class Orchestrator:
                             hdr_msg,
                             sample_rate=self.cfg.audio.sample_rate,
                             amplitude=self._same_amplitude(),
+                            native_encoder=self.cfg.same.native_encoder,
                         )
                         hdr_wavs.append(hw)
 
@@ -6808,6 +6811,7 @@ class Orchestrator:
                         same_eom_wav,
                         sample_rate=self.cfg.audio.sample_rate,
                         amplitude=self._same_amplitude(),
+                        native_encoder=self.cfg.same.native_encoder,
                     )
             except Exception:
                 same_hdr_all = None

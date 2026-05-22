@@ -11,13 +11,15 @@
 
 from __future__ import annotations
 
+import logging
 import math
+import subprocess
 import wave
 from array import array
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import Any, Iterable, List, Sequence, Tuple
 
 
 # NWSI 10-1712 Appendix A (SAME on NWR)
@@ -31,6 +33,101 @@ SAME_MAX_LOCS = 31                  # max PSSCCC blocks per header
 
 DEFAULT_ORG = "WXR"
 DEFAULT_SENDER = "SEASNWXR"         # must be 8 chars in the header; we clamp/pad
+
+log = logging.getLogger(__name__)
+
+
+class SameNativeEncoderError(RuntimeError):
+    """Raised when the optional native SAME encoder fails and fallback is disabled."""
+
+
+def _native_attr(native_encoder: Any, name: str, default: Any) -> Any:
+    if native_encoder is None:
+        return default
+    if isinstance(native_encoder, dict):
+        return native_encoder.get(name, default)
+    return getattr(native_encoder, name, default)
+
+
+def _native_encoder_enabled(native_encoder: Any) -> bool:
+    return bool(_native_attr(native_encoder, "enabled", False))
+
+
+def _native_encoder_fallback_enabled(native_encoder: Any) -> bool:
+    return bool(_native_attr(native_encoder, "fallback_to_python", True))
+
+
+def _try_render_same_bursts_native(
+    out_wav: Path,
+    message_ascii: str,
+    *,
+    sample_rate: int,
+    amplitude: float,
+    burst_count: int,
+    inter_burst_pause_seconds: float,
+    native_encoder: Any,
+) -> bool:
+    if not _native_encoder_enabled(native_encoder):
+        return False
+
+    binary = str(_native_attr(native_encoder, "bin", "samegen") or "samegen")
+    timeout_seconds = float(_native_attr(native_encoder, "timeout_seconds", 5.0))
+    cmd = [
+        binary,
+        "encode",
+        "--message",
+        str(message_ascii or ""),
+        "--out",
+        str(out_wav),
+        "--sample-rate",
+        str(int(sample_rate)),
+        "--amplitude",
+        str(float(amplitude)),
+        "--bursts",
+        str(max(1, int(burst_count))),
+        "--pause-seconds",
+        str(float(inter_burst_pause_seconds)),
+    ]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=max(0.1, timeout_seconds),
+        )
+    except FileNotFoundError as exc:
+        raise SameNativeEncoderError(f"native SAME encoder not found: {binary}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise SameNativeEncoderError(f"native SAME encoder timed out after {timeout_seconds:.1f}s: {binary}") from exc
+    except OSError as exc:
+        raise SameNativeEncoderError(f"native SAME encoder failed to start: {binary}: {exc}") from exc
+
+    if proc.returncode != 0:
+        stderr = (proc.stderr or proc.stdout or "").strip()
+        detail = f": {stderr}" if stderr else ""
+        raise SameNativeEncoderError(f"native SAME encoder exited {proc.returncode}: {binary}{detail}")
+
+    if not out_wav.exists() or out_wav.stat().st_size <= 0:
+        raise SameNativeEncoderError(f"native SAME encoder did not produce output: {out_wav}")
+
+    try:
+        with wave.open(str(out_wav), "rb") as wf:
+            channels = int(wf.getnchannels())
+            sample_width = int(wf.getsampwidth())
+            rendered_rate = int(wf.getframerate())
+            frames = int(wf.getnframes())
+    except wave.Error as exc:
+        raise SameNativeEncoderError(f"native SAME encoder wrote unreadable WAV: {out_wav}: {exc}") from exc
+
+    if channels != 2 or sample_width != 2 or rendered_rate != int(sample_rate) or frames <= 0:
+        raise SameNativeEncoderError(
+            "native SAME encoder wrote invalid WAV "
+            f"(channels={channels}, sample_width={sample_width}, sample_rate={rendered_rate}, frames={frames})"
+        )
+
+    return True
 
 
 def _normalize_three_char_code(value: str, default: str) -> str:
@@ -210,7 +307,7 @@ def _concat_pcm(parts: Sequence[array]) -> array:
     return out
 
 
-def render_same_bursts_wav(
+def _render_same_bursts_wav_python(
     out_wav: Path,
     message_ascii: str,
     *,
@@ -245,6 +342,44 @@ def render_same_bursts_wav(
     _write_pcm_mono_to_stereo_wav(out_wav, pcm, sample_rate)
 
 
+def render_same_bursts_wav(
+    out_wav: Path,
+    message_ascii: str,
+    *,
+    sample_rate: int,
+    amplitude: float = 0.35,
+    burst_count: int = 3,
+    inter_burst_pause_seconds: float = 1.0,
+    native_encoder: Any = None,
+) -> None:
+    """Render a SAME burst WAV, optionally using native samegen with Python fallback."""
+    if _native_encoder_enabled(native_encoder):
+        try:
+            if _try_render_same_bursts_native(
+                out_wav,
+                message_ascii,
+                sample_rate=sample_rate,
+                amplitude=amplitude,
+                burst_count=burst_count,
+                inter_burst_pause_seconds=inter_burst_pause_seconds,
+                native_encoder=native_encoder,
+            ):
+                return
+        except SameNativeEncoderError:
+            if not _native_encoder_fallback_enabled(native_encoder):
+                raise
+            log.warning("Native SAME encoder failed; falling back to Python renderer", exc_info=True)
+
+    _render_same_bursts_wav_python(
+        out_wav,
+        message_ascii,
+        sample_rate=sample_rate,
+        amplitude=amplitude,
+        burst_count=burst_count,
+        inter_burst_pause_seconds=inter_burst_pause_seconds,
+    )
+
+
 def render_same_eom_wav(
     out_wav: Path,
     *,
@@ -252,6 +387,7 @@ def render_same_eom_wav(
     amplitude: float = 0.35,
     burst_count: int = 3,
     inter_burst_pause_seconds: float = 1.0,
+    native_encoder: Any = None,
 ) -> None:
     # EOM is “NNNN” with preamble, repeated three times
     render_same_bursts_wav(
@@ -261,4 +397,5 @@ def render_same_eom_wav(
         amplitude=amplitude,
         burst_count=burst_count,
         inter_burst_pause_seconds=inter_burst_pause_seconds,
+        native_encoder=native_encoder,
     )

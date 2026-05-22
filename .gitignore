@@ -29,3 +29,8 @@ seasonalweather/_graveyard_*.tar.gz
 # dev box stuff
 # ==============
 tools/print_cycle_preview.py
+# ===========
+# Rust
+# ===========
+target/
+**/target/

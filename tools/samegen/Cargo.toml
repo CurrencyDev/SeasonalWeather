@@ -1,0 +1,9 @@
+[package]
+name = "samegen"
+version = "0.1.0"
+edition = "2021"
+description = "Small SAME/EAS AFSK WAV encoder for SeasonalWeather"
+
+[[bin]]
+name = "samegen"
+path = "src/main.rs"

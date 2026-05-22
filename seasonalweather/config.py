@@ -329,11 +329,20 @@ class PolicyConfig:
 # --- same ---
 
 @dataclass(frozen=True)
+class SameNativeEncoderConfig:
+    enabled: bool
+    bin: str
+    timeout_seconds: float
+    fallback_to_python: bool
+
+
+@dataclass(frozen=True)
 class SameConfig:
     enabled: bool
     sender: str
     duration_minutes: int
     amplitude: float
+    native_encoder: SameNativeEncoderConfig
 
 
 # --- cap ---
@@ -1117,11 +1126,18 @@ def load_config(path: str) -> AppConfig:
     # same
     # ------------------------------------------------------------------
     sa = raw.get("same", {})
+    same_native_raw = sa.get("native_encoder", {}) or {}
     same = SameConfig(
         enabled=bool(sa.get("enabled", False)),
         sender=str(sa.get("sender", "SEASNWXR")),
         duration_minutes=int(sa.get("duration_minutes", 60)),
         amplitude=float(sa.get("amplitude", 0.35)),
+        native_encoder=SameNativeEncoderConfig(
+            enabled=bool(same_native_raw.get("enabled", False)),
+            bin=str(same_native_raw.get("bin", "samegen") or "samegen"),
+            timeout_seconds=float(same_native_raw.get("timeout_seconds", 5.0)),
+            fallback_to_python=bool(same_native_raw.get("fallback_to_python", True)),
+        ),
     )
 
     # ------------------------------------------------------------------
@@ -1453,7 +1469,7 @@ def load_config(path: str) -> AppConfig:
             startup_delay_seconds=int(db_hk_raw.get("startup_delay_seconds", 45)),
             api_command_retention_days=int(db_hk_raw.get("api_command_retention_days", 14)),
             audio_asset_grace_seconds=int(db_hk_raw.get("audio_asset_grace_seconds", 900)),
-            generated_audio_retention_seconds=int(db_hk_raw.get("generated_audio_retention_seconds", 86400)),
+            generated_audio_retention_seconds=int(db_hk_raw.get("generated_audio_retention_seconds", 10800)),
             generated_audio_max_bytes=int(db_hk_raw.get("generated_audio_max_bytes", 1073741824)),
             tmp_file_grace_seconds=int(db_hk_raw.get("tmp_file_grace_seconds", 900)),
             wal_checkpoint=bool(db_hk_raw.get("wal_checkpoint", True)),
