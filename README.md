@@ -301,7 +301,7 @@ Generate a test alert WAV and optionally push it into the Liquidsoap queue:
 
 SeasonalWeather uses a custom Rust `samegen` binary for fast SAME encoding for alerts it generates with SAME tones when `native_encoder` is enabled and the binary is installed and present. 
 
-The `samegen` binary is located in `tools/samegen` from the repo root, and is currently not installed by default. 
+The `samegen` binary is located in `tools/samegen` from the repo root, and is currently not provisioned and installed by the bootstrapper. 
 
 Configuration flags:
 
