@@ -143,6 +143,7 @@ _PHEN_SIG_TO_SAME: dict[str, str] = {
     # Flash Flood
     "FF.W": "FFW",  "FF.A": "FFA",
     # Flood (riverine, areal)
+    "FA.W": "FLW",  "FA.A": "FLA",
     "FL.W": "FLW",  "FL.A": "FLA",
     # Winter Storm
     "WS.W": "WSW",  "WS.A": "WSA",
@@ -631,6 +632,11 @@ _TEST_VECTORS: list[tuple[str, str, str | None, str]] = [
         "/O.NEW.KLWX.CF.W.0003.260325T1400Z-260325T1800Z/",
         "FULL", "CFW",
         "CF.W NEW — Coastal Flood Warning, should FULL",
+    ),
+    (
+        "/O.NEW.KLWX.FA.W.0003.260527T1515Z-260527T1900Z/",
+        "FULL", "FLW",
+        "FA.W NEW — Areal Flood Warning carried in FLW product, should FULL as FLW",
     ),
     (
         "/O.NEW.KLWX.CF.A.0001.260325T1400Z-260325T1800Z/",
