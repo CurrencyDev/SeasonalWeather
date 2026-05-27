@@ -730,6 +730,32 @@ def parse_nwws_product_segments(product_text: str) -> list[NwwsProductSegment]:
     return [s for s in segments if s.actions]
 
 
+def _ensure_sentence(text: str) -> str:
+    s = (text or "").strip()
+    if s and not s.endswith((".", "!", "?")):
+        s += "."
+    return s
+
+
+def _reason_starts_with_event_terminal_scope(event_label: str, reason_text: str) -> bool:
+    """Return true when body prose already contains a scoped terminal line."""
+    event = re.sub(r"\s+", " ", (event_label or "").strip())
+    reason = re.sub(r"\s+", " ", (reason_text or "").strip())
+    if not event or not reason:
+        return False
+
+    event_re = re.escape(event)
+    terminal_re = (
+        rf"^the\s+{event_re}\s+(?:"
+        r"is\s+cancelled|has\s+been\s+cancelled|"
+        r"will\s+expire|has\s+expired|"
+        r"has\s+been\s+allowed\s+to\s+expire|"
+        r"will\s+be\s+allowed\s+to\s+expire"
+        r")\b"
+    )
+    return re.search(terminal_re, reason, flags=re.IGNORECASE) is not None
+
+
 def build_nwws_partial_cancel_script(
     event_label: str,
     segments: list[NwwsProductSegment],
@@ -762,21 +788,27 @@ def build_nwws_partial_cancel_script(
 
     for seg in can_segs:
         area = seg.area_text or "some areas"
-        lines.append(_headline_or_fallback(
-            seg,
-            f"The {event} has been cancelled for the following areas: {area}.",
-        ))
-        if seg.reason_text:
-            lines.append(f"{seg.reason_text.rstrip('.')}.")
+        if _reason_starts_with_event_terminal_scope(event, seg.reason_text):
+            lines.append(_ensure_sentence(seg.reason_text))
+        else:
+            lines.append(_headline_or_fallback(
+                seg,
+                f"The {event} has been cancelled for the following areas: {area}.",
+            ))
+            if seg.reason_text:
+                lines.append(_ensure_sentence(seg.reason_text))
 
     for seg in exp_segs:
         area = seg.area_text or "some areas"
-        lines.append(_headline_or_fallback(
-            seg,
-            f"The {event} has been allowed to expire for the following areas: {area}.",
-        ))
-        if seg.reason_text:
-            lines.append(f"{seg.reason_text.rstrip('.')}.")
+        if _reason_starts_with_event_terminal_scope(event, seg.reason_text):
+            lines.append(_ensure_sentence(seg.reason_text))
+        else:
+            lines.append(_headline_or_fallback(
+                seg,
+                f"The {event} has been allowed to expire for the following areas: {area}.",
+            ))
+            if seg.reason_text:
+                lines.append(_ensure_sentence(seg.reason_text))
 
     for seg in con_segs:
         area = seg.area_text or "other areas"
@@ -794,6 +826,37 @@ def build_nwws_partial_cancel_script(
         return ""
     lines.append("End of message.")
     return "\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
+
+
+def build_nwws_terminal_cancel_expiry_script(
+    event_label: str,
+    product_text: str,
+) -> str:
+    """
+    Build detailed narration for a pure NWWS CAN/EXP product.
+
+    Unlike expiry_summary_script(), this keeps product body prose that names the
+    cancelled/expired area and remaining public instructions.  It intentionally
+    refuses mixed continuation products; those stay on the partial-cancel path.
+    """
+    segments = parse_nwws_product_segments(product_text)
+    if not segments:
+        return ""
+
+    terminal_actions = {"CAN", "EXP"}
+    continuing_actions = {"CON", "EXT", "EXA", "EXB", "NEW"}
+    terminal_segments: list[NwwsProductSegment] = []
+
+    for seg in segments:
+        if seg.actions & continuing_actions:
+            return ""
+        if seg.actions & terminal_actions:
+            terminal_segments.append(seg)
+
+    if len(terminal_segments) != len(segments):
+        return ""
+
+    return build_nwws_partial_cancel_script(event_label, terminal_segments)
 
 
 # ---------------------------------------------------------------------------
@@ -1313,6 +1376,7 @@ __all__ = [
     "NwwsProductSegment",
     "parse_nwws_product_segments",
     "build_nwws_partial_cancel_script",
+    "build_nwws_terminal_cancel_expiry_script",
     "extract_nwws_wcn_area_desc",
     "match_nwws_wcn_area_same",
     "build_nwws_watch_vtec_script",

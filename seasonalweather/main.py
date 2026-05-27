@@ -65,6 +65,7 @@ from .broadcast.product_text import (
     build_statement_vtec_action_script as _build_statement_vtec_action_script_fn,
     build_warning_vtec_action_script as _build_warning_vtec_action_script_fn,
     build_nwws_partial_cancel_script as _build_nwws_partial_cancel_script,
+    build_nwws_terminal_cancel_expiry_script as _build_nwws_terminal_cancel_expiry_script,
     build_nwws_watch_vtec_script as _build_nwws_watch_vtec_script,
     build_nwws_watch_partial_cancel_script as _build_nwws_watch_partial_cancel_script,
     extract_nwws_wcn_area_desc as _extract_nwws_wcn_area_desc,
@@ -6321,16 +6322,36 @@ class Orchestrator:
                             )
                         else:
                             # Warning-class full cancel/expiry.
-                            summ = self._expiry_summary_script(official_text)
-                            if summ:
-                                spoken.script = summ
+                            # Hydrologic statements often carry scoped cancellation
+                            # prose and public instructions that are too important to
+                            # collapse into a one-sentence "has ended" summary.
+                            hydrologic_terminal_script = ""
+                            if (parsed.product_type or "").strip().upper() in {"FLS", "FFS"}:
+                                hydrologic_terminal_script = _build_nwws_terminal_cancel_expiry_script(
+                                    sf_event_label,
+                                    official_text,
+                                )
+
+                            if hydrologic_terminal_script:
+                                spoken.script = hydrologic_terminal_script
                                 log.info(
-                                    'NWWS EXP/CAN summary enabled (act=%s type=%s awips=%s wfo=%s)',
+                                    'NWWS hydrologic terminal CAN/EXP script built (act=%s type=%s awips=%s wfo=%s)',
                                     ','.join(sorted(vtec_actions))[:64],
                                     parsed.product_type,
                                     parsed.awips_id or '',
                                     parsed.wfo,
                                 )
+                            else:
+                                summ = self._expiry_summary_script(official_text)
+                                if summ:
+                                    spoken.script = summ
+                                    log.info(
+                                        'NWWS EXP/CAN summary enabled (act=%s type=%s awips=%s wfo=%s)',
+                                        ','.join(sorted(vtec_actions))[:64],
+                                        parsed.product_type,
+                                        parsed.awips_id or '',
+                                        parsed.wfo,
+                                    )
             except Exception:
                 log.exception('NWWS EXP/CAN summary failed; continuing with original script')
 

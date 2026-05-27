@@ -1,6 +1,7 @@
 from seasonalweather.alerts.vtec import VTEC_FIND_RE, toneout_policy
 from seasonalweather.broadcast.product_text import (
     build_nwws_partial_cancel_script,
+    build_nwws_terminal_cancel_expiry_script,
     expiry_summary_script,
     parse_nwws_product_segments,
 )
@@ -201,6 +202,56 @@ def test_partial_can_con_svs_preserves_sentence_boundaries_and_skips_labels():
     assert "Expect wind damage to roofs, siding, and trees." in script
     assert "Stay inside a well built structure and keep away from windows." in script
 
+
+
+FLS_CAN_FA_W = """147
+WGUS81 KLWX 271737
+FLSLWX
+
+Flood Statement
+National Weather Service Baltimore MD/Washington DC
+137 PM EDT Wed May 27 2026
+
+MDC001-271747-
+/O.CAN.KLWX.FA.W.0003.000000T0000Z-260527T1900Z/
+/00000.0.ER.000000T0000Z.000000T0000Z.000000T0000Z.OO/
+Allegany MD-
+137 PM EDT Wed May 27 2026
+
+...FLOOD WARNING IS CANCELLED...
+
+The Flood Warning is cancelled for a portion of western Maryland,
+including the following area, Allegany.
+
+Flood waters have receded. The heavy rain has ended. Flooding is no
+longer expected to pose a threat. Please continue to heed remaining
+road closures.
+
+&&
+
+LAT...LON 3955 7899 3953 7899 3951 7899 3950 7901
+      3947 7903 3948 7904 3948 7905 3947 7905
+      3947 7906 3948 7906 3951 7905 3954 7903
+      3956 7903 3955 7901
+
+$$
+
+KJP
+"""
+
+
+def test_fls_terminal_cancel_keeps_scoped_cancellation_prose():
+    assert expiry_summary_script(FLS_CAN_FA_W) == "The heavy rain has ended.\nEnd of message."
+
+    script = build_nwws_terminal_cancel_expiry_script("Flood Warning", FLS_CAN_FA_W)
+
+    assert "The Flood Warning is cancelled for a portion of western Maryland" in script
+    assert "including the following area, Allegany" in script
+    assert "Flood waters have receded" in script
+    assert "Flooding is no longer expected to pose a threat" in script
+    assert "Please continue to heed remaining road closures" in script
+    assert "Flood warning is cancelled.\nThe Flood Warning is cancelled" not in script
+    assert script.endswith("End of message.")
 
 EXP_SVS = """246
 WWUS51 KLWX 201855
