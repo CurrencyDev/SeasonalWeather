@@ -81,6 +81,7 @@ from .database.station_feed import StationFeedRepository
 from .discord_log import DiscordLogger
 from .health_state import HealthStateMachine
 from .broadcast.pns import PnsStateMachine
+from .broadcast.ern_script import build_ern_relay_script as _build_ern_relay_script
 
 # VTEC policy + SAME event code libraries — Orchestrator defers to these.
 from .alerts.vtec import (
@@ -5502,23 +5503,6 @@ class Orchestrator:
         concat_wavs(out, [pre, tts_wav, post])
         return out
 
-    def _build_ern_relay_script(self, ev: "ErnSameEvent") -> str:  # type: ignore[name-defined]
-        code = (ev.event or "").strip().upper()
-        sender = (ev.sender or "").strip()
-
-        if code == "RWT":
-            main = "This is a relay of a Required Weekly Test received via the Emergency Relay Network. This is only a test."
-        elif code == "RMT":
-            main = "This is a relay of a Required Monthly Test received via the Emergency Relay Network. This is only a test."
-        else:
-            main = "This is a relay message received via the Emergency Relay Network."
-
-        lines = [main]
-        if sender:
-            lines.append(f"Sender: {sender}.")
-        lines.append("End of message.")
-        return "\n".join(lines)
-
     # ------------------------------------------------------------------
     # IPAWS CAP ingest
     # ------------------------------------------------------------------
@@ -5977,7 +5961,28 @@ class Orchestrator:
                 continue
 
 
-            script = self._build_ern_relay_script(ev)
+            sf_ev = ev
+            area_text = ""
+            try:
+                area_text = await self._sf_area_text_from_same_codes(in_area_locs)
+                if area_text:
+                    try:
+                        setattr(sf_ev, "area", area_text)
+                    except Exception:
+                        try:
+                            sf_ev = SimpleNamespace(**getattr(ev, "__dict__", {}))
+                            setattr(sf_ev, "area", area_text)
+                        except Exception:
+                            sf_ev = ev
+            except Exception:
+                area_text = ""
+
+            script = _build_ern_relay_script(
+                ev,
+                same_locations=in_area_locs,
+                area_text=area_text,
+                tz=self._tz,
+            )
             dummy = SimpleNamespace(product_type=code, awips_id=None, wfo="ERN", raw_text="")
 
             out_wav = await self._render_alert_audio(dummy, script, same_locations=in_area_locs)
@@ -6013,21 +6018,6 @@ class Orchestrator:
                 out_wav,
             )
             # _ERN_DL_
-            sf_ev = ev
-            area_text = ""
-            try:
-                area_text = await self._sf_area_text_from_same_codes(in_area_locs)
-                if area_text:
-                    try:
-                        setattr(sf_ev, "area", area_text)
-                    except Exception:
-                        try:
-                            sf_ev = SimpleNamespace(**getattr(ev, "__dict__", {}))
-                            setattr(sf_ev, "area", area_text)
-                        except Exception:
-                            sf_ev = ev
-            except Exception:
-                area_text = ""
             self.discord.alert_aired(
                 code=code,
                 event=_same_label_or_code(code),
