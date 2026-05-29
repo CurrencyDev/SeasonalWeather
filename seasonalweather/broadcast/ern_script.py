@@ -128,25 +128,25 @@ def build_ern_relay_script(
 
     area = str(area_text or "").strip()
     if area:
-        lines.append(_sentence(f"The decoded SAME header applies to: {area}"))
+        lines.append(_sentence(f"The message applies to the following locations: {area}"))
     else:
         same_text = _join_human([str(x).strip() for x in (same_locations or []) if str(x).strip()])
         if same_text:
-            lines.append(_sentence(f"Affected SAME locations: {same_text}"))
+            lines.append(_sentence(f"The message applies to the following SAME locations: {same_text}"))
 
     start_utc = _same_jday_to_utc(getattr(ev, "jjjhhmm", None), now_utc=now_utc)
     duration_min = _parse_duration_minutes(getattr(ev, "tttt", None))
     if start_utc is not None and duration_min is not None:
         end_utc = start_utc + dt.timedelta(minutes=duration_min)
         lines.append(
-            f"SAME header time: {_fmt_when(start_utc, tz=tz)}. "
-            f"Valid until {_fmt_when(end_utc, tz=tz)}."
+            f"The message is valid from: {_fmt_when(start_utc, tz=tz)}. "
+            f"And the message is valid until: {_fmt_when(end_utc, tz=tz)}."
         )
     elif start_utc is not None:
-        lines.append(f"SAME header time: {_fmt_when(start_utc, tz=tz)}.")
+        lines.append(f"The message is valid from: {_fmt_when(start_utc, tz=tz)}.")
 
     if sender:
-        lines.append(f"Sender: {sender}.")
+        lines.append(f"The message was received from: {sender}.")
 
     lines.append("End of message.")
     return "\n".join(line.strip() for line in lines if line and line.strip())
