@@ -66,6 +66,8 @@ Freeze products are supported natively. `FZ.W` maps to SAME `FZW` (**Freeze Warn
 
 - Runs under **systemd** (units included in `systemd/`).
 - HTTP control API (localhost-only by default) for status, cycle control, and audio injection.
+- OpenAPI 3.1 API document at `/openapi.json`; Swagger UI remains available at `/docs`.
+- RFC 9457 Problem Details error responses (`application/problem+json`) with `code`, `details`, and `request_id` extensions for operator/debug use.
 - Public handled-alerts feed API (`/v1/handled-alerts`) for external UI consumption, with `handled-alerts.json` kept as a legacy compatibility mirror.
 
 ---
@@ -164,6 +166,14 @@ VOICETEXT_PAUL_WINEDEBUG=-all,+seh,+tid,+timestamp
 ```
 
 Everything else that was previously in `.env` (SEASONAL_CAP_*, SEASONAL_ERN_*, SEASONAL_TESTS_*, SEASONAL_CYCLE_*, VOICETEXT_PAUL_RETRIES, etc.) is now in `config.yaml`.
+
+## HTTP API contract
+
+The SeasonalWeather API publishes an OpenAPI 3.1 document at `/openapi.json` and interactive Swagger UI at `/docs`. The document includes the public station-feed routes and authenticated control-plane routes.
+
+Successful JSON endpoints use `application/json`. API errors use RFC 9457 Problem Details with `application/problem+json`; callers should read the standard `type`, `title`, `status`, `detail`, and `instance` members and may also use the SeasonalWeather extensions `code`, `details`, `errors`, and `request_id`. The same request identifier is returned in the `X-Request-ID` response header.
+
+`/v1/handled-alerts` remains public and cacheable for SPA/radio clients. Authenticated routes require Bearer tokens and mutating JSON routes require an `Idempotency-Key` header.
 
 For the wrapper install/runtime contract, see `docs/runtime-wrappers.md`.
 

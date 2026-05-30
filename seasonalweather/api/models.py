@@ -220,6 +220,15 @@ class AudioUploadAccepted(ApiModel):
     expires_at: str
 
 
-class ErrorEnvelope(ApiModel):
-    error: dict[str, Any]
+class ProblemDetails(BaseModel):
+    model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
+
+    type: str
+    title: str
+    status: int = Field(ge=100, le=599)
+    detail: str | None = None
+    instance: str | None = None
+    code: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+    errors: list[dict[str, Any]] | None = None
     request_id: str

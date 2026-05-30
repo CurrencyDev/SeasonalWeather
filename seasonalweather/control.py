@@ -272,7 +272,7 @@ class OrchestratorControl:
         return {
             "ok": liquidsoap_ok,
             "liquidsoap_telnet": {"reachable": liquidsoap_ok},
-            "api": {"version": "1.0"},
+            "api": {"version": "1.1.0"},
         }
 
     async def get_status(self) -> dict[str, Any]:

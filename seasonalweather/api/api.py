@@ -2,38 +2,102 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
+from http import HTTPStatus
 from typing import Any, Awaitable, Callable
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Response, UploadFile
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from .auth import ApiPrincipal, require_scopes
+from .commands import CommandNotFoundError, CommandStore, IdempotencyConflictError
 from .models import (
     AudioUploadAccepted,
     ClearHeightenedModeRequest,
     CommandAccepted,
     CommandSnapshot,
     ConfigReloadRequest,
-    ErrorEnvelope,
     OriginateAudioRequest,
     OriginateTestRequest,
     OriginateTextRequest,
+    ProblemDetails,
     RebuildCycleRequest,
     SetHeightenedModeRequest,
 )
-from .auth import ApiPrincipal, get_api_principal, require_scopes
-from .commands import CommandNotFoundError, CommandStore, IdempotencyConflictError
+from .openapi import (
+    API_VERSION,
+    PROBLEM_JSON,
+    PUBLIC_PROBLEM_RESPONSES,
+    STANDARD_PROBLEM_RESPONSES,
+    install_openapi,
+    json_response,
+)
 from ..control import ControlError, OrchestratorControl
 
 
-def _request_id() -> str:
+_CODE_RE = re.compile(r"[^a-z0-9_-]+")
+
+
+def _new_request_id() -> str:
     return f"req_{uuid.uuid4().hex[:16]}"
 
 
-def _error_response(*, status_code: int, request_id: str, code: str, message: str, details: dict[str, Any] | None = None) -> JSONResponse:
-    payload = ErrorEnvelope(error={"code": code, "message": message, "details": details or {}}, request_id=request_id)
-    return JSONResponse(status_code=status_code, content=payload.model_dump(mode="json"))
+def _request_id(request: Request) -> str:
+    header = (request.headers.get("x-request-id") or "").strip()
+    if header and len(header) <= 128 and all(ch.isprintable() and not ch.isspace() for ch in header):
+        return header
+    return _new_request_id()
+
+
+def _status_title(status_code: int) -> str:
+    try:
+        return HTTPStatus(status_code).phrase
+    except ValueError:
+        return "HTTP error"
+
+
+def _problem_type(code: str) -> str:
+    slug = _CODE_RE.sub("-", code.strip().lower().replace("_", "-")).strip("-")
+    return f"/problems/{slug or 'http-error'}"
+
+
+def _problem_response(
+    request: Request,
+    *,
+    status_code: int,
+    code: str,
+    detail: str,
+    title: str | None = None,
+    details: dict[str, Any] | None = None,
+    errors: list[dict[str, Any]] | None = None,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    request_id = _request_id(request)
+    response_headers = dict(headers or {})
+    response_headers["X-Request-ID"] = request_id
+    response_headers.setdefault("Cache-Control", "no-store")
+
+    payload = ProblemDetails(
+        type=_problem_type(code),
+        title=title or _status_title(status_code),
+        status=status_code,
+        detail=detail,
+        instance=str(request.url.path),
+        code=code,
+        details=details or {},
+        errors=errors,
+        request_id=request_id,
+    )
+    return JSONResponse(
+        status_code=status_code,
+        content=payload.model_dump(mode="json", exclude_none=True),
+        media_type=PROBLEM_JSON,
+        headers=response_headers,
+    )
 
 
 def _command_accepted(record: Any, *, replayed: bool) -> CommandAccepted:
@@ -100,59 +164,157 @@ async def _execute_command(
     return _command_accepted(record, replayed=False)
 
 
+def _detail_code_message(detail: Any) -> tuple[str, str, dict[str, Any]]:
+    if isinstance(detail, dict):
+        code = str(detail.get("code") or "http_error")
+        message = str(detail.get("message") or detail.get("detail") or "HTTP error")
+        raw_details = detail.get("details")
+        details = raw_details if isinstance(raw_details, dict) else {}
+        return code, message, details
+    return "http_error", str(detail or "HTTP error"), {}
+
+
 def create_app(control: OrchestratorControl, *, store: CommandStore | None = None) -> FastAPI:
     command_store = store or CommandStore()
-    app = FastAPI(title="SeasonalWeather Control API", version="1.0")
+    app = FastAPI(
+        title="SeasonalWeather API",
+        version=API_VERSION,
+        openapi_version="3.1.0",
+        docs_url="/docs",
+        redoc_url="/redoc",
+        swagger_ui_parameters={"defaultModelsExpandDepth": 1},
+    )
     app.state.control = control
     app.state.command_store = command_store
+    install_openapi(app)
 
     @app.exception_handler(RequestValidationError)
     async def _handle_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
-        return _error_response(
+        errors = jsonable_encoder(exc.errors())
+        return _problem_response(
+            request,
             status_code=422,
-            request_id=_request_id(),
             code="request_validation_failed",
-            message="Request body, path, query, or header validation failed.",
-            details={"errors": exc.errors()},
+            detail="Request body, path, query, or header validation failed.",
+            details={"errors": errors},
+            errors=errors,
         )
 
     @app.exception_handler(HTTPException)
-    async def _handle_http_exception(request: Request, exc: HTTPException) -> JSONResponse:
-        detail = exc.detail if isinstance(exc.detail, dict) else {"code": "http_error", "message": str(exc.detail)}
-        return _error_response(
+    async def _handle_fastapi_http_exception(request: Request, exc: HTTPException) -> JSONResponse:
+        code, message, details = _detail_code_message(exc.detail)
+        return _problem_response(
+            request,
             status_code=exc.status_code,
-            request_id=_request_id(),
-            code=str(detail.get("code") or "http_error"),
-            message=str(detail.get("message") or "HTTP error"),
-            details=detail.get("details") if isinstance(detail.get("details"), dict) else {},
+            code=code,
+            detail=message,
+            details=details,
+            headers=exc.headers,
         )
 
-    @app.get("/healthz")
+    @app.exception_handler(StarletteHTTPException)
+    async def _handle_starlette_http_exception(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+        code, message, details = _detail_code_message(exc.detail)
+        if code == "http_error":
+            code = "not_found" if exc.status_code == 404 else "http_error"
+        return _problem_response(
+            request,
+            status_code=exc.status_code,
+            code=code,
+            detail=message if message != "HTTP error" else _status_title(exc.status_code),
+            details=details,
+            headers=getattr(exc, "headers", None),
+        )
+
+    @app.exception_handler(Exception)
+    async def _handle_unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
+        return _problem_response(
+            request,
+            status_code=500,
+            code="internal_error",
+            detail="Unhandled server error.",
+        )
+
+    @app.get(
+        "/healthz",
+        tags=["status"],
+        summary="Return API and Liquidsoap health.",
+        responses={
+            200: json_response("Health payload.", {"$ref": "#/components/schemas/Health"}),
+            **STANDARD_PROBLEM_RESPONSES,
+        },
+    )
     async def healthz(principal: ApiPrincipal = Depends(require_scopes("read:health"))) -> dict[str, Any]:
         return await control.get_health()
 
-    @app.get("/v1/health")
+    @app.get(
+        "/v1/health",
+        tags=["status"],
+        summary="Return API and Liquidsoap health.",
+        responses={
+            200: json_response("Health payload.", {"$ref": "#/components/schemas/Health"}),
+            **STANDARD_PROBLEM_RESPONSES,
+        },
+    )
     async def v1_health(principal: ApiPrincipal = Depends(require_scopes("read:health"))) -> dict[str, Any]:
         return await control.get_health()
 
-    @app.get("/v1/status")
+    @app.get(
+        "/v1/status",
+        tags=["status"],
+        summary="Return runtime status for the station automation process.",
+        responses={
+            200: json_response("Runtime status payload.", {"$ref": "#/components/schemas/RuntimeStatus"}),
+            **STANDARD_PROBLEM_RESPONSES,
+        },
+    )
     async def v1_status(principal: ApiPrincipal = Depends(require_scopes("read:status"))) -> dict[str, Any]:
         return await control.get_status()
 
-    @app.get("/v1/handled-alerts")
+    @app.get(
+        "/v1/handled-alerts",
+        tags=["station-feed"],
+        summary="Return the public handled-alerts station feed.",
+        responses={
+            200: json_response("Station handled-alerts feed.", {"$ref": "#/components/schemas/StationFeed"}),
+            **PUBLIC_PROBLEM_RESPONSES,
+        },
+    )
     async def v1_handled_alerts(response: Response) -> dict[str, Any]:
         response.headers["Cache-Control"] = "public, max-age=2, stale-while-revalidate=30"
         return await control.get_public_handled_alerts()
 
-    @app.get("/v1/station-feed")
+    @app.get(
+        "/v1/station-feed",
+        tags=["station-feed"],
+        summary="Return the authenticated station feed read model.",
+        responses={
+            200: json_response("Station feed payload.", {"$ref": "#/components/schemas/StationFeed"}),
+            **STANDARD_PROBLEM_RESPONSES,
+        },
+    )
     async def v1_station_feed(principal: ApiPrincipal = Depends(require_scopes("read:alerts"))) -> dict[str, Any]:
         return await control.get_station_feed()
 
-    @app.get("/v1/config/summary")
+    @app.get(
+        "/v1/config/summary",
+        tags=["configuration"],
+        summary="Return a safe runtime configuration summary.",
+        responses={
+            200: json_response("Configuration summary payload.", {"$ref": "#/components/schemas/ConfigSummary"}),
+            **STANDARD_PROBLEM_RESPONSES,
+        },
+    )
     async def v1_config_summary(principal: ApiPrincipal = Depends(require_scopes("read:config"))) -> dict[str, Any]:
         return await control.get_config_summary()
 
-    @app.get("/v1/commands/{command_id}", response_model=CommandSnapshot)
+    @app.get(
+        "/v1/commands/{command_id}",
+        response_model=CommandSnapshot,
+        tags=["commands"],
+        summary="Return a command snapshot by command ID.",
+        responses=STANDARD_PROBLEM_RESPONSES,
+    )
     async def v1_command(command_id: str, principal: ApiPrincipal = Depends(require_scopes("read:status"))) -> CommandSnapshot:
         try:
             record = await command_store.get(command_id)
@@ -160,7 +322,13 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
             raise HTTPException(status_code=404, detail={"code": "command_not_found", "message": "Command was not found."}) from exc
         return _command_snapshot(record)
 
-    @app.post("/v1/cycle/rebuild", response_model=CommandAccepted)
+    @app.post(
+        "/v1/cycle/rebuild",
+        response_model=CommandAccepted,
+        tags=["control"],
+        summary="Rebuild the normal station cycle.",
+        responses=STANDARD_PROBLEM_RESPONSES,
+    )
     async def v1_cycle_rebuild(
         req: RebuildCycleRequest,
         principal: ApiPrincipal = Depends(require_scopes("control:cycle")),
@@ -177,7 +345,13 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
             success_event="cycle.rebuild.completed",
         )
 
-    @app.post("/v1/mode/heightened", response_model=CommandAccepted)
+    @app.post(
+        "/v1/mode/heightened",
+        response_model=CommandAccepted,
+        tags=["control"],
+        summary="Set heightened mode for a bounded duration.",
+        responses=STANDARD_PROBLEM_RESPONSES,
+    )
     async def v1_mode_heightened(
         req: SetHeightenedModeRequest,
         principal: ApiPrincipal = Depends(require_scopes("control:mode")),
@@ -194,7 +368,13 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
             success_event="mode.changed",
         )
 
-    @app.delete("/v1/mode/heightened", response_model=CommandAccepted)
+    @app.delete(
+        "/v1/mode/heightened",
+        response_model=CommandAccepted,
+        tags=["control"],
+        summary="Clear heightened mode.",
+        responses=STANDARD_PROBLEM_RESPONSES,
+    )
     async def v1_mode_heightened_clear(
         req: ClearHeightenedModeRequest,
         principal: ApiPrincipal = Depends(require_scopes("control:mode")),
@@ -211,7 +391,13 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
             success_event="mode.changed",
         )
 
-    @app.post("/v1/tests/originate", response_model=CommandAccepted)
+    @app.post(
+        "/v1/tests/originate",
+        response_model=CommandAccepted,
+        tags=["origination"],
+        summary="Originate a configured RWT or RMT test.",
+        responses=STANDARD_PROBLEM_RESPONSES,
+    )
     async def v1_tests_originate(
         req: OriginateTestRequest,
         principal: ApiPrincipal = Depends(require_scopes("control:tests")),
@@ -228,7 +414,13 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
             success_event="alert.originated",
         )
 
-    @app.post("/v1/uploads/audio", response_model=AudioUploadAccepted)
+    @app.post(
+        "/v1/uploads/audio",
+        response_model=AudioUploadAccepted,
+        tags=["origination"],
+        summary="Stage a WAV upload for later manual audio origination.",
+        responses=STANDARD_PROBLEM_RESPONSES,
+    )
     async def v1_upload_audio(
         file: UploadFile = File(...),
         principal: ApiPrincipal = Depends(require_scopes("control:audio")),
@@ -245,7 +437,13 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
             raise HTTPException(status_code=exc.status_code, detail=exc.to_dict()) from exc
         return AudioUploadAccepted.model_validate(payload)
 
-    @app.post("/v1/originate/text", response_model=CommandAccepted)
+    @app.post(
+        "/v1/originate/text",
+        response_model=CommandAccepted,
+        tags=["origination"],
+        summary="Originate a manual text alert.",
+        responses=STANDARD_PROBLEM_RESPONSES,
+    )
     async def v1_originate_text(
         req: OriginateTextRequest,
         principal: ApiPrincipal = Depends(require_scopes("control:originate")),
@@ -262,7 +460,13 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
             success_event="alert.originated",
         )
 
-    @app.post("/v1/originate/audio", response_model=CommandAccepted)
+    @app.post(
+        "/v1/originate/audio",
+        response_model=CommandAccepted,
+        tags=["origination"],
+        summary="Originate a manual alert from a staged audio asset.",
+        responses=STANDARD_PROBLEM_RESPONSES,
+    )
     async def v1_originate_audio(
         req: OriginateAudioRequest,
         principal: ApiPrincipal = Depends(require_scopes("control:originate")),
@@ -279,7 +483,13 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
             success_event="alert.originated",
         )
 
-    @app.post("/v1/config/reload", response_model=CommandAccepted)
+    @app.post(
+        "/v1/config/reload",
+        response_model=CommandAccepted,
+        tags=["configuration"],
+        summary="Reload runtime configuration where hot reload is safe.",
+        responses=STANDARD_PROBLEM_RESPONSES,
+    )
     async def v1_config_reload(
         req: ConfigReloadRequest,
         principal: ApiPrincipal = Depends(require_scopes("control:config")),
@@ -296,7 +506,18 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
             success_event="config.reloaded",
         )
 
-    @app.get("/v1/events")
+    @app.get(
+        "/v1/events",
+        tags=["commands"],
+        summary="Stream command and control-plane events as Server-Sent Events.",
+        responses={
+            200: {
+                "description": "Server-Sent Event stream.",
+                "content": {"text/event-stream": {"schema": {"type": "string"}}},
+            },
+            **STANDARD_PROBLEM_RESPONSES,
+        },
+    )
     async def v1_events(principal: ApiPrincipal = Depends(require_scopes("read:status"))) -> StreamingResponse:
         queue = await command_store.broker.subscribe()
 
