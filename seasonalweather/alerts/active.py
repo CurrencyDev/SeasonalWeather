@@ -1,37 +1,30 @@
 """
-active_alerts.py — Persistent active-alert registry for the broadcast cycle.
+active_alerts.py — persistent active-alert registry for the broadcast cycle.
 
-All alert types that produce audio (CAP FULL, CAP UPDATE, CAP VOICE, NWWS FULL/VOICE,
-ERN relay, PNS cycle-only) are registered here while they are active.
+All alert-like audio that should remain in cycle rotation is registered here
+while active: CAP, NWWS-OI, IPAWS, ERN relay, and allowed PNS cycle-only
+statements.
 
-On restart, active entries are re-queued as voice-only cycle segments replicating
-NWR rebroadcast behaviour — you never lose a watch or warning from the air because
-the process restarted.
+The SQLite active_alerts tables are authoritative.  Legacy JSON sidecar
+compatibility was removed so active state cannot diverge from the database.
 
-Design principles:
-  - Single asyncio event loop; no extra locking needed (Python GIL + single-threaded).
-  - Atomic write: write to .tmp, then os.replace → crash-safe.
-  - Schema-versioned JSON so we can add fields without breaking existing state files.
-  - All callers should treat IDs as strings and prefer VTEC-derived keys for
-    watch/warning events so updates find the same slot as the original.
+Cycle order is operational-priority driven, not arrival-order driven:
+warnings/emergencies before watches, watches before advisories, advisories
+before statements, then low-priority service/PNS statements.
 """
 from __future__ import annotations
 
 import datetime as dt
-import json
 import logging
-import os
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from ..database.alerts import AlertStateRepository
 from ..database.core import SeasonalDatabase
 
 log = logging.getLogger("seasonalweather.active_alerts")
-
-_SCHEMA_VERSION = 2
 
 
 def _parse_iso_dt(value: str | None) -> dt.datetime:
@@ -65,6 +58,80 @@ def _vtec_track_id(vtec_str: str) -> str | None:
     if not m:
         return None
     return f"{m.group('office')}.{m.group('phen')}.{m.group('sig')}.{m.group('etn')}"
+
+
+_SOURCE_RANK: dict[str, int] = {
+    "IPAWS": 0,
+    "CAP": 1,
+    "NWWS": 1,
+    "ERN": 4,
+    "PNS_CYCLE": 8,
+}
+
+_CRITICAL_CODES: frozenset[str] = frozenset({
+    "EAN", "EVI", "CEM", "LAE", "CDW", "NUW", "RHW", "LEW",
+    "TOE", "TOR", "FFW", "SVR", "SMW", "EWW",
+})
+_WATCH_CODES: frozenset[str] = frozenset({"TOA", "SVA", "FFA", "HUA", "WSA", "TRA"})
+_ADVISORY_CODES: frozenset[str] = frozenset({
+    "ADR", "CAE", "CFW", "CFA", "EWW", "FAW", "FLW", "FLS", "HLS",
+    "SPS", "SVS", "MWS", "NPW", "WSW",
+})
+
+
+def _vtec_significance_rank(alert: "ActiveAlert") -> int | None:
+    """Return a severity bucket from VTEC significance when present."""
+    best: int | None = None
+    for tid in alert.vtec_track_ids():
+        parts = tid.split(".")
+        if len(parts) != 4:
+            continue
+        sig = parts[2].upper()
+        if sig == "W":
+            rank = 0
+        elif sig == "A":
+            rank = 10
+        elif sig == "Y":
+            rank = 20
+        elif sig == "S":
+            rank = 30
+        else:
+            rank = 40
+        best = rank if best is None else min(best, rank)
+    return best
+
+
+def alert_priority_sort_key(alert: "ActiveAlert") -> tuple[int, int, dt.datetime, str]:
+    """
+    Sort key for on-air active-alert rotation.
+
+    Lower buckets are more important.  Chronology is only a tie-breaker inside
+    the same operational class; it must never cause a statement to outrank a
+    watch or a watch to outrank a warning.
+    """
+    vtec_rank = _vtec_significance_rank(alert)
+    code = (alert.code or "").strip().upper()
+    event = (alert.event or alert.headline or "").strip().lower()
+    source = (alert.source or "").strip().upper()
+
+    if source == "PNS_CYCLE":
+        severity = 60
+    elif vtec_rank is not None:
+        severity = vtec_rank
+    elif code in _CRITICAL_CODES or "emergency" in event or "warning" in event:
+        severity = 0
+    elif code in _WATCH_CODES or "watch" in event:
+        severity = 10
+    elif code in _ADVISORY_CODES or "advisory" in event:
+        severity = 20
+    elif "statement" in event or source == "ERN":
+        severity = 30
+    else:
+        severity = 40
+
+    source_rank = _SOURCE_RANK.get(source, 5)
+    first_seen = _parse_iso_dt(alert.first_aired or alert.issued)
+    return (severity, source_rank, first_seen, alert.id)
 
 
 @dataclass
@@ -155,8 +222,8 @@ class AlertTracker:
     """
     Registry of currently active alerts for the broadcast cycle.
 
-    Persists atomically to *state_path* — service restarts do not lose
-    active watches or warnings from the on-air rotation.
+    Persists to the configured SQLite alert-state repository — service
+    restarts do not lose active watches or warnings from the on-air rotation.
 
     All callers run in the same asyncio event loop so no extra asyncio.Lock
     is required (Python GIL + single-threaded asyncio protect the dict).
@@ -167,6 +234,85 @@ class AlertTracker:
         self._alerts: dict[str, ActiveAlert] = {}
         self._db = database
         self._repo = AlertStateRepository(database) if database is not None else None
+        self._on_change: Callable[[str], None] | None = None
+        self._warned_no_repo = False
+
+    def set_change_callback(self, callback: Callable[[str], None] | None) -> None:
+        """Install a synchronous best-effort callback for tracker mutations."""
+        self._on_change = callback
+
+    def _emit_change(self, reason: str) -> None:
+        if self._on_change is None:
+            return
+        try:
+            self._on_change(reason)
+        except Exception:
+            log.debug("AlertTracker: change callback failed reason=%s", reason, exc_info=True)
+
+    @staticmethod
+    def _loc_set(values: list[str] | None) -> set[str]:
+        return {str(v).strip() for v in (values or []) if str(v).strip()}
+
+    def _remove_shadowed_ern_relays_for(self, alert: ActiveAlert) -> int:
+        """
+        Drop ERN relay entries once an authoritative CAP/NWWS/IPAWS entry fully
+        covers the same SAME-code/location set.
+        """
+        source = (alert.source or "").strip().upper()
+        if source == "ERN":
+            return 0
+        code = (alert.code or "").strip().upper()
+        authoritative_locs = self._loc_set(alert.same_locs)
+        if not code or not authoritative_locs:
+            return 0
+
+        removed = 0
+        for aid, existing in list(self._alerts.items()):
+            if (existing.source or "").strip().upper() != "ERN":
+                continue
+            if (existing.code or "").strip().upper() != code:
+                continue
+            relay_locs = self._loc_set(existing.same_locs)
+            if relay_locs and relay_locs.issubset(authoritative_locs):
+                self._alerts.pop(aid, None)
+                removed += 1
+                log.info(
+                    "AlertTracker: removed shadowed ERN relay id=%s code=%s authoritative=%s",
+                    aid, code, alert.id,
+                )
+        return removed
+
+    def remove_matching_source(
+        self,
+        *,
+        source: str,
+        code: str | None = None,
+        same_locs: list[str] | None = None,
+        reason: str = "",
+    ) -> int:
+        """Remove active alerts from one source matching code and SAME coverage."""
+        source_u = (source or "").strip().upper()
+        code_u = (code or "").strip().upper()
+        wanted_locs = self._loc_set(same_locs)
+        removed = 0
+        for aid, existing in list(self._alerts.items()):
+            if (existing.source or "").strip().upper() != source_u:
+                continue
+            if code_u and (existing.code or "").strip().upper() != code_u:
+                continue
+            existing_locs = self._loc_set(existing.same_locs)
+            if wanted_locs and existing_locs and not existing_locs.issubset(wanted_locs) and not wanted_locs.issubset(existing_locs):
+                continue
+            self._alerts.pop(aid, None)
+            removed += 1
+            log.info(
+                "AlertTracker: removed source=%s id=%s code=%s reason=%s",
+                source_u, aid, existing.code, reason,
+            )
+        if removed:
+            self._persist()
+            self._emit_change(f"remove-matching:{source_u}:{reason}")
+        return removed
 
     # ------------------------------------------------------------------ #
     #  Mutation                                                            #
@@ -183,8 +329,10 @@ class AlertTracker:
             alert.airing_count = max(int(prev.airing_count or 0), int(alert.airing_count or 0))
             if alert.watch_number is None:
                 alert.watch_number = prev.watch_number
+        self._remove_shadowed_ern_relays_for(alert)
         self._alerts[alert.id] = alert
         self._persist()
+        self._emit_change(f"add-or-update:{alert.source}:{alert.id}")
 
     def remove(self, alert_id: str) -> bool:
         """Remove by ID. Returns True if it existed."""
@@ -192,6 +340,7 @@ class AlertTracker:
         if existed:
             self._alerts.pop(alert_id)
             self._persist()
+            self._emit_change(f"remove:{alert_id}")
         return existed
 
     def mark_aired(self, alert_id: str) -> None:
@@ -210,22 +359,24 @@ class AlertTracker:
         if a:
             a.audio_path = audio_path
             self._persist()
+            self._emit_change(f"update-audio:{alert_id}")
 
     def update_script(self, alert_id: str, script_text: str) -> None:
         a = self._alerts.get(alert_id)
         if a:
             a.script_text = script_text
             self._persist()
+            self._emit_change(f"update-script:{alert_id}")
 
     # ------------------------------------------------------------------ #
     #  Queries                                                             #
     # ------------------------------------------------------------------ #
 
     def get_active(self, now: Optional[dt.datetime] = None) -> list[ActiveAlert]:
-        """Return non-expired alerts sorted by first-seen chronology (oldest first)."""
+        """Return non-expired alerts sorted by operational priority."""
         now = now or dt.datetime.now(dt.timezone.utc)
         active = [a for a in self._alerts.values() if not a.is_expired(now)]
-        active.sort(key=lambda a: (_parse_iso_dt(a.first_aired or a.issued), _parse_iso_dt(a.issued), a.id))
+        active.sort(key=alert_priority_sort_key)
         return active
 
     def get_cycle_alerts(self, now: Optional[dt.datetime] = None) -> list[ActiveAlert]:
@@ -256,6 +407,7 @@ class AlertTracker:
             self._alerts.pop(aid)
         if dead:
             self._persist()
+            self._emit_change(f"purge-expired:{len(dead)}")
         return len(dead)
 
     def remove_by_vtec_tracks(self, track_ids: set[str], reason: str = "") -> int:
@@ -279,92 +431,44 @@ class AlertTracker:
                     break
         if removed:
             self._persist()
+            self._emit_change(f"remove-by-vtec:{reason}")
         return removed
 
     # ------------------------------------------------------------------ #
     #  Persistence                                                         #
     # ------------------------------------------------------------------ #
 
-    def _load_from_legacy_json(self) -> int:
-        if not self._path.exists():
+    def load(self) -> int:
+        """Load state from SQLite when the database is enabled."""
+        self._alerts = {}
+        if self._repo is None:
+            log.warning("AlertTracker: SQLite repository unavailable; active-alert state is memory-only")
             return 0
         try:
-            with open(self._path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-            if not isinstance(payload, dict):
-                return 0
-            alerts_raw = payload.get("active_alerts", [])
-            loaded = 0
-            _known_fields = set(ActiveAlert.__dataclass_fields__.keys())
-            for raw in alerts_raw:
-                if not isinstance(raw, dict):
-                    continue
-                try:
-                    kwargs = {k: raw[k] for k in _known_fields if k in raw}
-                    a = ActiveAlert(**kwargs)  # type: ignore[arg-type]
-                    self._alerts[a.id] = a
-                    loaded += 1
-                except Exception:
-                    log.debug("AlertTracker: skipped malformed legacy entry: %s", raw)
-            return loaded
-        except FileNotFoundError:
-            return 0
+            rows = self._repo.load_active_alerts()
+            for raw in rows:
+                self._alerts[str(raw["id"])] = ActiveAlert(**raw)  # type: ignore[arg-type]
+            if self._alerts:
+                log.info("AlertTracker: loaded %d entries from SQLite", len(self._alerts))
+            return len(self._alerts)
         except Exception:
-            log.exception("AlertTracker: legacy JSON load failed path=%s", self._path)
+            log.exception("AlertTracker: SQLite load failed")
             return 0
-
-    def load(self) -> int:
-        """Load state from SQLite when enabled, otherwise from the legacy JSON file."""
-        self._alerts = {}
-        if self._repo is not None:
-            try:
-                rows = self._repo.load_active_alerts()
-                for raw in rows:
-                    self._alerts[str(raw["id"])] = ActiveAlert(**raw)  # type: ignore[arg-type]
-                if self._alerts:
-                    log.info("AlertTracker: loaded %d entries from SQLite", len(self._alerts))
-                    return len(self._alerts)
-            except Exception:
-                log.exception("AlertTracker: SQLite load failed; falling back to legacy JSON")
-
-        loaded = self._load_from_legacy_json()
-        if loaded and self._repo is not None:
-            try:
-                self._persist()
-                log.info("AlertTracker: imported %d legacy entries into SQLite", loaded)
-            except Exception:
-                log.exception("AlertTracker: failed importing legacy JSON state into SQLite")
-        elif loaded:
-            log.info("AlertTracker: loaded %d entries from %s", loaded, self._path)
-        return loaded
 
     def _persist(self) -> None:
-        if self._repo is not None:
-            try:
-                now_iso = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
-                payload = []
-                for alert in self._alerts.values():
-                    raw = asdict(alert)
-                    raw.setdefault("created_at", alert.issued or now_iso)
-                    raw["updated_at"] = now_iso
-                    payload.append(raw)
-                self._repo.replace_active_alerts(payload)
-                return
-            except Exception:
-                log.exception("AlertTracker: SQLite persist failed; attempting legacy JSON fallback path=%s", self._path)
-
+        if self._repo is None:
+            if not self._warned_no_repo:
+                log.warning("AlertTracker: SQLite repository unavailable; legacy JSON fallback is disabled")
+                self._warned_no_repo = True
+            return
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._path.with_suffix(".tmp")
-            payload = {
-                "schema_version": _SCHEMA_VERSION,
-                "written_at": dt.datetime.now(dt.timezone.utc)
-                .replace(microsecond=0)
-                .isoformat(),
-                "active_alerts": [asdict(a) for a in self._alerts.values()],
-            }
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2, default=str)
-            os.replace(tmp, self._path)
+            now_iso = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+            payload = []
+            for alert in self._alerts.values():
+                raw = asdict(alert)
+                raw.setdefault("created_at", alert.issued or now_iso)
+                raw["updated_at"] = now_iso
+                payload.append(raw)
+            self._repo.replace_active_alerts(payload)
         except Exception:
-            log.exception("AlertTracker: persist failed path=%s", self._path)
+            log.exception("AlertTracker: SQLite persist failed; legacy JSON fallback is disabled")

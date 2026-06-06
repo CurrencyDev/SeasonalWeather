@@ -416,7 +416,7 @@ class ToneoutPolicy:
 
     continuation_tracks:
         Set of track_ids with CON/EXT/COR/ROU that are voice-only updates
-        to active events. Useful for cycle rebroadcast expiry refresh.
+        to active events. Useful for cycle expiry refresh.
     """
     mode: Literal["FULL", "VOICE"]
     same_code: str | None
@@ -507,7 +507,7 @@ def toneout_policy(vtec_strings: list[str]) -> ToneoutPolicy:
 
     cancel_tracks and continuation_tracks are populated from the full VTEC list
     regardless of what mode is returned, so the Orchestrator can keep AlertTracker
-    and the rebroadcast rotation up to date.
+    and the active-alert rotation up to date.
     """
     parsed = parse_vtec_list(vtec_strings)
 

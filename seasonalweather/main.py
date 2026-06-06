@@ -81,7 +81,11 @@ from .database.station_feed import StationFeedRepository
 from .discord_log import DiscordLogger
 from .health_state import HealthStateMachine
 from .broadcast.pns import PnsStateMachine
-from .broadcast.ern_script import build_ern_relay_script as _build_ern_relay_script
+from .broadcast.ern_script import (
+    build_ern_relay_script as _build_ern_relay_script,
+    _parse_duration_minutes as _ern_parse_duration_minutes,
+    _same_jday_to_utc as _ern_same_jday_to_utc,
+)
 
 # VTEC policy + SAME event code libraries — Orchestrator defers to these.
 from .alerts.vtec import (
@@ -362,6 +366,36 @@ def _sf_remove_by_vtec_tracks(tracks) -> int:
     track_ids = {(t[0] if isinstance(t, tuple) else t) for t in (tracks or []) if (t[0] if isinstance(t, tuple) else t)}
     return _sf_remove_ids(track_ids)
 
+
+def _sf_remove_ern_relays_matching(code: str | None, same_locs) -> int:
+    """Remove ERN relay feed entries shadowed by authoritative alert state."""
+    if not _sf_enabled():
+        return 0
+    code_u = (code or "").strip().upper()
+    wanted_locs = {str(x).strip() for x in (same_locs or []) if str(x).strip()}
+    if not code_u or not wanted_locs:
+        return 0
+    wanted_event = _same_label_or_code(code_u)
+    remove_ids: list[str] = []
+    try:
+        for sid, item in list(_STATION_FEED_STATE.items()):
+            alert = item[0]
+            links = getattr(alert, "links", None) or {}
+            sender = getattr(alert, "from_", None)
+            sender_kind = getattr(sender, "kind", "") if sender is not None else ""
+            is_ern = str(links.get("via", "")).upper() == "ERN/GWES" or str(sender_kind).lower() == "relay"
+            if not is_ern:
+                continue
+            event_text = str(getattr(alert, "event", "") or "").strip()
+            if event_text and event_text.upper() not in {code_u, wanted_event.upper()}:
+                continue
+            alert_locs = {str(x).strip() for x in (getattr(alert, "sameCodes", None) or []) if str(x).strip()}
+            if alert_locs and alert_locs.issubset(wanted_locs):
+                remove_ids.append(str(sid))
+    except Exception:
+        log.exception("Station feed: failed scanning ERN relay entries for code=%s", code_u)
+        return 0
+    return _sf_remove_ids(remove_ids)
 
 
 def _sf_cap_reference_ids(ev) -> list[str]:
@@ -1605,7 +1639,7 @@ class Orchestrator:
         )
 
         self._tz = ZoneInfo(cfg.station.timezone)
-        self.local_tz = self._tz  # alias for newer code paths (rebroadcast, etc.)
+        self.local_tz = self._tz
 
         # Isolated policy/state machines. main.py only wires inputs/outputs;
         # classification and health decisions live in their own modules.
@@ -1679,33 +1713,13 @@ class Orchestrator:
         # Prevent concurrent cycle flush/push from overlapping
         self._cycle_lock = asyncio.Lock()
 
-        # _cycle_refill_task and _last_cycle_seq_dur retired —
-        # CycleConductor handles continuous buffering; call
-        # self.conductor.notify_flush() instead.
-
-        # Live time handled by CycleConductor ("time" segment synthesised at
-        # push time — no cached WAV, no drift).  Config keys are kept in
-        # config.yaml for backwards compatibility but are no longer read here.
+        # CycleConductor handles continuous buffering and live time synthesis.
 
         # --- Cross-source dedupe (NWWS vs CAP) ---
         self._dedupe_ttl_seconds = cfg.dedupe.ttl_seconds
         self._dedupe_lock = asyncio.Lock()
         self._recent_air_keys: dict[str, dt.datetime] = {}
 
-
-        # --- Periodic rebroadcast rotation (no re-tone) ---
-        # Replays voice-only copies of recently-aired products so info isn't heard only once.
-        # Disabled by default; enable via SEASONAL_REBROADCAST_ENABLED=1.
-        self.rebroadcast_enabled = cfg.rebroadcast.enabled
-        self.rebroadcast_interval_seconds = cfg.rebroadcast.interval_seconds
-        self.rebroadcast_min_gap_seconds = cfg.rebroadcast.min_gap_seconds
-        self.rebroadcast_ttl_seconds = cfg.rebroadcast.ttl_seconds
-        self.rebroadcast_max_items = cfg.rebroadcast.max_items
-        self.rebroadcast_include_voice = cfg.rebroadcast.include_voice
-
-        self._rebroadcast_lock = asyncio.Lock()
-        self._rebroadcast_items: dict[str, SimpleNamespace] = {}
-        self._rebroadcast_last_any_at = None
 
         # --- NWWS decision visibility counters ---
         self._nwws_seen = 0
@@ -1773,11 +1787,13 @@ class Orchestrator:
             disclaimer=cfg.station.disclaimer,
             tz=self._tz,
             sample_rate=cfg.audio.sample_rate,
+            on_alert_segments_changed=lambda reason: self.conductor.notify_flush(
+                reset_rotation=True, reason=reason
+            ),
         )
 
-        # CycleConductor: continuous cycle driver — replaces _cycle_loop
-        # and _queue_cycle_once.  Call conductor.notify_flush() anywhere
-        # that previously called _schedule_cycle_refill().
+        # CycleConductor: continuous cycle driver.  Flush notifications restart
+        # the active-alert priority rotation after alert-state changes.
         self.conductor = CycleConductor(
             store=self._seg_store,
             telnet=self.telnet,
@@ -1789,7 +1805,21 @@ class Orchestrator:
             np_meta_fn=self._np_meta,
             discord_fn=self.discord.cycle_rebuilt,
             active_alerts_fn=lambda: len(self.alert_tracker.get_cycle_alerts()),
+            mode_fn=lambda: self.mode,
         )
+        self.alert_tracker.set_change_callback(self._on_alert_tracker_changed)
+
+    def _on_alert_tracker_changed(self, reason: str) -> None:
+        """Wake audio synthesis and reset rotation after active-alert state changes."""
+        try:
+            self.refresher.notify_alerts_changed()
+            self.refresher.trigger_immediate("status")
+        except Exception:
+            log.debug("AlertTracker change: refresher notify failed", exc_info=True)
+        try:
+            self.conductor.notify_flush(reset_rotation=True, reason=f"alert-state:{reason}")
+        except Exception:
+            log.debug("AlertTracker change: conductor notify failed", exc_info=True)
 
     def _station_feed_seed_from_alert_tracker(self) -> int:
         """
@@ -1964,7 +1994,6 @@ class Orchestrator:
         "ern": "{event} relay.",
         "rwt": "Required weekly test.",
         "rmt": "Required monthly test.",
-        "rebroadcast": "Details of a currently active {event}.",
         "default": "A weather alert has been issued.",
     }
 
@@ -2090,12 +2119,16 @@ class Orchestrator:
         return self.cfg.cycle.normal_interval_seconds
 
     def _schedule_cycle_refill(self, reason: str) -> None:
-        """Shim: delegates to CycleConductor.notify_flush(). Retained so that
-        any call-sites not yet migrated continue to compile and behave correctly.
-        The *reason* argument is accepted but ignored.
-        """
+        """Reset continuous-cycle buffer/order after an external state change."""
         try:
-            self.conductor.notify_flush()
+            self.refresher.trigger_immediate("id", "status")
+            self.refresher.notify_alerts_changed()
+        except AttributeError:
+            pass  # refresher not yet initialised (startup edge case)
+        except Exception:
+            log.debug("Cycle refill: refresher notify failed", exc_info=True)
+        try:
+            self.conductor.notify_flush(reset_rotation=True, reason=reason)
         except AttributeError:
             pass  # conductor not yet initialised (startup edge case)
 
@@ -3087,375 +3120,6 @@ class Orchestrator:
             return None
         return max(ends)
 
-    def _rebroadcast_clamp_expiry(self, now_local: dt.datetime, exp_utc: dt.datetime | None) -> dt.datetime:
-        '''
-        Clamp expiry to a safety TTL so rotation can't grow unbounded if upstream is weird.
-        '''
-        ttl = max(60, int(self.rebroadcast_ttl_seconds))
-        cap = now_local + dt.timedelta(seconds=ttl)
-
-        if not exp_utc:
-            return cap
-
-        try:
-            if exp_utc.tzinfo is None:
-                exp_utc = exp_utc.replace(tzinfo=dt.timezone.utc)
-            exp_local = exp_utc.astimezone(self._tz)
-
-            if exp_local <= now_local + dt.timedelta(seconds=20):
-                exp_local = now_local + dt.timedelta(seconds=20)
-
-            return min(exp_local, cap)
-        except Exception:
-            return cap
-
-    def _rebroadcast_make_key(
-        self,
-        *,
-        source: str,
-        kind: str,
-        event_code: str,
-        tracks: list[tuple[str, str]] | None,
-        same_locs: list[str] | None,
-        script: str,
-    ) -> str:
-        '''
-        Stable-ish identity for the rotation item.
-        Prefer track id, else functional FULL key, else script hash.
-        '''
-        src = "".join(ch for ch in (source or "").upper() if ch.isalnum())[:8] or "SRC"
-        knd = "".join(ch for ch in (kind or "").upper() if ch.isalnum())[:8] or "KIND"
-        code = _safe_event_code(event_code)
-
-        if tracks:
-            t0 = tracks[0][0]
-            if t0:
-                return f"RB:{src}:{knd}:TRK:{t0}"
-
-        if knd == "FULL":
-            fkey = self._dedupe_func_full_key(code, same_locs)
-            if fkey:
-                return f"RB:{src}:{knd}:{fkey}"
-
-        sh = self._sha1_12((script or "")[:4000])
-        return f"RB:{src}:{knd}:{code}:{sh}"
-
-    async def _rebroadcast_prune_locked(self, now: dt.datetime) -> None:
-        dead: list[str] = []
-        for k, it in self._rebroadcast_items.items():
-            try:
-                if getattr(it, "expires_at", None) and now >= it.expires_at:
-                    dead.append(k)
-            except Exception:
-                dead.append(k)
-
-        for k in dead:
-            it = self._rebroadcast_items.pop(k, None)
-            if not it:
-                continue
-            ap = Path(str(getattr(it, "audio_path", "") or ""))
-            if ap and ap.exists():
-                try:
-                    ap.unlink(missing_ok=True)
-                except Exception:
-                    pass
-
-        max_items = max(1, int(self.rebroadcast_max_items))
-        if len(self._rebroadcast_items) > max_items:
-            items = list(self._rebroadcast_items.items())
-            items.sort(key=lambda kv: (
-                getattr(kv[1], "expires_at", now),
-                getattr(kv[1], "created_at", now),
-            ))
-            for k, it in items[: max(0, len(items) - max_items)]:
-                self._rebroadcast_items.pop(k, None)
-                ap = Path(str(getattr(it, "audio_path", "") or ""))
-                if ap and ap.exists():
-                    try:
-                        ap.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-
-    async def _rebroadcast_remove_by_tracks(
-        self, *, tracks: list[tuple[str, str]] | None, reason: str
-    ) -> int:
-        """Remove rebroadcast rotation items that match given VTEC track ids."""
-        if not self.rebroadcast_enabled or not tracks:
-            return 0
-
-        track_ids: set[str] = {str(t[0]).strip() for t in tracks if t and str(t[0]).strip()}
-        if not track_ids:
-            return 0
-
-        now = dt.datetime.now(self.local_tz)
-        removed = 0
-
-        async with self._rebroadcast_lock:
-            await self._rebroadcast_prune_locked(now)
-            for k in list(self._rebroadcast_items.keys()):
-                parts = k.split(":")
-                # Key formats:
-                #   RB:src:knd:TRK:<track_id>:<same_sig>
-                #   RB:src:knd:ANON:<same_sig>:<hash>
-                if len(parts) >= 6 and parts[3] == "TRK" and parts[4] in track_ids:
-                    self._rebroadcast_items.pop(k, None)
-                    removed += 1
-
-        if removed:
-            log.info(
-                "Rebroadcast: removed %d item(s) tracks=%s reason=%s",
-                removed,
-                ",".join(sorted(track_ids)),
-                reason,
-            )
-        return removed
-
-
-    async def _rebroadcast_touch_expiry_by_tracks(
-        self, *, tracks: list[tuple[str, str]] | None, expires_at: dt.datetime, reason: str
-    ) -> int:
-        """Refresh expiry on any matching rotation items without creating new ones."""
-        if not self.rebroadcast_enabled or not tracks:
-            return 0
-
-        track_ids: set[str] = {str(t[0]).strip() for t in tracks if t and str(t[0]).strip()}
-        if not track_ids:
-            return 0
-
-        now = dt.datetime.now(self.local_tz)
-        touched = 0
-
-        async with self._rebroadcast_lock:
-            await self._rebroadcast_prune_locked(now)
-            for k, it in self._rebroadcast_items.items():
-                parts = k.split(":")
-                if len(parts) >= 6 and parts[3] == "TRK" and parts[4] in track_ids:
-                    it.expires_at = expires_at
-                    touched += 1
-
-        if touched:
-            log.debug(
-                "Rebroadcast: refreshed expiry for %d item(s) tracks=%s expires_at=%s reason=%s",
-                touched,
-                ",".join(sorted(track_ids)),
-                expires_at.isoformat(),
-                reason,
-            )
-        return touched
-
-
-    async def _rebroadcast_update_script_by_tracks(
-        self, *, tracks: list[tuple[str, str]] | None, script: str, expires_at: dt.datetime, reason: str
-    ) -> int:
-        """
-        For NWWS-OI CON/EXT voice-only products: update the script (and re-render audio)
-        for any existing rebroadcast rotation item that matches the given VTEC track ids.
-        Creates no new rotation entries — only updates existing ones.
-        """
-        if not self.rebroadcast_enabled or not tracks:
-            return 0
-        track_ids: set[str] = {str(t[0]).strip() for t in tracks if t and str(t[0]).strip()}
-        if not track_ids or not (script or "").strip():
-            return 0
-
-        now = dt.datetime.now(self.local_tz)
-        updated = 0
-
-        # Collect keys to update without holding the lock during rendering.
-        async with self._rebroadcast_lock:
-            await self._rebroadcast_prune_locked(now)
-            keys_to_update = [
-                k for k, it in self._rebroadcast_items.items()
-                if ":TRK:" in k and any(tid in k for tid in track_ids)
-                and getattr(it, "script_hash", "") != self._sha1_12(script[:4000])
-            ]
-
-        for k in keys_to_update:
-            new_wav = await self._render_voice_only_audio(script, prefix="rebcast")
-            async with self._rebroadcast_lock:
-                it = self._rebroadcast_items.get(k)
-                if not it:
-                    try:
-                        Path(new_wav).unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                    continue
-                old_wav = Path(str(getattr(it, "audio_path", "") or ""))
-                it.audio_path = str(new_wav)
-                it.script_hash = self._sha1_12(script[:4000])
-                it.expires_at = max(getattr(it, "expires_at", now), expires_at)
-                it.next_due_at = min(getattr(it, "next_due_at", now), now + dt.timedelta(seconds=60))
-                if old_wav and old_wav.exists():
-                    try:
-                        old_wav.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                updated += 1
-
-        if updated:
-            log.info(
-                "Rebroadcast: updated script for %d item(s) tracks=%s reason=%s",
-                updated, ",".join(sorted(track_ids)), reason,
-            )
-        return updated
-
-    def _rebroadcast_pick_due_locked(self, now: dt.datetime) -> SimpleNamespace | None:
-        due: list[SimpleNamespace] = []
-        for it in self._rebroadcast_items.values():
-            try:
-                if getattr(it, "expires_at", None) and now >= it.expires_at:
-                    continue
-                nd = getattr(it, "next_due_at", None)
-                if nd and now >= nd:
-                    due.append(it)
-            except Exception:
-                continue
-
-        if not due:
-            return None
-
-        due.sort(key=lambda it: (
-            getattr(it, "last_aired_at", None) or getattr(it, "created_at", now),
-            getattr(it, "created_at", now),
-        ))
-        return due[0]
-
-    async def _rebroadcast_add(self, *, key: str, desc: str, script: str, expires_at: dt.datetime) -> None:
-        if not self.rebroadcast_enabled:
-            return
-        s = (script or "").strip()
-        if not s:
-            return
-
-        now = dt.datetime.now(tz=self._tz)
-        script_hash = self._sha1_12(s[:4000])
-
-        async with self._rebroadcast_lock:
-            await self._rebroadcast_prune_locked(now)
-            it = self._rebroadcast_items.get(key)
-            if it and getattr(it, "script_hash", "") == script_hash:
-                it.desc = desc
-                it.expires_at = expires_at
-                it.next_due_at = min(getattr(it, "next_due_at", now), now + dt.timedelta(seconds=60))
-                return
-
-        # Render outside lock
-        out_wav = await self._render_voice_only_audio(s, prefix="rebcast")
-
-        async with self._rebroadcast_lock:
-            await self._rebroadcast_prune_locked(now)
-
-            it2 = self._rebroadcast_items.get(key)
-            if it2:
-                if getattr(it2, "script_hash", "") != script_hash:
-                    # Script changed (e.g. CON replaced NEW): swap to the updated audio.
-                    old_wav = Path(str(getattr(it2, "audio_path", "") or ""))
-                    it2.audio_path = str(out_wav)
-                    it2.script_hash = script_hash
-                    if old_wav and old_wav.exists():
-                        try:
-                            old_wav.unlink(missing_ok=True)
-                        except Exception:
-                            pass
-                else:
-                    # Identical script — no audio swap needed; discard the new render.
-                    try:
-                        Path(out_wav).unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                it2.desc = desc
-                it2.expires_at = max(getattr(it2, "expires_at", now), expires_at)
-                it2.next_due_at = min(getattr(it2, "next_due_at", now), now + dt.timedelta(seconds=60))
-                return
-
-            self._rebroadcast_items[key] = SimpleNamespace(
-                key=key,
-                desc=desc,
-                script_hash=script_hash,
-                audio_path=str(out_wav),
-                created_at=now,
-                last_aired_at=None,
-                next_due_at=now + dt.timedelta(seconds=max(60, int(self.rebroadcast_interval_seconds))),
-                expires_at=expires_at,
-            )
-
-            await self._rebroadcast_prune_locked(now)
-
-    async def _rebroadcast_maybe_air(self) -> None:
-        if not self.rebroadcast_enabled:
-            return
-
-        now = dt.datetime.now(tz=self._tz)
-
-        self._update_mode()
-        if self.mode == "heightened":
-            return
-
-        if self.last_toneout_at and (now - self.last_toneout_at).total_seconds() < float(self.rebroadcast_min_gap_seconds):
-            return
-
-        if self._rebroadcast_last_any_at and (now - self._rebroadcast_last_any_at).total_seconds() < float(self.rebroadcast_min_gap_seconds):
-            return
-
-        async with self._rebroadcast_lock:
-            await self._rebroadcast_prune_locked(now)
-            it = self._rebroadcast_pick_due_locked(now)
-            if not it:
-                return
-
-            ap = Path(str(getattr(it, "audio_path", "") or ""))
-            if not ap.exists():
-                it.next_due_at = now + dt.timedelta(seconds=120)
-                return
-
-            it.next_due_at = now + dt.timedelta(seconds=max(60, int(self.rebroadcast_interval_seconds)))
-
-        async with self._cycle_lock:
-            try:
-                self.telnet.flush_cycle()
-            except Exception:
-                pass
-            desc = (getattr(it, "desc", "") or "").strip() or "Earlier message"
-            title = self._np_alert_title("rebroadcast", event=desc)
-            meta = self._np_meta(title=title, kind="rebroadcast", extra={"sw_alert_source": "rebroadcast", "sw_desc": desc})
-            self.telnet.push_alert(str(ap), meta=meta)
-
-        async with self._rebroadcast_lock:
-            it2 = self._rebroadcast_items.get(getattr(it, "key", ""))
-            if it2:
-                it2.last_aired_at = now
-                n_items = max(1, len(self._rebroadcast_items))
-                it2.next_due_at = now + dt.timedelta(seconds=max(60, int(self.rebroadcast_interval_seconds)) * n_items)
-
-            self._rebroadcast_last_any_at = now
-
-        self._schedule_cycle_refill("post-rebroadcast")
-        log.info("REBROADCAST: aired desc=%s audio=%s", getattr(it, "desc", ""), str(ap))
-
-    async def _rebroadcast_loop(self) -> None:
-        tick = 20
-        try:
-            tick = max(10, min(60, int(self.rebroadcast_interval_seconds) // 10))
-        except Exception:
-            tick = 20
-
-        log.info(
-            "Rebroadcast loop starting (enabled=%s interval=%ss ttl=%ss max_items=%d include_voice=%s tick=%ss)",
-            self.rebroadcast_enabled,
-            self.rebroadcast_interval_seconds,
-            self.rebroadcast_ttl_seconds,
-            self.rebroadcast_max_items,
-            self.rebroadcast_include_voice,
-            tick,
-        )
-
-        while True:
-            await asyncio.sleep(tick)
-            try:
-                await self._rebroadcast_maybe_air()
-            except Exception:
-                log.exception("Rebroadcast tick failed")
-
     # ---- CAP toggles ----
     def _cap_enabled(self) -> bool:
         return self.cfg.cap.enabled
@@ -3590,53 +3254,6 @@ class Orchestrator:
 
     def _same_amplitude(self) -> float:
         return self.cfg.same.amplitude
-
-    # ---- LIVE TIME WAV (drift killer) ----
-    def _live_time_wav_path(self) -> Path:
-        _, audio_dir, _, _ = self._paths()
-        return audio_dir / "cycle_time_now.wav"
-
-    def _live_time_text(self) -> str:
-        now = dt.datetime.now(tz=self._tz)
-        return f"The current time is, {_fmt_time(now)}, {_short_tz(now)}."
-
-    def _render_live_time_wav_once(self) -> None:
-        out = self._live_time_wav_path()
-        out.parent.mkdir(parents=True, exist_ok=True)
-
-        tmp_id = uuid.uuid4().hex[:10]
-        tts_wav = out.parent / f".cycle_time_tts_{tmp_id}.wav"
-        gap = out.parent / f".cycle_time_gap_{tmp_id}.wav"
-        tmp_out = out.parent / f".cycle_time_out_{tmp_id}.wav"
-
-        seg_gap = 0.35
-
-        text = self._live_time_text()
-        self.tts.synth_to_wav(text, tts_wav)
-        write_silence_wav(gap, seg_gap, self.cfg.audio.sample_rate)
-        concat_wavs(tmp_out, [gap, tts_wav, gap])
-
-        os.replace(str(tmp_out), str(out))
-
-        for p in (tts_wav, gap):
-            try:
-                p.unlink(missing_ok=True)  # type: ignore[arg-type]
-            except Exception:
-                pass
-
-    async def _live_time_loop(self) -> None:
-        try:
-            self._render_live_time_wav_once()
-            log.info("Live time WAV enabled (interval=%ss path=%s)", self.live_time_interval_seconds, self._live_time_wav_path())
-        except Exception:
-            log.exception("Live time WAV initial render failed (will retry)")
-
-        while True:
-            await asyncio.sleep(max(10, int(self.live_time_interval_seconds)))
-            try:
-                self._render_live_time_wav_once()
-            except Exception:
-                log.exception("Live time WAV refresh failed")
 
     # ---- RWT/RMT scheduler toggles ----
     def _tests_enabled(self) -> bool:
@@ -3888,8 +3505,7 @@ class Orchestrator:
 
         tasks.append(asyncio.create_task(self.health_state.run_forever(on_change=_health_changed), name="health_state"))
 
-        # CycleConductor + SegmentRefresher replace _cycle_loop,
-        # _queue_cycle_once, and the old live_time_loop.
+        # CycleConductor + SegmentRefresher own routine cycle scheduling.
         tasks.append(asyncio.create_task(self.conductor.run(), name="conductor"))
         tasks.append(asyncio.create_task(self.refresher.run(), name="segment_refresher"))
 
@@ -3914,17 +3530,8 @@ class Orchestrator:
             )
             tasks.append(asyncio.create_task(xmpp.run_forever(), name="nwws_xmpp"))
             tasks.append(asyncio.create_task(self._consume_nwws(), name="nwws_consumer"))
-        # _cycle_loop retired — CycleConductor runs the cycle continuously.
+        # CycleConductor runs the cycle continuously.
 
-        if self.rebroadcast_enabled:
-            tasks.append(asyncio.create_task(self._rebroadcast_loop(), name="rebroadcast_loop"))
-            log.info(
-                "Rebroadcast enabled (interval=%ss ttl=%ss max_items=%d include_voice=%s)",
-                self.rebroadcast_interval_seconds,
-                self.rebroadcast_ttl_seconds,
-                self.rebroadcast_max_items,
-                self.rebroadcast_include_voice,
-            )
 
         if self._cap_enabled():
             if NwsCapPoller is None or CapAlertEvent is None:
@@ -4398,45 +4005,25 @@ class Orchestrator:
             if cap_mt == "cancel" and not tracks:
                 try:
                     same_code = self._cap_event_to_same_code((ev.event or "").strip())
+                    same_locs = self._filter_same_locations_to_service_area(
+                        list(getattr(ev, "same_fips", None) or [])
+                    )
                     self.alert_tracker.remove(self._alert_tracker_id_for_cap(ev, same_code))
+                    self._remove_matching_ipaws_state(
+                        code=same_code,
+                        same_locs=same_locs,
+                        reason=f"cap-cancel:{getattr(ev, 'alert_id', '')}",
+                    )
+                    self._remove_shadowed_ern_state(
+                        code=same_code,
+                        same_locs=same_locs,
+                        reason=f"cap-cancel:{getattr(ev, 'alert_id', '')}",
+                    )
                 except Exception:
                     log.exception("AlertTracker: failed handling CAP cancel without VTEC id=%s", getattr(ev, "alert_id", None))
                 _sf_remove_ids(cap_ref_ids + [getattr(ev, "alert_id", None)])
                 log.info("CAP cancel: evicted state without airing id=%s refs=%s", getattr(ev, "alert_id", None), ",".join(cap_ref_ids[:4]))
                 continue
-
-            # Keep rebroadcast rotation in sync with VTEC lifecycle.
-            # - CAN/EXP => remove immediately so we don't re-air a dead event.
-            # - CON/EXT/etc => refresh expiry for any existing rotation items.
-            if self.rebroadcast_enabled and tracks:
-                vtec_actions = {act for (_t, act) in tracks} if tracks else set()
-                now_local = dt.datetime.now(self.local_tz)
-                exp_utc = self._best_expiry_from_vtec(vtec)
-                expires_at = self._rebroadcast_clamp_expiry(now_local, exp_utc)
-                mt = str(getattr(ev, "message_type", None) or "Alert")
-
-                if vtec_actions & {"CAN", "EXP"}:
-                    await self._rebroadcast_remove_by_tracks(
-                        tracks=tracks,
-                        reason=f"cap:{mt}:{','.join(sorted(vtec_actions & {'CAN','EXP'}))}",
-                    )
-                    _sf_remove_by_vtec_tracks(tracks)
-                    _sf_remove_ids(cap_ref_ids + [getattr(ev, "alert_id", None)])
-                    # Also remove from AlertTracker (if not already handled by _air_cap_update)
-                    try:
-                        _can_track_ids = {_vtec_track_id(v) for v in vtec if _vtec_track_id(v)}
-                        self.alert_tracker.remove_by_vtec_tracks(
-                            _can_track_ids,  # type: ignore[arg-type]
-                            reason=f"cap-consume:{mt}:{','.join(sorted(vtec_actions & {'CAN','EXP'}))}",
-                        )
-                    except Exception:
-                        log.exception("AlertTracker: removal failed in _consume_cap CAN/EXP block")
-                else:
-                    await self._rebroadcast_touch_expiry_by_tracks(
-                        tracks=tracks,
-                        expires_at=expires_at,
-                        reason=f"cap:{mt}:{','.join(sorted(vtec_actions))}",
-                    )
 
             log.info(
                 "CAP match: event=%s severity=%s urgency=%s certainty=%s status=%s msgType=%s sent=%s same=%s headline=%s id=%s vtec=%s tracks=%s",
@@ -4611,23 +4198,6 @@ class Orchestrator:
 
             self._schedule_cycle_refill("post-cap-full")
 
-            # Rebroadcast rotation (no re-tone)
-            try:
-                if self.rebroadcast_enabled:
-                    exp_utc = self._best_expiry_from_vtec(vtec)
-                    expires_at = self._rebroadcast_clamp_expiry(now, exp_utc)
-                    key_rb = self._rebroadcast_make_key(
-                        source="CAP",
-                        kind="FULL",
-                        event_code=same_code,
-                        tracks=tracks,
-                        same_locs=same_locs,
-                        script=script,
-                    )
-                    desc_rb = f"CAP FULL {ev.event}".strip()
-                    await self._rebroadcast_add(key=key_rb, desc=desc_rb, script=script, expires_at=expires_at)
-            except Exception:
-                log.exception("Rebroadcast: failed to add CAP FULL item")
             log.info("CAP ACTION: aired FULL event=%s code=%s id=%s sent=%s vtec=%s audio=%s", ev.event, same_code, ev.alert_id, ev.sent, ",".join(vtec[:2]) if vtec else "", out_wav)
             # _CAP_FULL_DL_
             self.discord.alert_aired(
@@ -4643,7 +4213,7 @@ class Orchestrator:
             )
             _station_feed_note_cap(ev, mode="FULL", same_locations=(same_locs if same_locs else same_locs_raw), out_wav=str(out_wav), same_code=same_code, vtec=vtec)
 
-            # ---- Register to AlertTracker for restart-safe rebroadcast ----
+            # ---- Register to AlertTracker for active cycle rotation ----
             try:
                 tracker_id = self._alert_tracker_id_for_cap(ev, same_code)
                 expires_iso = self._alert_expires_from_cap(ev, vtec)
@@ -4675,6 +4245,11 @@ class Orchestrator:
                 )
                 self.alert_tracker.add_or_update(alert_entry)
                 self.alert_tracker.mark_aired(tracker_id)
+                self._remove_shadowed_ern_state(
+                    code=same_code,
+                    same_locs=same_locs,
+                    reason=f"cap-full:{tracker_id}",
+                )
                 log.info("AlertTracker: registered CAP FULL id=%s event=%s expires=%s", tracker_id, ev.event, expires_iso)
             except Exception:
                 log.exception("AlertTracker: failed to register CAP FULL event=%s", ev.event)
@@ -4749,24 +4324,6 @@ class Orchestrator:
 
             self._schedule_cycle_refill("post-cap-voice")
 
-            # Rebroadcast rotation (no re-tone) - optional for voice-only CAP
-            try:
-                if self.rebroadcast_enabled and self.rebroadcast_include_voice:
-                    exp_utc = self._best_expiry_from_vtec(vtec)
-                    expires_at = self._rebroadcast_clamp_expiry(now, exp_utc)
-                    same_code2 = _vtec_toneout_policy(vtec).same_code or self._cap_event_to_same_code((ev.event or "").strip())
-                    key_rb = self._rebroadcast_make_key(
-                        source="CAP",
-                        kind="VOICE",
-                        event_code=same_code2,
-                        tracks=tracks,
-                        same_locs=same_locs,
-                        script=script,
-                    )
-                    desc_rb = f"CAP VOICE {ev.event}".strip()
-                    await self._rebroadcast_add(key=key_rb, desc=desc_rb, script=script, expires_at=expires_at)
-            except Exception:
-                log.exception("Rebroadcast: failed to add CAP VOICE item")
             log.info("CAP ACTION: aired voice-only event=%s id=%s sent=%s audio=%s", ev.event, ev.alert_id, ev.sent, out_wav)
             # _CAP_VOICE_DL_
             self.discord.alert_aired(
@@ -4799,6 +4356,11 @@ class Orchestrator:
                 )
                 self.alert_tracker.add_or_update(_ae)
                 self.alert_tracker.mark_aired(tracker_id_v)
+                self._remove_shadowed_ern_state(
+                    code=same_code,
+                    same_locs=same_locs,
+                    reason=f"cap-voice:{tracker_id_v}",
+                )
             except Exception:
                 log.exception("AlertTracker: failed to register CAP VOICE event=%s", ev.event)
             _station_feed_note_cap(
@@ -4909,6 +4471,16 @@ class Orchestrator:
                             track_ids,  # type: ignore[arg-type]
                             reason=f"cap-update:{','.join(sorted(vtec_actions))}",
                         )
+                    self._remove_matching_ipaws_state(
+                        code=same_code,
+                        same_locs=same_locs,
+                        reason=f"cap-update:{','.join(sorted(vtec_actions))}",
+                    )
+                    self._remove_shadowed_ern_state(
+                        code=same_code,
+                        same_locs=same_locs,
+                        reason=f"cap-update:{','.join(sorted(vtec_actions))}",
+                    )
                     log.info("AlertTracker: removed id=%s event=%s action=%s", tracker_id, ev_event, vtec_actions)
                 else:
                     # CON/EXT/EXA: update the stored script to latest narration
@@ -5243,6 +4815,50 @@ class Orchestrator:
             return str(raw).strip()
         # Fallback: 6 hours from now
         return (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=6)).isoformat()
+
+    def _alert_expires_from_ern(self, ev) -> str:
+        """Best-effort expiry ISO for an ERN SAME relay from JJJHHMM + TTTT."""
+        now_utc = dt.datetime.now(dt.timezone.utc)
+        start_utc = _ern_same_jday_to_utc(getattr(ev, "jjjhhmm", None), now_utc=now_utc)
+        duration_min = _ern_parse_duration_minutes(getattr(ev, "tttt", None))
+        if start_utc is not None and duration_min is not None:
+            end_utc = start_utc + dt.timedelta(minutes=duration_min)
+            if end_utc > now_utc:
+                return end_utc.isoformat()
+        if duration_min is not None and duration_min > 0:
+            return (now_utc + dt.timedelta(minutes=duration_min)).isoformat()
+        return (now_utc + dt.timedelta(hours=1)).isoformat()
+
+    def _remove_shadowed_ern_state(self, *, code: str | None, same_locs, reason: str) -> int:
+        """Remove ERN relay copies once authoritative CAP/NWWS/IPAWS state covers them."""
+        removed = 0
+        try:
+            removed += self.alert_tracker.remove_matching_source(
+                source="ERN",
+                code=code,
+                same_locs=list(same_locs or []),
+                reason=reason,
+            )
+        except Exception:
+            log.exception("AlertTracker: failed removing ERN relay state reason=%s", reason)
+        try:
+            removed += _sf_remove_ern_relays_matching(code, same_locs)
+        except Exception:
+            log.exception("Station feed: failed removing ERN relay state reason=%s", reason)
+        return removed
+
+    def _remove_matching_ipaws_state(self, *, code: str | None, same_locs, reason: str) -> int:
+        """Remove IPAWS active-cycle entries when a CAP/IPAWS cancel kills them."""
+        try:
+            return self.alert_tracker.remove_matching_source(
+                source="IPAWS",
+                code=code,
+                same_locs=list(same_locs or []),
+                reason=reason,
+            )
+        except Exception:
+            log.exception("AlertTracker: failed removing IPAWS state reason=%s", reason)
+            return 0
 
     def _cap_prefers_statement_update_script(self, event: str, vtec_actions: set[str]) -> bool:
         """Shim → product_text.cap_prefers_statement_update_script()."""
@@ -5694,6 +5310,11 @@ class Orchestrator:
                 )
                 self.alert_tracker.add_or_update(alert_entry)
                 self.alert_tracker.mark_aired(tracker_id)
+                self._remove_shadowed_ern_state(
+                    code=event_code,
+                    same_locs=same_locs or same_locs_raw,
+                    reason=f"ipaws-full:{tracker_id}",
+                )
                 log.info(
                     "AlertTracker: registered IPAWS FULL id=%s code=%s expires=%s",
                     tracker_id,
@@ -5782,6 +5403,42 @@ class Orchestrator:
             self.last_product_desc = f"IPAWS {event_label}".strip()
             self._schedule_cycle_refill("post-ipaws-voice")
 
+            try:
+                tracker_id = f"IPAWS:{(ev.identifier or '').strip()}"
+                expires_iso = (ev.expires or "").strip() or (
+                    dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=2)
+                ).isoformat()
+                alert_entry = ActiveAlert(
+                    id=tracker_id,
+                    source="IPAWS",
+                    event=event_label,
+                    code=event_code,
+                    vtec=[],
+                    headline=str(ev.headline or event_label),
+                    script_text=script,
+                    audio_path=str(out_wav),
+                    expires=expires_iso,
+                    issued=str(ev.sent or dt.datetime.now(dt.timezone.utc).isoformat()),
+                    same_locs=same_locs or same_locs_raw,
+                    cycle_only=True,
+                    watch_number=None,
+                )
+                self.alert_tracker.add_or_update(alert_entry)
+                self.alert_tracker.mark_aired(tracker_id)
+                self._remove_shadowed_ern_state(
+                    code=event_code,
+                    same_locs=same_locs or same_locs_raw,
+                    reason=f"ipaws-voice:{tracker_id}",
+                )
+                log.info(
+                    "AlertTracker: registered IPAWS VOICE id=%s code=%s expires=%s",
+                    tracker_id,
+                    event_code,
+                    expires_iso,
+                )
+            except Exception:
+                log.exception("AlertTracker: failed to register IPAWS VOICE code=%s", event_code)
+
             log.info(
                 "IPAWS ACTION: aired VOICE code=%s event=%s id=%s audio=%s",
                 event_code,
@@ -5820,6 +5477,7 @@ class Orchestrator:
 
             event_code = (ev.event_code or "").strip().upper()
             event_label = (ev.event or event_code or "").strip()
+            message_type = str(getattr(ev, "message_type", None) or "").strip().lower()
 
             log.info(
                 "IPAWS event: code=%s event=%s id=%s sender=%s fips=%s",
@@ -5829,6 +5487,26 @@ class Orchestrator:
                 ev.sender_name_clean or ev.sender_name_raw or "",
                 ",".join(ev.same_fips[:6]) + ("..." if len(ev.same_fips) > 6 else ""),
             )
+
+            if message_type == "cancel":
+                same_locs = self._filter_same_locations_to_service_area(
+                    list(getattr(ev, "same_fips", None) or [])
+                )
+                removed_direct = self.alert_tracker.remove(f"IPAWS:{(ev.identifier or '').strip()}")
+                removed_matching = self._remove_matching_ipaws_state(
+                    code=event_code,
+                    same_locs=same_locs,
+                    reason=f"ipaws-cancel:{ev.identifier}",
+                )
+                log.info(
+                    "IPAWS cancel: removed active state direct=%s matching=%d code=%s id=%s",
+                    removed_direct,
+                    removed_matching,
+                    event_code,
+                    ev.identifier,
+                )
+                self._schedule_cycle_refill("post-ipaws-cancel")
+                continue
 
             full_events = self._ipaws_full_events()
             voice_events = self._ipaws_voice_events()
@@ -6009,6 +5687,40 @@ class Orchestrator:
             self._ern_relay_last_any_at = now
             self.last_product_desc = f"ERN {code}".strip()
 
+            try:
+                event_label = _same_label_or_code(code)
+                relay_id = "ERN:%s:%s" % (
+                    code,
+                    self._sha1_12(
+                        "|".join([
+                            (ev.sender or "").strip().upper(),
+                            ",".join(sorted(set(in_area_locs))),
+                            str(getattr(ev, "jjjhhmm", "") or ""),
+                            str(getattr(ev, "tttt", "") or ""),
+                        ])
+                    ),
+                )
+                alert_entry = ActiveAlert(
+                    id=relay_id,
+                    source="ERN",
+                    event=event_label,
+                    code=code,
+                    vtec=[],
+                    headline=f"ERN relay: {event_label}",
+                    script_text=script,
+                    audio_path=str(out_wav),
+                    expires=self._alert_expires_from_ern(ev),
+                    issued=dt.datetime.now(dt.timezone.utc).isoformat(),
+                    same_locs=in_area_locs,
+                    cycle_only=True,
+                    watch_number=None,
+                )
+                self.alert_tracker.add_or_update(alert_entry)
+                self.alert_tracker.mark_aired(relay_id)
+                log.info("AlertTracker: registered ERN relay id=%s code=%s", relay_id, code)
+            except Exception:
+                log.exception("AlertTracker: failed to register ERN relay event=%s sender=%s", code, ev.sender)
+
             self._schedule_cycle_refill("post-ern-relay")
             log.info(
                 "ERN ACTION: aired relay event=%s sender=%s same_locs=%d audio=%s",
@@ -6085,36 +5797,6 @@ class Orchestrator:
         vtec_actions = {act for (_t, act) in tracks} if tracks else set()
         should_full = (_nw_policy.mode == "FULL")
         log.debug("NWWS vtec policy: %s", _nw_policy.reason)
-
-        # Keep rebroadcast rotation in sync with VTEC lifecycle.
-        # For partial CAN+CON (e.g. MWS cancelling some zones, continuing others)
-        # only remove the tracks that are genuinely cancelled — not the whole event.
-        if self.rebroadcast_enabled and tracks:
-            now_local = dt.datetime.now(self.local_tz)
-            expires_at = self._rebroadcast_clamp_expiry(now_local, exp_utc)
-
-            if vtec_actions & {"CAN", "EXP"}:
-                # Build the set of track IDs that carry a CAN/EXP action specifically.
-                # CON/EXT tracks in the same product stay in the rotation.
-                cancelled_tracks = [(tid, act) for tid, act in tracks if act in {"CAN", "EXP"}]
-                continuing_tracks = [(tid, act) for tid, act in tracks if act not in {"CAN", "EXP"}]
-                if cancelled_tracks:
-                    await self._rebroadcast_remove_by_tracks(
-                        tracks=cancelled_tracks,
-                        reason=f"nwws:{parsed.product_type}:{','.join(sorted(vtec_actions & {'CAN','EXP'}))}",
-                    )
-                if continuing_tracks:
-                    await self._rebroadcast_touch_expiry_by_tracks(
-                        tracks=continuing_tracks,
-                        expires_at=expires_at,
-                        reason=f"nwws:{parsed.product_type}:CON",
-                    )
-            else:
-                await self._rebroadcast_touch_expiry_by_tracks(
-                    tracks=tracks,
-                    expires_at=expires_at,
-                    reason=f"nwws:{parsed.product_type}:{','.join(sorted(vtec_actions))}",
-                )
 
 
         # Critical safety gate:
@@ -6496,6 +6178,16 @@ class Orchestrator:
                             cancel_track_ids,
                             reason=f"nwws:{parsed.product_type}:{','.join(sorted(_nw_vtec_actions & {'CAN','EXP'}))}",
                         )
+                        self._remove_matching_ipaws_state(
+                            code=_nw_same_code,
+                            same_locs=_nw_same_locs,
+                            reason=f"nwws:{parsed.product_type}:{','.join(sorted(_nw_vtec_actions & {'CAN','EXP'}))}",
+                        )
+                        self._remove_shadowed_ern_state(
+                            code=_nw_same_code,
+                            same_locs=_nw_same_locs,
+                            reason=f"nwws:{parsed.product_type}:{','.join(sorted(_nw_vtec_actions & {'CAN','EXP'}))}",
+                        )
                         log.info(
                             "AlertTracker: removed %d entries for NWWS CAN/EXP type=%s awips=%s tracks=%s",
                             removed_n,
@@ -6529,6 +6221,11 @@ class Orchestrator:
                         )
                         self.alert_tracker.add_or_update(_ae_nw_con)
                         self.alert_tracker.mark_aired(_nw_tracker_id)
+                        self._remove_shadowed_ern_state(
+                            code=_nw_same_code,
+                            same_locs=_nw_same_locs,
+                            reason=f"nwws-continuation:{_nw_tracker_id}",
+                        )
                         log.info(
                             "AlertTracker: kept continuing NWWS id=%s type=%s (partial cancel) tracks=%s",
                             _nw_tracker_id,
@@ -6560,47 +6257,16 @@ class Orchestrator:
                     )
                     self.alert_tracker.add_or_update(_ae_nw)
                     self.alert_tracker.mark_aired(_nw_tracker_id)
+                    self._remove_shadowed_ern_state(
+                        code=_nw_same_code,
+                        same_locs=_nw_same_locs,
+                        reason=f"nwws:{_nw_tracker_id}",
+                    )
                     log.info("AlertTracker: registered NWWS id=%s type=%s should_full=%s expires=%s",
                              _nw_tracker_id, parsed.product_type, should_full, _nw_expires_iso)
             except Exception:
                 log.exception("AlertTracker: failed to register NWWS type=%s", parsed.product_type)
 
-            # Rebroadcast rotation (no re-tone)
-            try:
-                if self.rebroadcast_enabled:
-                    exp_utc = self._best_expiry_from_vtec(vtec)
-                    expires_at = self._rebroadcast_clamp_expiry(now, exp_utc)
-                    _rb_vtec_acts = {act for (_t, act) in tracks} if tracks else set()
-                    _rb_is_con_ext = bool(
-                        not should_full
-                        and tracks
-                        and _rb_vtec_acts & {"CON", "EXT", "EXA", "EXB"}
-                    )
-                    if _rb_is_con_ext:
-                        # CON/EXT on a VTEC-tracked product: update the script text of
-                        # any existing rotation entry for this track rather than adding
-                        # a duplicate slot alongside the original NEW entry.
-                        desc_rb = f"NWWS VOICE {parsed.product_type} {parsed.wfo} {parsed.awips_id or ''}".strip()
-                        await self._rebroadcast_update_script_by_tracks(
-                            tracks=tracks,
-                            script=spoken.script,
-                            expires_at=expires_at,
-                            reason=f"nwws-con-ext:{parsed.product_type}:{parsed.wfo}",
-                        )
-                    elif should_full or self.rebroadcast_include_voice:
-                        kind_rb = "FULL" if should_full else "VOICE"
-                        key_rb = self._rebroadcast_make_key(
-                            source="NWWS",
-                            kind=kind_rb,
-                            event_code=_nw_policy.same_code or _safe_event_code(parsed.product_type),
-                            tracks=tracks,
-                            same_locs=in_area_same,
-                            script=spoken.script,
-                        )
-                        desc_rb = f"NWWS {kind_rb} {parsed.product_type} {parsed.wfo} {parsed.awips_id or ''}".strip()
-                        await self._rebroadcast_add(key=key_rb, desc=desc_rb, script=spoken.script, expires_at=expires_at)
-            except Exception:
-                log.exception("Rebroadcast: failed to add NWWS item")
         except Exception:
             await self._dedupe_release(keys)
             raise
@@ -7091,181 +6757,6 @@ class Orchestrator:
             expires_in_minutes=expires_in_minutes,
             heightened_override=heightened_override,
         )
-
-    async def _render_cycle_segment_audio(self, seg: CycleSegment) -> Path:
-        _, audio_dir, _, _ = self._paths()
-        ts = dt.datetime.now(tz=self._tz).strftime("%Y%m%d-%H%M%S")
-        safe_key = "".join(ch for ch in seg.key if ch.isalnum() or ch in {"_", "-"}).strip() or "seg"
-
-        tts_wav = audio_dir / f"cycle_{ts}_{safe_key}_tts.wav"
-        gap = audio_dir / f"cycle_{ts}_{safe_key}_gap.wav"
-        out = audio_dir / f"cycle_{ts}_{safe_key}.wav"
-
-        seg_gap = 0.45
-        self.tts.synth_to_wav(seg.text, tts_wav)
-        write_silence_wav(gap, seg_gap, self.cfg.audio.sample_rate)
-        concat_wavs(out, [gap, tts_wav, gap])
-        return out
-
-    async def _queue_cycle_once(self, reason: str = "scheduled") -> None:
-        async with self._cycle_lock:
-            self._update_mode()
-            interval = self._cycle_interval_seconds()
-
-            ctx = CycleContext(
-                mode=self.mode,
-                last_heightened_ago=self._heightened_ago_str(),
-                last_product_desc=self.last_product_desc,
-            )
-
-            try:
-                segs = await self.cycle_builder.build_segments(
-                    station_name=self.cfg.station.name,
-                    service_area_name=self.cfg.station.service_area_name,
-                    disclaimer=self.cfg.station.disclaimer,
-                    ctx=ctx,
-                )
-
-                if self.live_time_enabled:
-                    try:
-                        if not self._live_time_wav_path().exists():
-                            self._render_live_time_wav_once()
-                    except Exception:
-                        log.exception("Failed to ensure live time WAV exists")
-
-                # Prepend active-alert voice segments (NWR rebroadcast style)
-                # These are cycle_only (no SAME retone) and play in alert order.
-                try:
-                    _active = self.alert_tracker.get_cycle_alerts()
-                    if _active:
-                        _alert_segs: list[CycleSegment] = []
-                        for _ae in _active:
-                            if _ae.script_text.strip():
-                                _alert_segs.append(CycleSegment(
-                                    key=f"alert_{_ae.code}",
-                                    title=_ae.event or _ae.code or "Alert",
-                                    text=_ae.script_text,
-                                ))
-                        if _alert_segs:
-                            segs = _alert_segs + list(segs)
-                            log.debug(
-                                "Cycle: prepended %d active alert segment(s) (%s)",
-                                len(_alert_segs),
-                                ", ".join(a.event for a in _active),
-                            )
-                except Exception:
-                    log.exception("Cycle: alert segment injection failed")
-
-                cycle_items: list[tuple[Path, str]] = []
-                durs: list[float] = []
-
-                for seg in segs:
-                    if self.live_time_enabled and seg.key == "id":
-                        stripped = _TIME_SENTENCE_RE.sub("", seg.text).strip()
-                        seg2 = CycleSegment(key=seg.key, title=seg.title, text=stripped)
-                        w = await self._render_cycle_segment_audio(seg2)
-                        cycle_items.append((w, "id"))
-                        cycle_items.append((self._live_time_wav_path(), "time"))
-                    else:
-                        w = await self._render_cycle_segment_audio(seg)
-                        cycle_items.append((w, seg.key))
-
-                for w, _k in cycle_items:
-                    try:
-                        durs.append(wav_duration_seconds(w))
-                    except Exception:
-                        durs.append(0.0)
-
-                seq_dur = sum(d for d in durs if d and d > 0.0)
-                if seq_dur <= 1.0:
-                    seq_dur = float(max(10, interval))
-
-                # Persist so _cycle_loop can base its next-regen sleep on actual audio length.
-                self._last_cycle_seq_dur = seq_dur
-
-                try:
-                    self.telnet.flush_cycle()
-                except Exception:
-                    pass
-
-                cover = max(30, interval + 30)
-                repeats = int(math.ceil(cover / seq_dur))
-                repeats = max(1, min(repeats, 20))
-
-                for _ in range(repeats):
-                    for w, k in cycle_items:
-                        meta = self._np_meta(
-                            title=self._np_cycle_title(k),
-                            kind="cycle",
-                            extra={"sw_cycle_key": k, "sw_mode": self.mode},
-                        )
-                        self.telnet.push_cycle(str(w), meta=meta)
-
-                log.info(
-                    "Queued segmented %s cycle (%ss, segs=%d, seq_dur=%.1fs, repeats=%d, reason=%s)",
-                    self.mode,
-                    interval,
-                    len(segs),
-                    seq_dur,
-                    repeats,
-                    reason,
-                )
-                # _CYCLE_DL_
-                try:
-                    self.discord.cycle_rebuilt(
-                        reason=reason,
-                        mode=self.mode,
-                        interval=interval,
-                        seq_dur=seq_dur,
-                        segments=len(segs),
-                        active_alerts=len(self.alert_tracker.get_cycle_alerts()),
-                    )
-                except Exception:
-                    pass
-
-            except Exception as e:
-                log.exception("Segmented cycle build failed (%s): %s", reason, e)
-
-    async def _cycle_loop(self) -> None:
-        """Retired — CycleConductor.run() handles the broadcast cycle.
-        This stub is kept so any remaining references compile; it exits
-        immediately if somehow called.
-        """
-        log.warning("_cycle_loop called but is retired — CycleConductor is active")
-        return
-        # Original body preserved below for reference during transition.
-        # fmt: off  # noqa: E999
-        _RETIRED = True
-        if _RETIRED:
-            return
-        # fmt: on
-        _unused_loop_start = True  # type: ignore[unreachable]
-        while True:
-            self._update_mode()
-            interval = self._cycle_interval_seconds()
-            await self._queue_cycle_once(reason="scheduled")
-            # Housekeeping: drop expired alerts from tracker once per cycle
-            try:
-                n = self.alert_tracker.purge_expired()
-                if n:
-                    log.info("AlertTracker: purged %d expired entry/entries", n)
-            except Exception:
-                pass
-
-            # Sleep until (seq_dur - lead_time) so the next rebuild fires with enough
-            # headroom for fetch + synth before the current audio train runs out.
-            # Falls back to the configured interval if seq_dur wasn't captured yet.
-            _lead = int(self.cfg.cycle.lead_time_seconds)
-            _seq = self._last_cycle_seq_dur
-            if _seq > 0:
-                _sleep = max(30, _seq - _lead)
-            else:
-                _sleep = max(30, interval)
-            log.debug(
-                "Cycle loop sleeping %.1fs (seq_dur=%.1fs lead=%ds interval=%ds mode=%s)",
-                _sleep, _seq, _lead, interval, self.mode,
-            )
-            await asyncio.sleep(_sleep)
 
 
 def main(argv: list[str] | None = None) -> int:

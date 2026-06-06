@@ -115,11 +115,15 @@ def build_ern_relay_script(
 
     if code in _TEST_EVENT_CODES:
         intro = (
-            f"This is a relay of {article} {event_label} received via the Emergency Relay Network. "
+            f"The Emergency Relay Network reports {article} {event_label}. "
             "This is only a test."
         )
     else:
-        intro = f"This is a relay of {article} {event_label} received via the Emergency Relay Network."
+        intro = (
+            f"The Emergency Relay Network reports {article} {event_label}. "
+            "This relay will remain in the active alert rotation until it expires, "
+            "or until authoritative CAP, NWWS, or IPAWS alert text supersedes it."
+        )
 
     lines: list[str] = [intro]
 
@@ -148,5 +152,6 @@ def build_ern_relay_script(
     if sender:
         lines.append(f"The message was received from: {sender}.")
 
-    lines.append("End of message.")
+    if code in _TEST_EVENT_CODES:
+        lines.append("End of test message.")
     return "\n".join(line.strip() for line in lines if line and line.strip())

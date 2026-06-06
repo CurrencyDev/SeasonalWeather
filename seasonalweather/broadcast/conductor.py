@@ -1,8 +1,6 @@
 """
 broadcast/conductor.py — CycleConductor: continuous broadcast cycle driver.
 
-Replaces ``_cycle_loop`` + ``_queue_cycle_once`` in main.py.
-
 Design
 ------
 The conductor maintains a soft real-time estimate of how much audio is
@@ -20,28 +18,9 @@ Key differences from the old architecture
 - After an alert flushes the cycle queue, call ``notify_flush()``; the
   conductor sees estimated_remaining_s ≈ 0 and immediately refills.
 - Alert-tracker voice segments are injected right after "time" each
-  rotation, replicating NWR rebroadcast behaviour without re-toning.
-
-Wiring in main.py (summary)
-----------------------------
-  In Orchestrator.__init__:
-    self.conductor = CycleConductor(store=..., telnet=..., ...)
-
-  In Orchestrator.run():
-    tasks.append(asyncio.create_task(self.conductor.run(), name="conductor"))
-
-  Replace every ``self._schedule_cycle_refill(reason)`` call with:
-    self.conductor.notify_flush()
-
-  Remove:  _cycle_loop, _queue_cycle_once, _schedule_cycle_refill,
-           _cycle_refill_task, _last_cycle_seq_dur,
-           _live_time_loop, _live_time_wav_path, _render_live_time_wav_once,
-           _live_time_text, live_time_enabled, live_time_interval_seconds,
-           the live_time task in run(), and the _TIME_SENTENCE_RE strip
-           in _queue_cycle_once.
-
-  _cycle_lock in main.py is KEPT — it still guards concurrent alert
-  handlers from stepping on flush_cycle() + push_alert() calls.
+  rotation in operational-priority order, without re-toning.
+- In focus mode, routine low-priority segments are deferred instead of
+  forcing heightened-mode text truncation.
 """
 from __future__ import annotations
 
@@ -80,12 +59,24 @@ _TIME_BUF_COUNT: int = 2
 _MAX_PUSHES_PER_TICK: int = 30
 
 # Fixed base content order — alert segments are injected after "time".
-_BASE_CONTENT: List[str] = ["hwo", "spc", "zfp", "fcst", "cwf", "obs", "marine_obs"]
+_BASE_CONTENT: List[str] = ["health", "status", "hwo", "spc", "zfp", "fcst", "cwf", "obs", "marine_obs"]
+
+# Heightened/active-alert mode is deliberately more selective: alerts and
+# severe-weather context stay hot, while routine forecast/marine products are
+# spaced out instead of truncated mid-sentence.
+_FOCUS_CONTENT: List[str] = ["health", "status", "hwo", "spc", "obs"]
+_FOCUS_DEFERRED_CONTENT: Dict[str, float] = {
+    "zfp": 20 * 60.0,
+    "fcst": 20 * 60.0,
+    "marine_obs": 30 * 60.0,
+    "cwf": 40 * 60.0,
+}
 
 # Metadata titles for the Now-Playing / IP-RDS display.
 _NP_TITLES: Dict[str, str] = {
     "id":         "Station identification.",
     "time":       "The current time in our service area.",
+    "health":     "Data feed status.",
     "status":     "Overall station status and alerts.",
     "hwo":        "Hazardous weather outlook for the service area.",
     "spc":        "Severe weather outlook for the service area.",
@@ -159,6 +150,7 @@ class CycleConductor:
         tick_s: float = _TICK_S,
         discord_fn: Optional[Callable[..., Any]] = None,
         active_alerts_fn: Optional[Callable[[], int]] = None,
+        mode_fn: Optional[Callable[[], str]] = None,
     ) -> None:
         """
         Parameters
@@ -196,6 +188,7 @@ class CycleConductor:
         self._np_meta_fn = np_meta_fn
         self._discord_fn = discord_fn            # optional: fires cycle_rebuilt embed
         self._active_alerts_fn = active_alerts_fn  # optional: count for embed
+        self._mode_fn = mode_fn
         self._seg_gap_s = seg_gap_s
         self._lookahead_s = lookahead_s
         self._tick_s = tick_s
@@ -207,6 +200,8 @@ class CycleConductor:
         # Cycle position tracking
         self._position_in_rotation: int = 0
         self._cycle_order: List[str] = []   # rebuilt at each rotation start
+        self._last_pushed_at: Dict[str, float] = {}
+        self._focus_mode_active: bool = False
 
         # Double-buffer for live time WAV (prevents overwriting while queued)
         self._audio_dir.mkdir(parents=True, exist_ok=True)
@@ -228,16 +223,25 @@ class CycleConductor:
     #  Public API
     # ------------------------------------------------------------------
 
-    def notify_flush(self) -> None:
+    def notify_flush(self, *, reset_rotation: bool = True, reason: str = "") -> None:
         """
         Call this immediately after ``telnet.flush_cycle()`` in any alert
         handler.  Resets buffer tracking so the conductor refills the
-        (now-empty) cycle queue as fast as possible.
+        (now-empty) cycle queue as fast as possible.  By default, also resets
+        rotation order so newly active alerts are heard by priority instead of
+        inheriting an old chronological slot.
         """
         self._push_start_ts = time.time()
         self._total_pushed_s = 0.0
+        if reset_rotation:
+            self._cycle_order = []
+            self._position_in_rotation = 0
         self._flush_event.set()
-        log.debug("CycleConductor: notify_flush — buffer reset, refill imminent")
+        log.debug(
+            "CycleConductor: notify_flush — buffer reset, reset_rotation=%s reason=%s",
+            reset_rotation,
+            reason or "-",
+        )
 
     @property
     def estimated_remaining_s(self) -> float:
@@ -281,13 +285,50 @@ class CycleConductor:
     #  Segment push orchestration
     # ------------------------------------------------------------------
 
+    def _focus_mode_enabled(self, now: float) -> bool:
+        active = False
+        try:
+            # PNS-only cycle statements should not, by themselves, force the
+            # severe-weather focus schedule.  Any CAP/NWWS/IPAWS/ERN alert does.
+            active = any(
+                (getattr(a, "source", "") or "").strip().upper() != "PNS_CYCLE"
+                for a in self._alert_tracker.get_cycle_alerts()
+            )
+        except Exception:
+            active = False
+        try:
+            if self._mode_fn and (self._mode_fn() or "").strip().lower() == "heightened":
+                active = True
+        except Exception:
+            pass
+
+        if active and not self._focus_mode_active:
+            # Entering heightened/alert focus: postpone routine products from
+            # this point so the next several rotations are severe-weather first.
+            for key in _FOCUS_DEFERRED_CONTENT:
+                self._last_pushed_at[key] = now
+            log.info("CycleConductor: alert-focus mode entered — routine segments deferred")
+        elif not active and self._focus_mode_active:
+            log.info("CycleConductor: alert-focus mode cleared — normal segment cadence restored")
+
+        self._focus_mode_active = active
+        return active
+
+    def _deferred_focus_segments_due(self, now: float) -> List[str]:
+        due: List[str] = []
+        for key, min_gap_s in _FOCUS_DEFERRED_CONTENT.items():
+            last = self._last_pushed_at.get(key, now)
+            if now - last >= min_gap_s:
+                due.append(key)
+        return due
+
     def _rebuild_cycle_order(self) -> None:
         """
         Recalculate the segment sequence for the upcoming rotation.
         Called once at position 0 (the start of each new cycle pass).
 
         Order:
-          id → time → [active alert tracker segments] → hwo → spc → …
+          id → time → [priority-sorted active alerts] → focus/normal content
         """
         now = time.time()
 
@@ -311,7 +352,7 @@ class CycleConductor:
                 active_alerts,
             )
 
-            # Fire Discord cycle_rebuilt embed (mirrors old _queue_cycle_once behaviour)
+            # Fire Discord cycle_rebuilt embed for rotation observability
             try:
                 if self._discord_fn:
                     self._discord_fn(
@@ -337,15 +378,27 @@ class CycleConductor:
         except Exception:
             log.exception("CycleConductor: could not fetch cycle alerts")
 
-        order.extend(_BASE_CONTENT)
+        focus = self._focus_mode_enabled(now)
+        if focus:
+            order.extend(_FOCUS_CONTENT)
+            due = self._deferred_focus_segments_due(now)
+            if due:
+                order.extend(due)
+                log.info(
+                    "CycleConductor: deferred routine segments due in focus mode: %s",
+                    ",".join(due),
+                )
+        else:
+            order.extend(_BASE_CONTENT)
         self._cycle_order = order
 
-        alert_count = len(order) - 2 - len(_BASE_CONTENT)
+        alert_count = len([k for k in order if k.startswith("_alert_")])
         log.info(
-            "CycleConductor: starting rotation #%d — %d segments (%d active alerts)",
+            "CycleConductor: starting rotation #%d — %d segments (%d active alerts, focus=%s)",
             self._rotation_count,
             len(order),
             alert_count,
+            focus,
         )
 
     async def _push_next_segment(self) -> bool:
@@ -415,6 +468,7 @@ class CycleConductor:
             return 0.0
 
         self._rotation_seg_count += 1
+        self._last_pushed_at[key] = time.time()
         log.info("CycleConductor: → %s (%.1fs)", key, entry.duration_s)
         return entry.duration_s
 

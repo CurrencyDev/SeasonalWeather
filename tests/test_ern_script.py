@@ -23,14 +23,14 @@ def test_ern_script_includes_test_metadata_and_area():
         now_utc=dt.datetime(2026, 5, 28, 2, 0, tzinfo=dt.timezone.utc),
     )
 
-    assert "relay of a Required Weekly Test" in script
+    assert "The Emergency Relay Network reports a Required Weekly Test." in script
     assert "This is only a test." in script
     assert "An EAS participant has issued a Required Weekly Test." in script
     assert "Anne Arundel County, MD; Montgomery County, MD" in script
     assert "The message is valid from: 9:30 PM EDT on Wednesday, May 27." in script
     assert "And the message is valid until: 9:45 PM EDT on Wednesday, May 27." in script
     assert "The message was received from: WJON/TV." in script
-    assert script.endswith("End of message.")
+    assert script.endswith("End of test message.")
 
 
 def test_ern_script_includes_warning_metadata_without_area_lookup():
@@ -50,9 +50,10 @@ def test_ern_script_includes_warning_metadata_without_area_lookup():
         now_utc=dt.datetime(2026, 5, 28, 2, 0, tzinfo=dt.timezone.utc),
     )
 
-    assert "relay of a Severe Thunderstorm Warning" in script
+    assert "The Emergency Relay Network reports a Severe Thunderstorm Warning." in script
     assert "The National Weather Service has issued a Severe Thunderstorm Warning." in script
     assert "The message applies to the following SAME locations: 024003 and 024031." in script
     assert "The message is valid from: 1:30 AM UTC on Thursday, May 28." in script
     assert "And the message is valid until: 2:00 AM UTC on Thursday, May 28." in script
     assert "This is only a test." not in script
+    assert "authoritative CAP, NWWS, or IPAWS alert text supersedes it" in script

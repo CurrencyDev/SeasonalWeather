@@ -287,9 +287,6 @@ class OrchestratorControl:
             "last_heightened_at": self._serialize_dt(getattr(self.orch, "last_heightened_at", None)),
             "last_product_desc": getattr(self.orch, "last_product_desc", None),
             "liquidsoap_telnet_reachable": liquidsoap_ok,
-            "cycle_refill_pending": bool(getattr(self.orch, "_cycle_refill_task", None) and not self.orch._cycle_refill_task.done()),
-            "live_time_enabled": bool(getattr(self.orch, "live_time_enabled", False)),
-            "rebroadcast_enabled": bool(getattr(self.orch, "rebroadcast_enabled", False)),
             "nwws_queue_size": int(getattr(self.orch, "nwws_queue", asyncio.Queue()).qsize()),
             "cap_queue_size": int(getattr(self.orch, "cap_queue", asyncio.Queue()).qsize()),
             "ern_queue_size": int(getattr(self.orch, "ern_queue", asyncio.Queue()).qsize()),
@@ -383,15 +380,13 @@ class OrchestratorControl:
             },
             "features": {
                 "station_feed_enabled": self.orch.cfg.station_feed.enabled,
-                "live_time_enabled": bool(getattr(self.orch, "live_time_enabled", False)),
-                "rebroadcast_enabled": bool(getattr(self.orch, "rebroadcast_enabled", False)),
             },
         }
 
     async def rebuild_cycle(self, *, reason: str | None, actor: str) -> dict[str, Any]:
         self._ensure_backend_ready()
         reason_text = (reason or "admin-request").strip() or "admin-request"
-        await self.orch._queue_cycle_once(reason=f"api-{reason_text[:48]}")
+        self.orch._schedule_cycle_refill(reason=f"api-{reason_text[:48]}")
         # _API_REBUILD_DL_
         try:
             self.orch.discord.api_action(
@@ -416,7 +411,7 @@ class OrchestratorControl:
         self.orch.heightened_until = now + dt.timedelta(minutes=minutes)
         self.orch._update_mode()
         self.orch.last_product_desc = f"Manual heightened mode: {reason}"[:200]
-        await self.orch._queue_cycle_once(reason="api-heightened")
+        self.orch._schedule_cycle_refill(reason="api-heightened")
         # _API_SET_HEIGHTENED_DL_
         try:
             self.orch.discord.api_action(
@@ -440,7 +435,7 @@ class OrchestratorControl:
         self.orch.heightened_until = None
         self.orch._update_mode()
         self.orch.last_product_desc = (f"Manual heightened mode cleared: {reason}" if reason else "Manual heightened mode cleared")[:200]
-        await self.orch._queue_cycle_once(reason="api-clear-heightened")
+        self.orch._schedule_cycle_refill(reason="api-clear-heightened")
         # _API_CLEAR_HEIGHTENED_DL_
         try:
             self.orch.discord.api_action(
@@ -766,9 +761,8 @@ class OrchestratorControl:
         )
         self.orch._same_fips_allow_set = normalize_same_allow_set(new_cfg.service_area.same_fips_all)
         self.orch._nwws_allowed_wfos = self.orch._norm_wfo_set(getattr(new_cfg.nwws, "allowed_wfos", []))
-        self.orch.live_time_enabled = bool(getattr(self.orch, "live_time_enabled", False))
         self.orch.last_product_desc = (f"Config reloaded: {reason}" if reason else "Config reloaded")[:200]
-        await self.orch._queue_cycle_once(reason="api-config-reload")
+        self.orch._schedule_cycle_refill(reason="api-config-reload")
 
         caveats: list[str] = []
         if old_cfg.nwws.server != new_cfg.nwws.server or old_cfg.nwws.port != new_cfg.nwws.port:

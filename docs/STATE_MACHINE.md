@@ -6,14 +6,14 @@ SeasonalWeather now has three distinct runtime state machines. Keep them separat
 
 ### NORMAL
 - Default mode.
-- Cycle refresh interval = `cycle.normal_interval_seconds`.
-- Content = station ID, optional health notice, status, HWO, outlook/synopsis/forecast/observations, and active cycle-only alerts.
+- Conductor rotation uses the normal routine content order.
+- Content = station ID, health/status, HWO, outlook/synopsis/forecast/observations, and active alerts sorted by operational priority.
 
 ### HEIGHTENED
 - Entered when a tone-out product is received.
 - Tone-out products are controlled by `policy.toneout_product_types`.
-- Cycle refresh interval = `cycle.heightened_interval_seconds`.
-- Stays in HEIGHTENED until `now >= heightened_until` unless another tone-out extends it.
+- Conductor rotation switches to alert-focus order. Routine forecast and marine segments are postponed by cadence rather than hard-truncated.
+- Stays in HEIGHTENED until `now >= heightened_until` unless another tone-out extends it; active non-PNS alert state can also keep conductor focus active.
 
 ### Broadcast transitions
 - `NORMAL -> HEIGHTENED`: tone-out product airs.

@@ -713,37 +713,28 @@ class CycleBuilder:
 
 
     def _product_max_chars(self, kind: str, mode: str) -> Optional[int]:
-        """
-        Existing knobs stay the same:
-          SEASONAL_CYCLE_HWO_MAX_CHARS_NORMAL / _HEIGHTENED
-          SEASONAL_CYCLE_AFD_MAX_CHARS_NORMAL / _HEIGHTENED
+        """Return per-product hard character caps.
 
-        New (optional) knob for synopsis:
-          SEASONAL_CYCLE_SYN_MAX_CHARS_NORMAL / _HEIGHTENED
-
-        Defaults for synopsis are intentionally NOT unlimited so it can’t DOS your disk.
+        Heightened mode no longer hard-truncates products.  The conductor
+        handles severe-weather focus by postponing routine segments instead
+        of clipping words out of spoken products.
         """
         k = (kind or "").strip().upper()
         m = (mode or "normal").strip().lower()
 
+        if m == "heightened":
+            return None
+
         if k == "HWO":
-            if m == "heightened":
-                return self._cycle_cfg.hwo.max_chars_heightened if self._cycle_cfg else 1200
             return self._cycle_cfg.hwo.max_chars_normal if self._cycle_cfg else 0
 
         if k == "AFD":
-            if m == "heightened":
-                return self._cycle_cfg.afd.max_chars_heightened if self._cycle_cfg else 1000
             return self._cycle_cfg.afd.max_chars_normal if self._cycle_cfg else 0
 
         if k in {"SYN", "SYNOPSIS"}:
-            if m == "heightened":
-                return self._cycle_cfg.syn.max_chars_heightened if self._cycle_cfg else 900
             return self._cycle_cfg.syn.max_chars_normal if self._cycle_cfg else 1500
 
         if k == "CWF":
-            if m == "heightened":
-                return self._cycle_cfg.cwf.max_chars_heightened if self._cycle_cfg else 1200
             return self._cycle_cfg.cwf.max_chars_normal if self._cycle_cfg else 2000
 
         return None

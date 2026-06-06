@@ -1,8 +1,8 @@
 """
 broadcast/segment_refresher.py — SegmentRefresher: background segment refresh engine.
 
-Replaces the monolithic "build everything then push everything" pattern from
-``_queue_cycle_once``.  Each segment now has its own cadence:
+Replaces the monolithic "build everything then push everything" pattern.
+Each segment now has its own cadence:
 
   Segment    Interval   Trigger
   ─────────  ─────────  ──────────────────────────────────────────────────────
@@ -140,6 +140,7 @@ class SegmentRefresher:
         seg_gap_s: float = 0.45,
         refresh_intervals: Optional[Dict[str, int]] = None,
         tick_s: float = _TICK_S,
+        on_alert_segments_changed: Optional[Callable[[str], None]] = None,
     ) -> None:
         self._store = store
         self._builder = cycle_builder
@@ -156,9 +157,11 @@ class SegmentRefresher:
         if refresh_intervals:
             self._intervals.update(refresh_intervals)
         self._tick_s = tick_s
+        self._on_alert_segments_changed = on_alert_segments_changed
 
         # Immediate-refresh request queue
         self._pending: Set[str] = set()
+        self._pending_alert_sync: bool = False
         self._wake_event: asyncio.Event = asyncio.Event()
 
         # build_segments() result cache (amortises API calls on multi-stale ticks)
@@ -182,6 +185,11 @@ class SegmentRefresher:
             self._pending.add(k)
         self._wake_event.set()
 
+    def notify_alerts_changed(self) -> None:
+        """Wake the loop immediately for AlertTracker audio sync."""
+        self._pending_alert_sync = True
+        self._wake_event.set()
+
     # ------------------------------------------------------------------
     #  Main loop
     # ------------------------------------------------------------------
@@ -202,13 +210,17 @@ class SegmentRefresher:
                 for key in pending:
                     await self._refresh_one(key)
 
+            alert_sync_requested = self._pending_alert_sync
+            self._pending_alert_sync = False
+
             # Regular stale-check pass
             for key in _ALL_CONTENT_KEYS:
                 if self._store.is_stale(key):
                     await self._refresh_one(key)
 
-            # Sync alert-tracker voice segments
-            await self._sync_alert_segments()
+            # Sync alert-tracker voice segments.  This runs every tick, and
+            # notify_alerts_changed() wakes it immediately after tracker changes.
+            await self._sync_alert_segments(requested=alert_sync_requested)
 
             # Sleep until next tick or woken by trigger_immediate
             try:
@@ -364,13 +376,19 @@ class SegmentRefresher:
     #  Alert-tracker segment sync
     # ------------------------------------------------------------------
 
-    async def _sync_alert_segments(self) -> None:
+    async def _sync_alert_segments(self, *, requested: bool = False) -> None:
         """
         Ensure every active AlertTracker voice entry has a synthesised store
         entry (``_alert_{id}``), and mark departed entries as placeholders so
         the conductor skips them on the next rotation.
         """
+        changed = False
         try:
+            purged = self._alert_tracker.purge_expired()
+            if purged:
+                changed = True
+                log.info("SegmentRefresher: purged %d expired AlertTracker entries", purged)
+
             active = self._alert_tracker.get_cycle_alerts()
             active_ids: Set[str] = {ae.id for ae in active}
 
@@ -389,12 +407,14 @@ class SegmentRefresher:
                             title=f"{ae.event}." if ae.event else "Active alert.",
                             interval=0,  # on-demand only; tracker owns expiry
                         )
+                        changed = True
                     else:
                         await self._store.mark_placeholder(
                             store_key,
                             ae.event or "Active alert.",
                             refresh_interval_s=0,
                         )
+                        changed = True
 
             # Update text if it changed (e.g. CON/EXT updated the script)
             for ae in active:
@@ -416,6 +436,7 @@ class SegmentRefresher:
                         title=f"{ae.event}." if ae.event else "Active alert.",
                         interval=0,
                     )
+                    changed = True
 
             # Mark departed entries as placeholders
             departed = self._known_alert_ids - active_ids
@@ -432,8 +453,16 @@ class SegmentRefresher:
                         "SegmentRefresher: alert segment expired/cancelled id=%s",
                         alert_id,
                     )
+                    changed = True
 
             self._known_alert_ids = active_ids
+
+            if changed or requested:
+                try:
+                    if self._on_alert_segments_changed:
+                        self._on_alert_segments_changed("alert-segment-sync")
+                except Exception:
+                    log.debug("SegmentRefresher: alert-change callback failed", exc_info=True)
 
         except Exception:
             log.exception("SegmentRefresher: alert segment sync failed")

@@ -543,18 +543,6 @@ class StationFeedConfig:
     nwws: StationFeedNwwsConfig
 
 
-# --- rebroadcast ---
-
-@dataclass(frozen=True)
-class RebroadcastConfig:
-    enabled: bool
-    interval_seconds: int
-    min_gap_seconds: int
-    ttl_seconds: int
-    max_items: int
-    include_voice: bool
-
-
 # --- api ---
 
 @dataclass(frozen=True)
@@ -568,14 +556,6 @@ class ApiConfig:
     scopes: str
     subject: str
     manual_full_eas_heightens: bool
-
-
-# --- live_time ---
-
-@dataclass(frozen=True)
-class LiveTimeConfig:
-    enabled: bool
-    interval_seconds: int
 
 
 # --- dedupe ---
@@ -774,9 +754,7 @@ class AppConfig:
     zonecounty: ZoneCountyConfig
     mareas: MareasConfig
     station_feed: StationFeedConfig
-    rebroadcast: RebroadcastConfig
     api: ApiConfig
-    live_time: LiveTimeConfig
     dedupe: DedupeConfig
     logs: LogsConfig
 
@@ -879,16 +857,16 @@ def load_config(path: str) -> AppConfig:
         ),
         hwo=CycleHwoConfig(
             max_chars_normal=int(hwo_raw.get("max_chars_normal", 0)),
-            max_chars_heightened=int(hwo_raw.get("max_chars_heightened", 1200)),
+            max_chars_heightened=int(hwo_raw.get("max_chars_heightened", 0)),
             speak_unavailable=bool(hwo_raw.get("speak_unavailable", True)),
         ),
         afd=CycleProductConfig(
             max_chars_normal=int(afd_raw.get("max_chars_normal", 0)),
-            max_chars_heightened=int(afd_raw.get("max_chars_heightened", 1000)),
+            max_chars_heightened=int(afd_raw.get("max_chars_heightened", 0)),
         ),
         syn=CycleProductConfig(
             max_chars_normal=int(syn_raw.get("max_chars_normal", 1500)),
-            max_chars_heightened=int(syn_raw.get("max_chars_heightened", 900)),
+            max_chars_heightened=int(syn_raw.get("max_chars_heightened", 0)),
         ),
         cwf=CycleCwfConfig(
             enabled=bool(cwf_raw.get("enabled", False)),
@@ -1376,19 +1354,6 @@ def load_config(path: str) -> AppConfig:
     )
 
     # ------------------------------------------------------------------
-    # rebroadcast
-    # ------------------------------------------------------------------
-    rb_raw = raw.get("rebroadcast", {})
-    rebroadcast = RebroadcastConfig(
-        enabled=bool(rb_raw.get("enabled", False)),
-        interval_seconds=int(rb_raw.get("interval_seconds", 300)),
-        min_gap_seconds=int(rb_raw.get("min_gap_seconds", 300)),
-        ttl_seconds=int(rb_raw.get("ttl_seconds", 3600)),
-        max_items=int(rb_raw.get("max_items", 6)),
-        include_voice=bool(rb_raw.get("include_voice", False)),
-    )
-
-    # ------------------------------------------------------------------
     # api
     # ------------------------------------------------------------------
     api_raw = raw.get("api", {})
@@ -1402,15 +1367,6 @@ def load_config(path: str) -> AppConfig:
         scopes=str(api_raw.get("scopes", "")),
         subject=str(api_raw.get("subject", "local-admin")),
         manual_full_eas_heightens=bool(api_raw.get("manual_full_eas_heightens", True)),
-    )
-
-    # ------------------------------------------------------------------
-    # live_time
-    # ------------------------------------------------------------------
-    lt_raw = raw.get("live_time", {})
-    live_time = LiveTimeConfig(
-        enabled=bool(lt_raw.get("enabled", True)),
-        interval_seconds=int(lt_raw.get("interval_seconds", 45)),
     )
 
     # ------------------------------------------------------------------
@@ -1577,9 +1533,7 @@ def load_config(path: str) -> AppConfig:
         zonecounty=zonecounty,
         mareas=mareas,
         station_feed=station_feed,
-        rebroadcast=rebroadcast,
         api=api,
-        live_time=live_time,
         dedupe=dedupe,
         secrets=secrets,
         logs=logs,
