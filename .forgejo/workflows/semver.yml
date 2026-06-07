@@ -19,10 +19,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
+      - name: Show Python version
+        run: python3 --version
 
       - name: Validate package version
         run: python3 tools/semver_guard.py check-working
