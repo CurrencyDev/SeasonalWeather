@@ -75,6 +75,7 @@ from .broadcast.product_text import (
 
 # Active alert tracker (persistent cycle state across restarts)
 from .alerts.active import ActiveAlert, AlertTracker, _vtec_track_id
+from .alerts.focus import alert_holds_focus
 from .database.bootstrap import bootstrap_database_from_config
 from .database.housekeeping import DatabaseHousekeeper
 from .database.inserts import CycleInsertRepository
@@ -1808,6 +1809,7 @@ class Orchestrator:
             discord_fn=self.discord.cycle_rebuilt,
             active_alerts_fn=lambda: len(self.alert_tracker.get_cycle_alerts()),
             mode_fn=lambda: self.mode,
+            alert_focus_policy=cfg.cycle.alert_focus,
             scheduled_inserts_fn=self._cycle_due_inserts,
             mark_insert_aired_fn=self._mark_cycle_insert_aired,
         )
@@ -2142,8 +2144,17 @@ class Orchestrator:
         rem = mins % 60
         return f"{hrs} hours" if rem == 0 else f"{hrs} hours and {rem} minutes"
 
+    def _has_focus_holding_alerts(self) -> bool:
+        try:
+            return any(
+                alert_holds_focus(a, self.cfg.cycle.alert_focus)
+                for a in self.alert_tracker.get_cycle_alerts()
+            )
+        except Exception:
+            return False
+
     def _cycle_interval_seconds(self) -> int:
-        if self.mode == "heightened" or self.alert_tracker.has_active():
+        if self.mode == "heightened" or self._has_focus_holding_alerts():
             return self.cfg.cycle.heightened_interval_seconds
         return self.cfg.cycle.normal_interval_seconds
 

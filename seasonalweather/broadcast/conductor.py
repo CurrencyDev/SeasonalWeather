@@ -35,6 +35,7 @@ from typing import Any, Callable, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from ..alerts.active import AlertTracker
+from ..alerts.focus import AlertFocusPolicy, alert_holds_focus
 from ..liquidsoap_telnet import LiquidsoapTelnet
 from ..tts.audio import concat_wavs, wav_duration_seconds, write_silence_wav
 from ..tts.tts import TTS
@@ -151,6 +152,7 @@ class CycleConductor:
         discord_fn: Optional[Callable[..., Any]] = None,
         active_alerts_fn: Optional[Callable[[], int]] = None,
         mode_fn: Optional[Callable[[], str]] = None,
+        alert_focus_policy: Optional[AlertFocusPolicy] = None,
         scheduled_inserts_fn: Optional[Callable[[str, int, bool], List[Dict[str, Any]]]] = None,
         mark_insert_aired_fn: Optional[Callable[[str, int], Any]] = None,
     ) -> None:
@@ -191,6 +193,7 @@ class CycleConductor:
         self._discord_fn = discord_fn            # optional: fires cycle_rebuilt embed
         self._active_alerts_fn = active_alerts_fn  # optional: count for embed
         self._mode_fn = mode_fn
+        self._alert_focus_policy = alert_focus_policy or AlertFocusPolicy()
         self._scheduled_inserts_fn = scheduled_inserts_fn
         self._mark_insert_aired_fn = mark_insert_aired_fn
         self._seg_gap_s = seg_gap_s
@@ -298,10 +301,8 @@ class CycleConductor:
     def _focus_mode_enabled(self, now: float) -> bool:
         active = False
         try:
-            # PNS-only cycle statements should not, by themselves, force the
-            # severe-weather focus schedule.  Any CAP/NWWS/IPAWS/ERN alert does.
             active = any(
-                (getattr(a, "source", "") or "").strip().upper() != "PNS_CYCLE"
+                alert_holds_focus(a, self._alert_focus_policy)
                 for a in self._alert_tracker.get_cycle_alerts()
             )
         except Exception:

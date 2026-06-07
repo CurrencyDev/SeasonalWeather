@@ -14,6 +14,19 @@ cycle:
   normal_interval_seconds: 300
   heightened_interval_seconds: 180
   min_heightened_seconds: 1800  # stay heightened at least this long after a tone-out
+
+  # Active-alert focus-hold policy.  Alerts can remain in rotation without
+  # pinning the station in focus mode.  Empty/omitted hold_event_codes inherits
+  # policy.toneout_product_types with tests removed, then applies the VTEC and
+  # marine guards below.
+  alert_focus:
+    hold_event_codes: []
+    hold_vtec_significance: ["W", "A"]   # warning/watch VTEC only
+    excluded_sources: ["PNS_CYCLE"]
+    test_event_codes: ["DMO", "NAT", "NPT", "NST", "RMT", "RWT"]
+    marine_event_codes: ["SMW", "MWS", "SCY", "GLW", "GLA", "SRW", "SRA", "HSW", "HSA", "HFW", "HFA", "MHY"]
+    marine_hold_event_codes: ["SMW"]      # Special Marine Warning is short-fused/life-safety
+
   reference_points:
     # (lat, lon, label) — used for forecast snippets + obs anchors
     - [38.8521, -77.0377, "Washington"]

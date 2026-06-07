@@ -26,6 +26,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import yaml
 
 from .broadcast.tests import normalize_postpone_policy
+from .alerts.focus import (
+    AlertFocusPolicy,
+    DEFAULT_EXCLUDED_SOURCES,
+    DEFAULT_HOLD_VTEC_SIGNIFICANCE,
+    DEFAULT_MARINE_EVENT_CODES,
+    DEFAULT_MARINE_HOLD_EVENT_CODES,
+    DEFAULT_TEST_EVENT_CODES,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +220,7 @@ class CycleConfig:
     heightened_interval_seconds: int
     min_heightened_seconds: int
     lead_time_seconds: int
+    alert_focus: AlertFocusPolicy
     reference_points: List[Tuple[float, float, str]]
     last_product_max_chars: int
     spc: CycleSpcConfig
@@ -778,6 +787,28 @@ def _get(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
     return cur
 
 
+def _upper_list(value: Any) -> List[str]:
+    """Return unique non-empty strings upper-cased, preserving order."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = [value]
+    else:
+        try:
+            items = list(value)
+        except TypeError:
+            items = [value]
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in items:
+        token = str(item).strip().upper()
+        if not token or token in seen:
+            continue
+        out.append(token)
+        seen.add(token)
+    return out
+
+
 def load_config(path: str) -> AppConfig:
     raw: Dict[str, Any] = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
 
@@ -806,6 +837,27 @@ def load_config(path: str) -> AppConfig:
     # cycle
     # ------------------------------------------------------------------
     cy = raw["cycle"]
+    focus_raw = cy.get("alert_focus", {}) or {}
+    policy_toneout_raw = raw.get("policy", {}).get("toneout_product_types", [])
+    focus_test_codes = _upper_list(focus_raw.get("test_event_codes", DEFAULT_TEST_EVENT_CODES))
+    focus_hold_raw = focus_raw.get("hold_event_codes", None)
+    if focus_hold_raw:
+        focus_hold_codes = _upper_list(focus_hold_raw)
+    else:
+        # Omitted/empty hold_event_codes inherits the operational tone-out
+        # policy, then test codes are removed.  This keeps local high-value
+        # tone-out additions from being silently blacklisted while still
+        # preventing RWT/RMT/DMO-style tests from pinning focus.
+        focus_hold_codes = _upper_list(policy_toneout_raw)
+    focus_hold_codes = [c for c in focus_hold_codes if c not in set(focus_test_codes)]
+    alert_focus = AlertFocusPolicy(
+        hold_event_codes=tuple(focus_hold_codes),
+        excluded_sources=tuple(_upper_list(focus_raw.get("excluded_sources", DEFAULT_EXCLUDED_SOURCES))),
+        test_event_codes=tuple(focus_test_codes),
+        hold_vtec_significance=tuple(_upper_list(focus_raw.get("hold_vtec_significance", DEFAULT_HOLD_VTEC_SIGNIFICANCE))),
+        marine_event_codes=tuple(_upper_list(focus_raw.get("marine_event_codes", DEFAULT_MARINE_EVENT_CODES))),
+        marine_hold_event_codes=tuple(_upper_list(focus_raw.get("marine_hold_event_codes", DEFAULT_MARINE_HOLD_EVENT_CODES))),
+    )
     spc_raw = cy.get("spc", {})
     fc_raw = cy.get("fc", {})
     obs_raw = cy.get("obs", {})
@@ -821,6 +873,7 @@ def load_config(path: str) -> AppConfig:
         heightened_interval_seconds=int(cy["heightened_interval_seconds"]),
         min_heightened_seconds=int(cy["min_heightened_seconds"]),
         lead_time_seconds=int(cy.get("lead_time_seconds", 90)),
+        alert_focus=alert_focus,
         reference_points=[
             (float(a), float(b), str(lbl))
             for a, b, lbl in cy["reference_points"]

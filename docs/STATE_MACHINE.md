@@ -13,7 +13,8 @@ SeasonalWeather now has three distinct runtime state machines. Keep them separat
 - Entered when a tone-out product is received.
 - Tone-out products are controlled by `policy.toneout_product_types`.
 - Conductor rotation switches to alert-focus order. Routine forecast and marine segments are postponed by cadence rather than hard-truncated.
-- Stays in HEIGHTENED until `now >= heightened_until` unless another tone-out extends it; active non-PNS alert state can also keep conductor focus active.
+- Stays in HEIGHTENED until `now >= heightened_until` unless another tone-out extends it.
+- Active alerts only keep conductor focus active when they pass `cycle.alert_focus`: by default, tone-out SAME codes with warning/watch VTEC significance, excluding PNS cycle statements, tests, and long-lived marine products other than Special Marine Warning.
 
 ### Broadcast transitions
 - `NORMAL -> HEIGHTENED`: tone-out product airs.

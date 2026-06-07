@@ -119,7 +119,7 @@ This is the single source of truth for all runtime behaviour. The file is well-c
 |---|---|
 | `station` | Name, service area description, timezone, disclaimer |
 | `stream` | Icecast host, port, mount |
-| `cycle` | Broadcast reference points, SPC/forecast/obs/HWO tuning, and heightened-mode policy |
+| `cycle` | Broadcast reference points, SPC/forecast/obs/HWO tuning, heightened-mode policy, and alert-focus hold policy |
 | `observations` | ASOS/AWOS station IDs for current conditions |
 | `nwws` | NWWS-OI server, allowed WFOs, resiliency knobs |
 | `policy` | Product types that trigger tone-out |
