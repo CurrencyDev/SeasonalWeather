@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 MIGRATIONS: dict[int, tuple[str, ...]] = {
     1: (
@@ -120,5 +120,37 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         """,
         "CREATE INDEX IF NOT EXISTS idx_station_feed_alerts_expires_at ON station_feed_alerts (expires_at)",
         "CREATE INDEX IF NOT EXISTS idx_station_feed_alerts_updated_at ON station_feed_alerts (updated_at)",
+    ),
+
+    4: (
+        """
+        CREATE TABLE IF NOT EXISTS cycle_inserts (
+            insert_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL CHECK (kind IN ('text', 'audio')),
+            title TEXT NOT NULL,
+            text TEXT,
+            audio_path TEXT,
+            audio_asset_id TEXT,
+            placement TEXT NOT NULL CHECK (placement IN ('after_time', 'after_status', 'end_of_rotation')),
+            start_after TEXT,
+            expires_at TEXT NOT NULL,
+            repeat_mode TEXT NOT NULL CHECK (repeat_mode IN ('once', 'every_n_rotations')),
+            repeat_every_rotations INTEGER NOT NULL DEFAULT 1,
+            max_airings INTEGER NOT NULL DEFAULT 1,
+            defer_during_active_alerts INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'cancelled', 'completed', 'expired')),
+            actor TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_aired_at TEXT,
+            airing_count INTEGER NOT NULL DEFAULT 0,
+            last_aired_rotation INTEGER,
+            duration_seconds REAL NOT NULL DEFAULT 0.0,
+            meta_json TEXT
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cycle_inserts_status_expires ON cycle_inserts (status, expires_at)",
+        "CREATE INDEX IF NOT EXISTS idx_cycle_inserts_due ON cycle_inserts (status, placement, start_after, expires_at)",
+        "CREATE INDEX IF NOT EXISTS idx_cycle_inserts_audio_path ON cycle_inserts (audio_path)",
     ),
 }

@@ -77,6 +77,7 @@ from .broadcast.product_text import (
 from .alerts.active import ActiveAlert, AlertTracker, _vtec_track_id
 from .database.bootstrap import bootstrap_database_from_config
 from .database.housekeeping import DatabaseHousekeeper
+from .database.inserts import CycleInsertRepository
 from .database.station_feed import StationFeedRepository
 from .discord_log import DiscordLogger
 from .health_state import HealthStateMachine
@@ -1749,6 +1750,7 @@ class Orchestrator:
 
         # --- Embedded SQLite runtime state ---
         self.database = bootstrap_database_from_config(cfg) if getattr(cfg.database, "enabled", True) else None
+        self.cycle_insert_repo = CycleInsertRepository(self.database) if self.database is not None else None
         self.db_housekeeper = DatabaseHousekeeper(cfg, self.database) if self.database is not None else None
         self.station_feed_repo = StationFeedRepository(self.database) if self.database is not None else None
         _sf_set_repository(self.station_feed_repo)
@@ -1806,8 +1808,35 @@ class Orchestrator:
             discord_fn=self.discord.cycle_rebuilt,
             active_alerts_fn=lambda: len(self.alert_tracker.get_cycle_alerts()),
             mode_fn=lambda: self.mode,
+            scheduled_inserts_fn=self._cycle_due_inserts,
+            mark_insert_aired_fn=self._mark_cycle_insert_aired,
         )
         self.alert_tracker.set_change_callback(self._on_alert_tracker_changed)
+
+    def _utc_iso(self, value: dt.datetime | None = None) -> str:
+        when = value or dt.datetime.now(dt.timezone.utc)
+        return when.astimezone(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+    def _cycle_due_inserts(self, placement: str, rotation_count: int, focus: bool) -> list[dict]:
+        repo = getattr(self, "cycle_insert_repo", None)
+        if repo is None:
+            return []
+        return repo.list_due(
+            placement=placement,
+            rotation_count=rotation_count,
+            now_iso=self._utc_iso(),
+            active_alert_focus=focus,
+        )
+
+    def _mark_cycle_insert_aired(self, insert_id: str, rotation_count: int) -> None:
+        repo = getattr(self, "cycle_insert_repo", None)
+        if repo is None:
+            return
+        repo.mark_aired(
+            insert_id=insert_id,
+            aired_at=self._utc_iso(),
+            rotation_count=rotation_count,
+        )
 
     def _on_alert_tracker_changed(self, reason: str) -> None:
         """Wake audio synthesis and reset rotation after active-alert state changes."""

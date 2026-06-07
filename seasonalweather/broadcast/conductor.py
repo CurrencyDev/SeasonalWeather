@@ -151,6 +151,8 @@ class CycleConductor:
         discord_fn: Optional[Callable[..., Any]] = None,
         active_alerts_fn: Optional[Callable[[], int]] = None,
         mode_fn: Optional[Callable[[], str]] = None,
+        scheduled_inserts_fn: Optional[Callable[[str, int, bool], List[Dict[str, Any]]]] = None,
+        mark_insert_aired_fn: Optional[Callable[[str, int], Any]] = None,
     ) -> None:
         """
         Parameters
@@ -189,6 +191,8 @@ class CycleConductor:
         self._discord_fn = discord_fn            # optional: fires cycle_rebuilt embed
         self._active_alerts_fn = active_alerts_fn  # optional: count for embed
         self._mode_fn = mode_fn
+        self._scheduled_inserts_fn = scheduled_inserts_fn
+        self._mark_insert_aired_fn = mark_insert_aired_fn
         self._seg_gap_s = seg_gap_s
         self._lookahead_s = lookahead_s
         self._tick_s = tick_s
@@ -200,6 +204,7 @@ class CycleConductor:
         # Cycle position tracking
         self._position_in_rotation: int = 0
         self._cycle_order: List[str] = []   # rebuilt at each rotation start
+        self._insert_cache: Dict[str, Dict[str, Any]] = {}
         self._last_pushed_at: Dict[str, float] = {}
         self._focus_mode_active: bool = False
 
@@ -242,6 +247,11 @@ class CycleConductor:
             reset_rotation,
             reason or "-",
         )
+
+    def notify_inserts_changed(self) -> None:
+        """Wake the conductor so newly scheduled inserts are considered promptly."""
+        self._flush_event.set()
+        log.debug("CycleConductor: scheduled inserts changed — waking loop")
 
     @property
     def estimated_remaining_s(self) -> float:
@@ -322,6 +332,23 @@ class CycleConductor:
                 due.append(key)
         return due
 
+    def _insert_keys_for(self, placement: str, *, rotation_count: int, focus: bool) -> List[str]:
+        if not self._scheduled_inserts_fn:
+            return []
+        keys: List[str] = []
+        try:
+            for item in self._scheduled_inserts_fn(placement, rotation_count, focus) or []:
+                insert_id = str(item.get("insert_id") or "").strip()
+                audio_path = str(item.get("audio_path") or "").strip()
+                if not insert_id or not audio_path:
+                    continue
+                key = f"_insert_{insert_id}"
+                self._insert_cache[key] = dict(item)
+                keys.append(key)
+        except Exception:
+            log.exception("CycleConductor: could not fetch scheduled inserts placement=%s", placement)
+        return keys
+
     def _rebuild_cycle_order(self) -> None:
         """
         Recalculate the segment sequence for the upcoming rotation.
@@ -371,6 +398,7 @@ class CycleConductor:
         self._rotation_start_ts = now
 
         order: List[str] = ["id", "time"]
+        self._insert_cache = {}
 
         try:
             for ae in self._alert_tracker.get_cycle_alerts():
@@ -379,8 +407,15 @@ class CycleConductor:
             log.exception("CycleConductor: could not fetch cycle alerts")
 
         focus = self._focus_mode_enabled(now)
+        order.extend(self._insert_keys_for("after_time", rotation_count=self._rotation_count, focus=focus))
+
+        content_order = list(_FOCUS_CONTENT if focus else _BASE_CONTENT)
+        for content_key in content_order:
+            order.append(content_key)
+            if content_key == "status":
+                order.extend(self._insert_keys_for("after_status", rotation_count=self._rotation_count, focus=focus))
+
         if focus:
-            order.extend(_FOCUS_CONTENT)
             due = self._deferred_focus_segments_due(now)
             if due:
                 order.extend(due)
@@ -388,8 +423,8 @@ class CycleConductor:
                     "CycleConductor: deferred routine segments due in focus mode: %s",
                     ",".join(due),
                 )
-        else:
-            order.extend(_BASE_CONTENT)
+
+        order.extend(self._insert_keys_for("end_of_rotation", rotation_count=self._rotation_count, focus=focus))
         self._cycle_order = order
 
         alert_count = len([k for k in order if k.startswith("_alert_")])
@@ -419,6 +454,8 @@ class CycleConductor:
                 dur = await self._push_live_time()
             elif key.startswith("_alert_"):
                 dur = self._push_tracker_alert(key[len("_alert_"):])
+            elif key.startswith("_insert_"):
+                dur = self._push_scheduled_insert(key)
             else:
                 dur = self._push_cached(key)
         except Exception:
@@ -434,6 +471,46 @@ class CycleConductor:
     # ------------------------------------------------------------------
     #  Push helpers
     # ------------------------------------------------------------------
+
+    def _push_scheduled_insert(self, key: str) -> float:
+        item = self._insert_cache.get(key) or {}
+        insert_id = str(item.get("insert_id") or key[len("_insert_"):])
+        audio = Path(str(item.get("audio_path") or ""))
+        if not audio.exists():
+            log.warning("CycleConductor: scheduled insert audio missing id=%s path=%s", insert_id, audio)
+            return 0.0
+
+        title = str(item.get("title") or "Scheduled announcement.")
+        duration = float(item.get("duration_seconds") or 0.0)
+        if duration <= 0.0:
+            try:
+                duration = wav_duration_seconds(audio)
+            except Exception:
+                duration = 0.0
+
+        meta = self._np_meta_fn(
+            title=title,
+            kind="cycle",
+            extra={
+                "sw_cycle_key": "insert",
+                "sw_insert_id": insert_id,
+                "sw_insert_kind": str(item.get("kind") or ""),
+            },
+        )
+        try:
+            self._telnet.push_cycle(str(audio), meta=meta)
+        except Exception:
+            log.exception("CycleConductor: telnet push_cycle failed for scheduled insert id=%s", insert_id)
+            return 0.0
+
+        self._rotation_seg_count += 1
+        if self._mark_insert_aired_fn:
+            try:
+                self._mark_insert_aired_fn(insert_id, self._rotation_count)
+            except Exception:
+                log.exception("CycleConductor: failed to mark scheduled insert aired id=%s", insert_id)
+        log.info("CycleConductor: → insert_%s (%.1fs) %s", insert_id, duration, title)
+        return max(0.1, duration)
 
     def _push_cached(self, key: str) -> float:
         """

@@ -219,6 +219,7 @@ def install_openapi(app: FastAPI) -> None:
                 {"name": "commands", "description": "Command status and event streams."},
                 {"name": "control", "description": "Authenticated station control operations."},
                 {"name": "origination", "description": "Authenticated test and manual alert origination."},
+                {"name": "inserts", "description": "Authenticated bounded inserts into the normal broadcast cycle."},
                 {"name": "configuration", "description": "Authenticated configuration inspection and reload."},
             ],
         )

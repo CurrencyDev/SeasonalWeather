@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import re
 from enum import Enum
 from typing import Any, Literal
@@ -21,6 +22,22 @@ class VoiceMode(str, Enum):
 class InterruptPolicy(str, Enum):
     INTERRUPT_THEN_REFILL = "interrupt_then_refill"
     QUEUE_AFTER_CURRENT_ALERT = "queue_after_current_alert"
+
+
+class InsertKind(str, Enum):
+    TEXT = "text"
+    AUDIO = "audio"
+
+
+class InsertPlacement(str, Enum):
+    AFTER_TIME = "after_time"
+    AFTER_STATUS = "after_status"
+    END_OF_ROTATION = "end_of_rotation"
+
+
+class InsertRepeatMode(str, Enum):
+    ONCE = "once"
+    EVERY_N_ROTATIONS = "every_n_rotations"
 
 
 class CommandStatus(str, Enum):
@@ -218,6 +235,100 @@ class AudioUploadAccepted(ApiModel):
     sha256: str
     uploaded_at: str
     expires_at: str
+
+
+class InsertRepeatRequest(ApiModel):
+    mode: InsertRepeatMode = Field(default=InsertRepeatMode.ONCE)
+    every_n_rotations: int = Field(default=1, ge=1, le=1440)
+    max_airings: int = Field(default=1, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def _validate_repeat(self) -> "InsertRepeatRequest":
+        if self.mode == InsertRepeatMode.ONCE:
+            self.every_n_rotations = 1
+            self.max_airings = 1
+        return self
+
+
+class CreateInsertBaseRequest(ApiModel):
+    title: str = Field(min_length=1, max_length=160)
+    placement: InsertPlacement = Field(default=InsertPlacement.AFTER_TIME)
+    start_after: dt.datetime | None = None
+    expires_at: dt.datetime
+    repeat: InsertRepeatRequest = Field(default_factory=InsertRepeatRequest)
+    defer_during_active_alerts: bool = True
+
+    @field_validator("title")
+    @classmethod
+    def _validate_title(cls, value: str) -> str:
+        if not _PRINTABLE_RE.fullmatch(value):
+            raise ValueError("title contains unsupported characters")
+        return value
+
+    @field_validator("start_after", "expires_at")
+    @classmethod
+    def _validate_datetime(cls, value: dt.datetime | None) -> dt.datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("datetime values must include a timezone offset")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_window(self) -> "CreateInsertBaseRequest":
+        if self.start_after is not None and self.expires_at <= self.start_after:
+            raise ValueError("expires_at must be after start_after")
+        return self
+
+
+class CreateTextInsertRequest(CreateInsertBaseRequest):
+    text: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("text")
+    @classmethod
+    def _validate_text(cls, value: str) -> str:
+        if not _PRINTABLE_RE.fullmatch(value):
+            raise ValueError("text contains unsupported characters")
+        return value.strip()
+
+
+class CreateAudioInsertRequest(CreateInsertBaseRequest):
+    audio_asset_id: str = Field(min_length=8, max_length=64)
+
+    @field_validator("audio_asset_id")
+    @classmethod
+    def _validate_asset_id(cls, value: str) -> str:
+        v = value.strip()
+        if not re.fullmatch(r"^[A-Za-z0-9_-]{8,64}$", v):
+            raise ValueError("audio_asset_id contains unsupported characters")
+        return v
+
+
+class CycleInsertSnapshot(ApiModel):
+    insert_id: str
+    kind: InsertKind
+    title: str
+    placement: InsertPlacement
+    start_after: str | None = None
+    expires_at: str
+    repeat: dict[str, Any]
+    defer_during_active_alerts: bool
+    status: str
+    actor: str
+    created_at: str
+    updated_at: str
+    last_aired_at: str | None = None
+    airing_count: int
+    max_airings: int
+    duration_seconds: float
+    estimated_next_air_at: str | None = None
+    estimate_confidence: str | None = None
+    estimate_window_seconds: int | None = None
+    audio_asset_id: str | None = None
+
+
+class CycleInsertList(ApiModel):
+    inserts: list[CycleInsertSnapshot]
 
 
 class ProblemDetails(BaseModel):

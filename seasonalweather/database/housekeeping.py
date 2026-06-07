@@ -26,6 +26,7 @@ _GENERATED_AUDIO_GLOBS = (
     "cycle_seg*.wav",
     "cycle_time*.wav",
     "ipawsvoice_*.wav",
+    "insert_*.wav",
     "nwwsvoice_*.wav",
     "rebcast_*.wav",
 )
@@ -328,6 +329,18 @@ class DatabaseHousekeeper:
                 ).fetchall()
                 for row in feed_rows:
                     self._add_station_feed_audio_paths(keep, str(row["payload_json"] or "{}"))
+
+                insert_rows = conn.execute(
+                    """
+                    SELECT audio_path FROM cycle_inserts
+                    WHERE audio_path IS NOT NULL
+                      AND status = 'active'
+                      AND expires_at >= ?
+                    """,
+                    (now_iso,),
+                ).fetchall()
+                for row in insert_rows:
+                    self._add_audio_path(keep, row["audio_path"])
         except Exception:
             log.exception("database housekeeping: failed to load protected audio paths")
 

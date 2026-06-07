@@ -42,6 +42,7 @@ _DEFAULT_ADMIN_SCOPES = frozenset(
         "control:tests",
         "control:originate",
         "control:audio",
+        "control:inserts",
         "control:config",
     }
 )

@@ -14,11 +14,21 @@ from types import SimpleNamespace
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .api.models import InterruptPolicy, OriginateAudioRequest, OriginateTextRequest, VoiceMode
+from .api.models import (
+    CreateAudioInsertRequest,
+    CreateTextInsertRequest,
+    InterruptPolicy,
+    OriginateAudioRequest,
+    OriginateTextRequest,
+    VoiceMode,
+)
 from .config import AppConfig, load_config
 from .broadcast.cycle import CycleBuilder
+from .broadcast.segment_store import render_segment_wav
 from .database.assets import AudioAssetRepository
+from .database.inserts import CycleInsertRepository
 from .database.station_feed import StationFeedRepository
+from .tts.audio import wav_duration_seconds
 from .tts.tts import TTS
 from .same.locations import (
     normalize_same_allow_set,
@@ -62,6 +72,7 @@ class OrchestratorControl:
         self._supported_interrupt_policies = {InterruptPolicy.INTERRUPT_THEN_REFILL.value}
         db = getattr(self.orch, "database", None)
         self._audio_asset_repo = AudioAssetRepository(db) if db is not None else None
+        self._cycle_insert_repo = CycleInsertRepository(db) if db is not None else None
         self._station_feed_repo = getattr(self.orch, "station_feed_repo", None)
         if self._station_feed_repo is None and db is not None:
             self._station_feed_repo = StationFeedRepository(db)
@@ -119,6 +130,32 @@ class OrchestratorControl:
 
     def _asset_max_duration_seconds(self) -> float:
         return max(1.0, min(float(self.orch.cfg.api.audio_max_seconds), 3600.0))
+
+    def _require_insert_repo(self) -> CycleInsertRepository:
+        if self._cycle_insert_repo is None:
+            raise DependencyUnavailableError(
+                "database_required",
+                "Scheduled broadcast inserts require the SQLite database to be enabled.",
+            )
+        return self._cycle_insert_repo
+
+    def _to_utc_dt(self, value: dt.datetime) -> dt.datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ControlError("invalid_datetime", "Datetime values must include a timezone offset.")
+        return value.astimezone(dt.timezone.utc).replace(microsecond=0)
+
+    def _insert_audio_path(self, insert_id: str) -> Path:
+        _work_dir, audio_dir, _cache_dir, _logs_dir = self._work_paths()
+        return audio_dir / f"insert_{insert_id}.wav"
+
+    def _validate_insert_id(self, insert_id: str) -> str:
+        v = str(insert_id or "").strip()
+        if not v or len(v) > 64 or not all(ch.isalnum() or ch in {"_", "-"} for ch in v):
+            raise ControlError("invalid_insert_id", "insert_id contains unsupported characters.")
+        return v
+
+    def _enum_value(self, value: Any) -> str:
+        return str(getattr(value, "value", value))
 
 
     def _station_sample_rate(self) -> int:
@@ -734,6 +771,295 @@ class OrchestratorControl:
             except Exception:
                 pass
         return result
+
+    def _format_insert_snapshot(self, item: dict[str, Any]) -> dict[str, Any]:
+        repeat = {
+            "mode": item.get("repeat_mode") or "once",
+            "every_n_rotations": int(item.get("repeat_every_rotations") or 1),
+            "max_airings": int(item.get("max_airings") or 1),
+        }
+        estimate = self._estimate_insert_airtime(item)
+        snapshot = {
+            "insert_id": item["insert_id"],
+            "kind": item["kind"],
+            "title": item["title"],
+            "placement": item["placement"],
+            "start_after": item.get("start_after"),
+            "expires_at": item["expires_at"],
+            "repeat": repeat,
+            "defer_during_active_alerts": bool(item.get("defer_during_active_alerts", True)),
+            "status": item.get("status") or "active",
+            "actor": item.get("actor") or "",
+            "created_at": item.get("created_at") or "",
+            "updated_at": item.get("updated_at") or "",
+            "last_aired_at": item.get("last_aired_at"),
+            "airing_count": int(item.get("airing_count") or 0),
+            "max_airings": int(item.get("max_airings") or 1),
+            "duration_seconds": round(float(item.get("duration_seconds") or 0.0), 3),
+            "estimated_next_air_at": estimate.get("estimated_next_air_at"),
+            "estimate_confidence": estimate.get("estimate_confidence"),
+            "estimate_window_seconds": estimate.get("estimate_window_seconds"),
+            "audio_asset_id": item.get("audio_asset_id"),
+        }
+        return snapshot
+
+    def _estimate_insert_airtime(self, item: dict[str, Any]) -> dict[str, Any]:
+        if item.get("status") != "active":
+            return {"estimated_next_air_at": None, "estimate_confidence": None, "estimate_window_seconds": None}
+
+        now = self._now_utc().replace(microsecond=0)
+        try:
+            start_raw = item.get("start_after")
+            if start_raw:
+                start = dt.datetime.fromisoformat(str(start_raw))
+                if start.tzinfo is None:
+                    start = start.replace(tzinfo=dt.timezone.utc)
+                start = start.astimezone(dt.timezone.utc).replace(microsecond=0)
+            else:
+                start = now
+        except Exception:
+            start = now
+
+        try:
+            expires = dt.datetime.fromisoformat(str(item.get("expires_at")))
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=dt.timezone.utc)
+            expires = expires.astimezone(dt.timezone.utc).replace(microsecond=0)
+        except Exception:
+            expires = now
+        if expires <= now:
+            return {"estimated_next_air_at": None, "estimate_confidence": None, "estimate_window_seconds": None}
+
+        placement_offsets = {
+            "after_time": 45,
+            "after_status": 120,
+            "end_of_rotation": 300,
+        }
+        placement = str(item.get("placement") or "after_time")
+        buffered = 0.0
+        try:
+            conductor = getattr(self.orch, "conductor", None)
+            if conductor is not None:
+                buffered = float(getattr(conductor, "estimated_remaining_s", 0.0) or 0.0)
+        except Exception:
+            buffered = 0.0
+        estimate = now + dt.timedelta(seconds=buffered + placement_offsets.get(placement, 120))
+        if estimate < start:
+            estimate = start
+        if estimate >= expires:
+            return {"estimated_next_air_at": None, "estimate_confidence": "best_effort", "estimate_window_seconds": 180}
+        return {
+            "estimated_next_air_at": self._serialize_dt(estimate),
+            "estimate_confidence": "best_effort",
+            "estimate_window_seconds": 180,
+        }
+
+    async def _render_text_insert_audio(self, *, insert_id: str, text: str) -> tuple[Path, float]:
+        out_path = self._insert_audio_path(insert_id)
+        loop = asyncio.get_event_loop()
+        duration = await loop.run_in_executor(
+            None,
+            lambda: render_segment_wav(
+                self.orch.tts,
+                text,
+                out_path,
+                sample_rate=self._station_sample_rate(),
+            ),
+        )
+        return out_path, float(duration)
+
+    def _copy_insert_audio_asset(self, *, insert_id: str, audio_asset_id: str) -> tuple[Path, float]:
+        meta = self._load_audio_asset(audio_asset_id)
+        source_wav = Path(meta["path"])
+        out_path = self._insert_audio_path(insert_id)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_wav, out_path)
+        try:
+            duration = float(meta.get("duration_seconds") or 0.0)
+        except Exception:
+            duration = 0.0
+        if duration <= 0.0:
+            duration = float(wav_duration_seconds(out_path))
+        return out_path, duration
+
+    def _base_insert_record(
+        self,
+        *,
+        insert_id: str,
+        kind: str,
+        title: str,
+        placement: str,
+        start_after: dt.datetime | None,
+        expires_at: dt.datetime,
+        repeat_mode: str,
+        repeat_every_rotations: int,
+        max_airings: int,
+        defer_during_active_alerts: bool,
+        actor: str,
+        audio_path: Path,
+        duration_seconds: float,
+        text: str | None = None,
+        audio_asset_id: str | None = None,
+    ) -> dict[str, Any]:
+        now_iso = self._serialize_dt(self._now_utc())
+        start_iso = self._serialize_dt(start_after) if start_after is not None else None
+        expires_iso = self._serialize_dt(expires_at)
+        assert now_iso is not None and expires_iso is not None
+        return {
+            "insert_id": insert_id,
+            "kind": kind,
+            "title": title,
+            "text": text,
+            "audio_path": str(audio_path),
+            "audio_asset_id": audio_asset_id,
+            "placement": placement,
+            "start_after": start_iso,
+            "expires_at": expires_iso,
+            "repeat_mode": repeat_mode,
+            "repeat_every_rotations": repeat_every_rotations,
+            "max_airings": max_airings,
+            "defer_during_active_alerts": defer_during_active_alerts,
+            "status": "active",
+            "actor": actor,
+            "created_at": now_iso,
+            "updated_at": now_iso,
+            "last_aired_at": None,
+            "airing_count": 0,
+            "last_aired_rotation": None,
+            "duration_seconds": duration_seconds,
+            "meta": {"source": "api"},
+        }
+
+    def _notify_inserts_changed(self) -> None:
+        try:
+            conductor = getattr(self.orch, "conductor", None)
+            if conductor is not None and hasattr(conductor, "notify_inserts_changed"):
+                conductor.notify_inserts_changed()
+        except Exception:
+            pass
+
+    async def create_text_insert(self, req: CreateTextInsertRequest, *, actor: str) -> dict[str, Any]:
+        repo = self._require_insert_repo()
+        now = self._now_utc().replace(microsecond=0)
+        expires_at = self._to_utc_dt(req.expires_at)
+        if expires_at <= now:
+            raise ControlError("insert_expired", "expires_at must be in the future.")
+        start_after = self._to_utc_dt(req.start_after) if req.start_after is not None else None
+        insert_id = f"ins_{uuid.uuid4().hex[:20]}"
+        audio_path, duration = await self._render_text_insert_audio(insert_id=insert_id, text=req.text)
+        repeat = req.repeat
+        record = self._base_insert_record(
+            insert_id=insert_id,
+            kind="text",
+            title=req.title,
+            text=req.text,
+            audio_path=audio_path,
+            duration_seconds=duration,
+            placement=self._enum_value(req.placement),
+            start_after=start_after,
+            expires_at=expires_at,
+            repeat_mode=self._enum_value(repeat.mode),
+            repeat_every_rotations=int(repeat.every_n_rotations),
+            max_airings=int(repeat.max_airings),
+            defer_during_active_alerts=bool(req.defer_during_active_alerts),
+            actor=actor,
+        )
+        repo.upsert_insert(record)
+        self._notify_inserts_changed()
+        try:
+            self.orch.discord.api_action(
+                method="POST",
+                endpoint="/v1/inserts/text",
+                actor=actor,
+                status="succeeded",
+                headline=req.title,
+                details={"insert_id": insert_id, "placement": self._enum_value(req.placement)},
+            )
+        except Exception:
+            pass
+        snapshot = self._format_insert_snapshot(record)
+        return {"ok": True, "insert": snapshot, "insert_id": insert_id}
+
+    async def create_audio_insert(self, req: CreateAudioInsertRequest, *, actor: str) -> dict[str, Any]:
+        repo = self._require_insert_repo()
+        now = self._now_utc().replace(microsecond=0)
+        expires_at = self._to_utc_dt(req.expires_at)
+        if expires_at <= now:
+            raise ControlError("insert_expired", "expires_at must be in the future.")
+        start_after = self._to_utc_dt(req.start_after) if req.start_after is not None else None
+        insert_id = f"ins_{uuid.uuid4().hex[:20]}"
+        audio_path, duration = self._copy_insert_audio_asset(insert_id=insert_id, audio_asset_id=req.audio_asset_id)
+        repeat = req.repeat
+        record = self._base_insert_record(
+            insert_id=insert_id,
+            kind="audio",
+            title=req.title,
+            audio_asset_id=req.audio_asset_id,
+            audio_path=audio_path,
+            duration_seconds=duration,
+            placement=self._enum_value(req.placement),
+            start_after=start_after,
+            expires_at=expires_at,
+            repeat_mode=self._enum_value(repeat.mode),
+            repeat_every_rotations=int(repeat.every_n_rotations),
+            max_airings=int(repeat.max_airings),
+            defer_during_active_alerts=bool(req.defer_during_active_alerts),
+            actor=actor,
+        )
+        repo.upsert_insert(record)
+        self._notify_inserts_changed()
+        try:
+            self.orch.discord.api_action(
+                method="POST",
+                endpoint="/v1/inserts/audio",
+                actor=actor,
+                status="succeeded",
+                headline=req.title,
+                details={"insert_id": insert_id, "placement": self._enum_value(req.placement), "asset_id": req.audio_asset_id},
+            )
+        except Exception:
+            pass
+        snapshot = self._format_insert_snapshot(record)
+        return {"ok": True, "insert": snapshot, "insert_id": insert_id}
+
+    async def list_inserts(self, *, include_inactive: bool = False, limit: int = 100) -> list[dict[str, Any]]:
+        repo = self._require_insert_repo()
+        now_iso = self._serialize_dt(self._now_utc())
+        if now_iso is not None:
+            repo.expire_due(now_iso)
+        return [self._format_insert_snapshot(item) for item in repo.list_inserts(include_inactive=include_inactive, limit=limit)]
+
+    async def get_insert(self, insert_id: str) -> dict[str, Any]:
+        repo = self._require_insert_repo()
+        insert_id = self._validate_insert_id(insert_id)
+        now_iso = self._serialize_dt(self._now_utc())
+        if now_iso is not None:
+            repo.expire_due(now_iso)
+        item = repo.get_insert(insert_id)
+        if item is None:
+            raise NotFoundError("insert_not_found", "Scheduled insert was not found.", details={"insert_id": insert_id})
+        return self._format_insert_snapshot(item)
+
+    async def cancel_insert(self, insert_id: str, *, actor: str) -> dict[str, Any]:
+        repo = self._require_insert_repo()
+        insert_id = self._validate_insert_id(insert_id)
+        updated_at = self._serialize_dt(self._now_utc())
+        assert updated_at is not None
+        item = repo.cancel_insert(insert_id=insert_id, updated_at=updated_at)
+        if item is None:
+            raise NotFoundError("insert_not_found", "Scheduled insert was not found.", details={"insert_id": insert_id})
+        self._notify_inserts_changed()
+        try:
+            self.orch.discord.api_action(
+                method="DELETE",
+                endpoint=f"/v1/inserts/{insert_id}",
+                actor=actor,
+                status="succeeded",
+                details={"insert_id": insert_id},
+            )
+        except Exception:
+            pass
+        return {"ok": True, "insert": self._format_insert_snapshot(item), "insert_id": insert_id}
 
     async def reload_config(self, *, actor: str, reason: str | None = None) -> dict[str, Any]:
         old_hash = self._config_file_hash()

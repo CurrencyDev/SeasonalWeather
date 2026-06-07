@@ -7,7 +7,7 @@ import uuid
 from http import HTTPStatus
 from typing import Any, Awaitable, Callable
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Response, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -21,6 +21,10 @@ from .models import (
     CommandAccepted,
     CommandSnapshot,
     ConfigReloadRequest,
+    CreateAudioInsertRequest,
+    CreateTextInsertRequest,
+    CycleInsertList,
+    CycleInsertSnapshot,
     OriginateAudioRequest,
     OriginateTestRequest,
     OriginateTextRequest,
@@ -436,6 +440,102 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
         except ControlError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.to_dict()) from exc
         return AudioUploadAccepted.model_validate(payload)
+
+    @app.post(
+        "/v1/inserts/text",
+        response_model=CommandAccepted,
+        tags=["inserts"],
+        summary="Schedule a bounded text insert into the normal broadcast cycle.",
+        responses=STANDARD_PROBLEM_RESPONSES,
+    )
+    async def v1_inserts_text(
+        req: CreateTextInsertRequest,
+        principal: ApiPrincipal = Depends(require_scopes("control:inserts")),
+        idempotency_key: str = Depends(_require_idempotency_key),
+    ) -> CommandAccepted:
+        payload = req.model_dump(mode="json")
+        return await _execute_command(
+            store=command_store,
+            principal=principal,
+            idempotency_key=idempotency_key,
+            command_type="inserts.text.create",
+            payload=payload,
+            action=lambda: control.create_text_insert(req, actor=principal.subject),
+            success_event="inserts.changed",
+        )
+
+    @app.post(
+        "/v1/inserts/audio",
+        response_model=CommandAccepted,
+        tags=["inserts"],
+        summary="Schedule a bounded uploaded-audio insert into the normal broadcast cycle.",
+        responses=STANDARD_PROBLEM_RESPONSES,
+    )
+    async def v1_inserts_audio(
+        req: CreateAudioInsertRequest,
+        principal: ApiPrincipal = Depends(require_scopes("control:inserts")),
+        idempotency_key: str = Depends(_require_idempotency_key),
+    ) -> CommandAccepted:
+        payload = req.model_dump(mode="json")
+        return await _execute_command(
+            store=command_store,
+            principal=principal,
+            idempotency_key=idempotency_key,
+            command_type="inserts.audio.create",
+            payload=payload,
+            action=lambda: control.create_audio_insert(req, actor=principal.subject),
+            success_event="inserts.changed",
+        )
+
+    @app.get(
+        "/v1/inserts",
+        response_model=CycleInsertList,
+        tags=["inserts"],
+        summary="List scheduled broadcast-cycle inserts.",
+        responses=STANDARD_PROBLEM_RESPONSES,
+    )
+    async def v1_inserts_list(
+        include_inactive: bool = Query(default=False),
+        limit: int = Query(default=100, ge=1, le=500),
+        principal: ApiPrincipal = Depends(require_scopes("control:inserts")),
+    ) -> CycleInsertList:
+        return CycleInsertList(inserts=[CycleInsertSnapshot.model_validate(item) for item in await control.list_inserts(include_inactive=include_inactive, limit=limit)])
+
+    @app.get(
+        "/v1/inserts/{insert_id}",
+        response_model=CycleInsertSnapshot,
+        tags=["inserts"],
+        summary="Return one scheduled broadcast-cycle insert.",
+        responses=STANDARD_PROBLEM_RESPONSES,
+    )
+    async def v1_inserts_get(
+        insert_id: str,
+        principal: ApiPrincipal = Depends(require_scopes("control:inserts")),
+    ) -> CycleInsertSnapshot:
+        return CycleInsertSnapshot.model_validate(await control.get_insert(insert_id))
+
+    @app.delete(
+        "/v1/inserts/{insert_id}",
+        response_model=CommandAccepted,
+        tags=["inserts"],
+        summary="Cancel a scheduled broadcast-cycle insert.",
+        responses=STANDARD_PROBLEM_RESPONSES,
+    )
+    async def v1_inserts_cancel(
+        insert_id: str,
+        principal: ApiPrincipal = Depends(require_scopes("control:inserts")),
+        idempotency_key: str = Depends(_require_idempotency_key),
+    ) -> CommandAccepted:
+        payload = {"insert_id": insert_id}
+        return await _execute_command(
+            store=command_store,
+            principal=principal,
+            idempotency_key=idempotency_key,
+            command_type="inserts.cancel",
+            payload=payload,
+            action=lambda: control.cancel_insert(insert_id, actor=principal.subject),
+            success_event="inserts.changed",
+        )
 
     @app.post(
         "/v1/originate/text",
