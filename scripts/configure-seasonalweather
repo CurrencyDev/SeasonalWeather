@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Launch the SeasonalWeather interactive configuration assistant.
+set -euo pipefail
+
+APP_DIR="${SEASONALWEATHER_APP_DIR:-/opt/seasonalweather/app}"
+PYTHON="${SEASONALWEATHER_PYTHON:-/opt/seasonalweather/venv/bin/python}"
+
+if [[ ! -x "${PYTHON}" ]]; then
+  PYTHON="$(command -v python3)"
+fi
+
+if [[ -d "${APP_DIR}" ]]; then
+  cd "${APP_DIR}"
+fi
+
+exec "${PYTHON}" -m seasonalweather.cli.configure "$@"

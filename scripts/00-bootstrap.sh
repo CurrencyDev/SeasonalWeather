@@ -10,24 +10,309 @@
 # Do NOT clone directly into /opt/seasonalweather/app/ — clone elsewhere and let
 # this script handle the deploy.
 #
-# Optional environment variables:
-#   SEASONAL_VOICETEXT_PAUL=1   — also install the VoiceText Paul (Wine) TTS backend
-#   SEASONAL_DECTALK=1          — install DECtalk (builds from source; slow)
-#   SEASONAL_DECTALK_UPDATE=1   — pull latest DECtalk source before rebuilding
-#   SEASONAL_SAMEDEC=0          — skip installing the Rust samedec decoder
-#   SEASONAL_SAMEDEC_VERSION=x  — override pinned samedec crate version
+# Interactive by default when run from a TTY. Use --non-interactive for
+# automation/CI. Environment variables remain supported:
+#   SEASONAL_INSTALL_PROFILE=x  — minimal|standard|voicetext-paul|dectalk|custom
+#   SEASONAL_ESPEAK=0|1        — install espeak-ng fallback TTS packages
+#   SEASONAL_FESTIVAL=0|1      — install Festival TTS packages
+#   SEASONAL_PIPER=0|1         — install Piper Python TTS requirements
+#   SEASONAL_VOICETEXT_PAUL=1  — install the VoiceText Paul (Wine) TTS backend
+#   SEASONAL_DECTALK=1         — install DECtalk (builds from source; slow)
+#   SEASONAL_DECTALK_UPDATE=1  — pull latest DECtalk source before rebuilding
+#   SEASONAL_SAMEDEC=0         — skip installing the Rust samedec decoder
+#   SEASONAL_SAMEDEC_VERSION=x — override pinned samedec crate version
 #
 set -euo pipefail
+
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+log()  { echo "[+] $*"; }
+warn() { echo "[!] $*" >&2; }
+
+ui_notice() { echo "[/]: $*"; }
+
+BOOTSTRAP_NONINTERACTIVE="${SEASONAL_BOOTSTRAP_NONINTERACTIVE:-0}"
+BOOTSTRAP_TUI="${SEASONAL_BOOTSTRAP_TUI:-auto}"
+BOOTSTRAP_PROFILE="${SEASONAL_INSTALL_PROFILE:-}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --non-interactive)
+      BOOTSTRAP_NONINTERACTIVE=1
+      shift
+      ;;
+    --profile)
+      BOOTSTRAP_PROFILE="${2:-}"
+      shift 2
+      ;;
+    --no-tui)
+      BOOTSTRAP_TUI=0
+      shift
+      ;;
+    --tui)
+      BOOTSTRAP_TUI=1
+      shift
+      ;;
+    -h|--help)
+      cat <<'EOF'
+Usage: sudo bash scripts/00-bootstrap.sh [options]
+
+Options:
+  --non-interactive       Do not prompt; use env vars/defaults only.
+  --profile NAME          Install profile: minimal, standard, voicetext-paul, dectalk, custom.
+  --tui                   Require a dialog/whiptail TUI when interactive.
+  --no-tui                Use stdout/stdin prompts when interactive.
+
+Environment overrides remain supported for automation:
+  SEASONAL_INSTALL_PROFILE=minimal|standard|voicetext-paul|dectalk|custom
+  SEASONAL_ESPEAK=0|1
+  SEASONAL_FESTIVAL=0|1
+  SEASONAL_PIPER=0|1
+  SEASONAL_DECTALK=0|1
+  SEASONAL_VOICETEXT_PAUL=0|1
+  SEASONAL_SAMEDEC=0|1
+EOF
+      exit 0
+      ;;
+    *)
+      warn "Unknown option: $1"
+      exit 2
+      ;;
+  esac
+done
 
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   echo "Run as root: sudo bash $0"
   exit 1
 fi
 
-SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+is_interactive() {
+  [[ "${BOOTSTRAP_NONINTERACTIVE}" != "1" && -t 0 && -t 1 ]]
+}
 
-log()  { echo "[+] $*"; }
-warn() { echo "[!] $*" >&2; }
+UI_TOOL="plain"
+init_ui() {
+  if ! is_interactive || [[ "${BOOTSTRAP_TUI}" == "0" ]]; then
+    return 0
+  fi
+
+  if command -v dialog >/dev/null 2>&1; then
+    UI_TOOL="dialog"
+    ui_notice "using dialog Terminal User Interface"
+    return 0
+  fi
+  if command -v whiptail >/dev/null 2>&1; then
+    UI_TOOL="whiptail"
+    ui_notice "using whiptail Terminal User Interface"
+    return 0
+  fi
+
+  ui_notice "dialog/whiptail not found, falling back to stdout/stdin and disabling Terminal User Interface"
+  if [[ "${BOOTSTRAP_TUI}" == "1" ]]; then
+    warn "--tui was requested but neither dialog nor whiptail is installed"
+    exit 1
+  fi
+}
+
+plain_menu() {
+  local title="$1" default="$2"
+  shift 2
+  local -a values=()
+  local -a labels=()
+  local i=1
+  echo >&2
+  echo "${title}" >&2
+  while [[ $# -gt 0 ]]; do
+    values+=("$1")
+    labels+=("$2")
+    printf '  %d) %s\n' "${i}" "$2" >&2
+    shift 2
+    i=$((i + 1))
+  done
+  local answer
+  while true; do
+    read -r -p "Select [${default}]: " answer
+    answer="${answer:-${default}}"
+    if [[ "${answer}" =~ ^[0-9]+$ ]] && (( answer >= 1 && answer <= ${#values[@]} )); then
+      printf '%s\n' "${values[$((answer - 1))]}"
+      return 0
+    fi
+    for i in "${!values[@]}"; do
+      if [[ "${answer}" == "${values[$i]}" ]]; then
+        printf '%s\n' "${values[$i]}"
+        return 0
+      fi
+    done
+    warn "Invalid selection: ${answer}"
+  done
+}
+
+tui_menu() {
+  local title="$1" default="$2"
+  shift 2
+  local -a args=()
+  local selected=""
+  while [[ $# -gt 0 ]]; do
+    args+=("$1" "$2")
+    shift 2
+  done
+
+  if [[ "${UI_TOOL}" == "dialog" ]]; then
+    selected="$(dialog --stdout --title "SeasonalWeather bootstrap" --default-item "${default}" --menu "${title}" 18 76 8 "${args[@]}")" || return 1
+  elif [[ "${UI_TOOL}" == "whiptail" ]]; then
+    selected="$(whiptail --title "SeasonalWeather bootstrap" --default-item "${default}" --menu "${title}" 18 76 8 "${args[@]}" 3>&1 1>&2 2>&3)" || return 1
+  else
+    return 1
+  fi
+  printf '%s\n' "${selected}"
+}
+
+choose_menu() {
+  local title="$1" default="$2"
+  shift 2
+  if [[ "${UI_TOOL}" != "plain" ]]; then
+    tui_menu "${title}" "${default}" "$@" && return 0
+  fi
+  plain_menu "${title}" "${default}" "$@"
+}
+
+plain_yesno() {
+  local prompt="$1" default="$2" answer
+  while true; do
+    read -r -p "${prompt} [${default}]: " answer
+    answer="${answer:-${default}}"
+    case "${answer,,}" in
+      y|yes|1|true) return 0 ;;
+      n|no|0|false) return 1 ;;
+      *) warn "Enter yes or no." ;;
+    esac
+  done
+}
+
+tui_yesno() {
+  local prompt="$1" default="$2"
+  local extra=()
+  [[ "${default,,}" == "n" || "${default,,}" == "no" ]] && extra+=(--defaultno)
+  if [[ "${UI_TOOL}" == "dialog" ]]; then
+    dialog --title "SeasonalWeather bootstrap" "${extra[@]}" --yesno "${prompt}" 8 76
+  elif [[ "${UI_TOOL}" == "whiptail" ]]; then
+    whiptail --title "SeasonalWeather bootstrap" "${extra[@]}" --yesno "${prompt}" 8 76
+  else
+    return 2
+  fi
+}
+
+choose_yesno() {
+  local prompt="$1" default="$2"
+  if [[ "${UI_TOOL}" != "plain" ]]; then
+    tui_yesno "${prompt}" "${default}" && return 0
+    local rc=$?
+    [[ ${rc} -eq 1 ]] && return 1
+  fi
+  plain_yesno "${prompt}" "${default}"
+}
+
+apply_install_profile() {
+  local profile="$1"
+  case "${profile}" in
+    minimal)
+      SEASONAL_ESPEAK="${SEASONAL_ESPEAK:-0}"
+      SEASONAL_FESTIVAL="${SEASONAL_FESTIVAL:-0}"
+      SEASONAL_PIPER="${SEASONAL_PIPER:-0}"
+      SEASONAL_DECTALK="${SEASONAL_DECTALK:-0}"
+      SEASONAL_VOICETEXT_PAUL="${SEASONAL_VOICETEXT_PAUL:-0}"
+      SEASONAL_SAMEDEC="${SEASONAL_SAMEDEC:-0}"
+      ;;
+    standard)
+      SEASONAL_ESPEAK="${SEASONAL_ESPEAK:-1}"
+      SEASONAL_FESTIVAL="${SEASONAL_FESTIVAL:-0}"
+      SEASONAL_PIPER="${SEASONAL_PIPER:-0}"
+      SEASONAL_DECTALK="${SEASONAL_DECTALK:-0}"
+      SEASONAL_VOICETEXT_PAUL="${SEASONAL_VOICETEXT_PAUL:-0}"
+      SEASONAL_SAMEDEC="${SEASONAL_SAMEDEC:-1}"
+      ;;
+    voicetext-paul|voicetext_paul|vt-paul)
+      SEASONAL_ESPEAK="${SEASONAL_ESPEAK:-0}"
+      SEASONAL_FESTIVAL="${SEASONAL_FESTIVAL:-0}"
+      SEASONAL_PIPER="${SEASONAL_PIPER:-0}"
+      SEASONAL_DECTALK="${SEASONAL_DECTALK:-0}"
+      SEASONAL_VOICETEXT_PAUL="${SEASONAL_VOICETEXT_PAUL:-1}"
+      SEASONAL_SAMEDEC="${SEASONAL_SAMEDEC:-1}"
+      ;;
+    dectalk)
+      SEASONAL_ESPEAK="${SEASONAL_ESPEAK:-0}"
+      SEASONAL_FESTIVAL="${SEASONAL_FESTIVAL:-0}"
+      SEASONAL_PIPER="${SEASONAL_PIPER:-0}"
+      SEASONAL_DECTALK="${SEASONAL_DECTALK:-1}"
+      SEASONAL_VOICETEXT_PAUL="${SEASONAL_VOICETEXT_PAUL:-0}"
+      SEASONAL_SAMEDEC="${SEASONAL_SAMEDEC:-1}"
+      ;;
+    custom|"")
+      ;;
+    *)
+      warn "Unknown install profile '${profile}', falling back to standard"
+      apply_install_profile standard
+      ;;
+  esac
+}
+
+configure_interactive_features() {
+  init_ui
+
+  if ! is_interactive; then
+    apply_install_profile "${BOOTSTRAP_PROFILE:-standard}"
+    SEASONAL_ESPEAK="${SEASONAL_ESPEAK:-1}"
+    SEASONAL_FESTIVAL="${SEASONAL_FESTIVAL:-0}"
+    SEASONAL_PIPER="${SEASONAL_PIPER:-0}"
+    SEASONAL_DECTALK="${SEASONAL_DECTALK:-0}"
+    SEASONAL_VOICETEXT_PAUL="${SEASONAL_VOICETEXT_PAUL:-0}"
+    SEASONAL_SAMEDEC="${SEASONAL_SAMEDEC:-1}"
+    return 0
+  fi
+
+  local profile="${BOOTSTRAP_PROFILE}"
+  if [[ -z "${profile}" ]]; then
+    profile="$(choose_menu "Select install profile" "standard" \
+      minimal "Minimal daemon (no optional TTS/SAME decoder)" \
+      standard "Standard install (espeak-ng fallback + samedec)" \
+      voicetext-paul "VoiceText Paul production path" \
+      dectalk "DECtalk path" \
+      custom "Custom feature selection")"
+  fi
+
+  apply_install_profile "${profile}"
+
+  if [[ "${profile}" == "custom" ]]; then
+    choose_yesno "Install espeak-ng fallback TTS?" "Y" && SEASONAL_ESPEAK=1 || SEASONAL_ESPEAK=0
+    choose_yesno "Install Festival TTS packages?" "N" && SEASONAL_FESTIVAL=1 || SEASONAL_FESTIVAL=0
+    choose_yesno "Install Piper Python TTS stack?" "N" && SEASONAL_PIPER=1 || SEASONAL_PIPER=0
+    choose_yesno "Build/install DECtalk?" "N" && SEASONAL_DECTALK=1 || SEASONAL_DECTALK=0
+    choose_yesno "Install VoiceText Paul/Wine backend?" "N" && SEASONAL_VOICETEXT_PAUL=1 || SEASONAL_VOICETEXT_PAUL=0
+    choose_yesno "Install Rust samedec SAME decoder?" "Y" && SEASONAL_SAMEDEC=1 || SEASONAL_SAMEDEC=0
+  fi
+
+  cat <<EOF
+
+Selected SeasonalWeather install features:
+  espeak-ng fallback:   ${SEASONAL_ESPEAK:-0}
+  Festival:             ${SEASONAL_FESTIVAL:-0}
+  Piper Python stack:   ${SEASONAL_PIPER:-0}
+  DECtalk:              ${SEASONAL_DECTALK:-0}
+  VoiceText Paul:       ${SEASONAL_VOICETEXT_PAUL:-0}
+  samedec decoder:      ${SEASONAL_SAMEDEC:-0}
+EOF
+
+  choose_yesno "Continue with these selections?" "Y" || exit 1
+}
+
+install_packages() {
+  local label="$1"
+  shift
+  [[ $# -eq 0 ]] && return 0
+  log "Installing ${label}"
+  apt-get install -y --no-install-recommends "$@"
+}
+
 
 install_repo_wrapper() {
   local name="$1"
@@ -43,35 +328,56 @@ install_repo_wrapper() {
   install -m 755 "${src}" "${dest}"
 }
 
+configure_interactive_features
+
 export DEBIAN_FRONTEND=noninteractive
 
-# -----------------------------------------------------------------------------------------
-# Base OS packages
-# -----------------------------------------------------------------------------------------
-log "Installing OS packages"
-apt-get update -y
-apt-get install -y --no-install-recommends \
-  ca-certificates \
-  curl \
-  git \
-  build-essential \
-  pkg-config \
-  autoconf \
-  automake \
-  libasound2-dev \
-  libpulse-dev \
-  python3 python3-venv \
-  ffmpeg \
-  icecast2 \
-  liquidsoap \
-  espeak-ng \
-  sox \
-  rsync \
-  tzdata \
-  festival \
-  festvox-kallpc16k \
-  plocate \
+BASE_APT_PACKAGES=(
+  ca-certificates
+  curl
+  git
+  python3 python3-venv
+  ffmpeg
+  icecast2
+  liquidsoap
+  sox
+  rsync
+  tzdata
+  plocate
   sudo
+)
+ESPEAK_APT_PACKAGES=(espeak-ng)
+FESTIVAL_APT_PACKAGES=(festival festvox-kallpc16k)
+DECTALK_APT_PACKAGES=(
+  build-essential
+  pkg-config
+  autoconf
+  automake
+  libasound2-dev
+  libpulse-dev
+)
+
+# -----------------------------------------------------------------------------------------
+# OS packages
+# -----------------------------------------------------------------------------------------
+apt-get update -y
+install_packages "base OS packages" "${BASE_APT_PACKAGES[@]}"
+
+if [[ "${SEASONAL_ESPEAK:-1}" == "1" ]]; then
+  install_packages "espeak-ng fallback TTS packages" "${ESPEAK_APT_PACKAGES[@]}"
+else
+  log "Skipping espeak-ng fallback TTS packages"
+fi
+
+if [[ "${SEASONAL_FESTIVAL:-0}" == "1" ]]; then
+  install_packages "Festival TTS packages" "${FESTIVAL_APT_PACKAGES[@]}"
+else
+  log "Skipping Festival TTS packages"
+fi
+
+if [[ "${SEASONAL_DECTALK:-0}" == "1" ]]; then
+  install_packages "DECtalk build dependencies" "${DECTALK_APT_PACKAGES[@]}"
+fi
 
 # -----------------------------------------------------------------------------------------
 # System user + directories
@@ -104,6 +410,12 @@ if [[ ! -d /opt/seasonalweather/venv ]]; then
 fi
 /opt/seasonalweather/venv/bin/python -m pip install --upgrade pip wheel
 /opt/seasonalweather/venv/bin/pip install -r /opt/seasonalweather/app/requirements.txt
+if [[ "${SEASONAL_PIPER:-0}" == "1" ]]; then
+  log "Installing Piper Python TTS stack"
+  /opt/seasonalweather/venv/bin/pip install -r /opt/seasonalweather/app/requirements-piper.txt
+else
+  log "Skipping Piper Python TTS stack"
+fi
 
 # -----------------------------------------------------------------------------------------
 # samedec SAME/EAS decoder
@@ -149,7 +461,7 @@ fi
 # DECtalk (optional — set SEASONAL_DECTALK=1 to install)
 #
 #   Build from source: github.com/dectalk/dectalk (develop branch, autoconf/automake)
-#   Requires: autoconf automake libasound2-dev libpulse-dev (installed above)
+#   Requires: autoconf automake libasound2-dev libpulse-dev (installed when selected)
 #
 #   Built say binary:   /opt/dectalk/dectalk/src/dist/say
 #   Installed to:       /opt/dectalk/dectalk/dist/say  (path wrapper scripts expect)
@@ -538,6 +850,10 @@ if [[ "${SEASONAL_VOICETEXT_PAUL:-0}" == "1" && -f /etc/systemd/system/seasonalw
 fi
 
 log "Installing helper scripts (if present in repo)"
+if [[ -f "/opt/seasonalweather/app/scripts/configure-seasonalweather" ]]; then
+  bash -n /opt/seasonalweather/app/scripts/configure-seasonalweather
+  install -m 755 /opt/seasonalweather/app/scripts/configure-seasonalweather /usr/local/bin/seasonalweather-configure
+fi
 for f in seasonalweather-audio-prune.sh seasonalweather-prune-audio.sh; do
   if [[ -f "/opt/seasonalweather/app/scripts/${f}" ]]; then
     install -m 755 "/opt/seasonalweather/app/scripts/${f}" "/usr/local/sbin/${f}"
@@ -569,13 +885,14 @@ echo "   Always edit the LIVE config. Editing the repo template has no effect"
 echo "   on the running service."
 echo
 echo " Configuration:"
-echo "   Behaviour  →  sudo nano /etc/seasonalweather/config.yaml"
+echo "   Assistant  →  sudo seasonalweather-configure"
+echo "   Manual     →  sudo nano /etc/seasonalweather/config.yaml"
 echo "   Secrets    →  sudo nano /etc/seasonalweather/seasonalweather.env"
 echo
 echo " Next steps:"
-echo "   1) Set your service area, TTS backend (default: espeak-ng),"
-echo "      NWWS office, and other behaviour knobs in the LIVE config:"
-echo "      sudo nano /etc/seasonalweather/config.yaml"
+echo "   1) Generate/review a live config candidate:"
+echo "      sudo seasonalweather-configure"
+echo "      # or edit manually: sudo nano /etc/seasonalweather/config.yaml"
 echo
 echo "   2) Fill in credentials (NWWS_JID, NWWS_PASSWORD, ICECAST_SOURCE_PASSWORD):"
 echo "      sudo nano /etc/seasonalweather/seasonalweather.env"
@@ -591,7 +908,9 @@ echo
 echo " Listen:"
 echo "   http://<your-ip>:8000/seasonalweather.ogg"
 echo
-echo " Optional backends (re-run bootstrapper with env var to install):"
-echo "   DECtalk:        SEASONAL_DECTALK=1 sudo -E bash scripts/00-bootstrap.sh"
-echo "   VoiceText Paul: SEASONAL_VOICETEXT_PAUL=1 sudo -E bash scripts/00-bootstrap.sh"
+echo " Optional/re-run install profiles:"
+echo "   Standard:       sudo bash scripts/00-bootstrap.sh --profile standard"
+echo "   DECtalk:        sudo bash scripts/00-bootstrap.sh --profile dectalk"
+echo "   VoiceText Paul: sudo bash scripts/00-bootstrap.sh --profile voicetext-paul"
+echo "   Automation:     sudo bash scripts/00-bootstrap.sh --non-interactive"
 echo "======================================================="

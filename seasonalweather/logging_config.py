@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 import sys
 from typing import TYPE_CHECKING
@@ -10,6 +11,17 @@ if TYPE_CHECKING:
 
 _DEFAULT_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 _VALID_LEVELS = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"}
+_VALID_COLOR_MODES = {"never", "auto", "always"}
+_RESET = "\x1b[0m"
+_DIM = "\x1b[2m"
+_LEVEL_COLORS = {
+    "DEBUG": "\x1b[2m",
+    "INFO": "\x1b[32m",
+    "WARNING": "\x1b[33m",
+    "ERROR": "\x1b[31m",
+    "CRITICAL": "\x1b[1;31m",
+}
+_LOGGER_COLOR = "\x1b[36m"
 
 
 class _RuntimeMessageFilter(logging.Filter):
@@ -48,9 +60,42 @@ class _RuntimeMessageFilter(logging.Filter):
         return True
 
 
+class _AnsiFormatter(logging.Formatter):
+    """ANSI presentation formatter; never mutates the original LogRecord."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        colored = copy.copy(record)
+        level_color = _LEVEL_COLORS.get(str(record.levelname).upper(), "")
+        if level_color:
+            colored.levelname = f"{level_color}{record.levelname}{_RESET}"
+        colored.name = f"{_LOGGER_COLOR}{record.name}{_RESET}"
+        # Keep the timestamp dim but leave the application message itself clean.
+        rendered = super().format(colored)
+        if rendered:
+            parts = rendered.split(" ", 2)
+            if len(parts) >= 2:
+                parts[0] = f"{_DIM}{parts[0]}"
+                parts[1] = f"{parts[1]}{_RESET}"
+                rendered = " ".join(parts)
+        return rendered
+
+
 def _normalize_level(value: str | None, *, default: str) -> str:
     level = str(value or default).strip().upper()
     return level if level in _VALID_LEVELS else default
+
+
+def _normalize_color_mode(value: str | None, *, default: str = "never") -> str:
+    mode = str(value or default).strip().lower()
+    return mode if mode in _VALID_COLOR_MODES else default
+
+
+def _should_use_color(mode: str) -> bool:
+    if mode == "always":
+        return True
+    if mode == "auto":
+        return bool(getattr(sys.stdout, "isatty", lambda: False)())
+    return False
 
 
 def _apply_level(logger_name: str, level_name: str) -> None:
@@ -60,6 +105,7 @@ def _apply_level(logger_name: str, level_name: str) -> None:
 def setup_logging(cfg: "AppConfig | None" = None) -> None:
     runtime = getattr(getattr(cfg, "logs", None), "runtime", None)
     root_level = _normalize_level(getattr(runtime, "level", None), default="INFO")
+    color_mode = _normalize_color_mode(getattr(runtime, "color", None), default="never")
 
     logging.basicConfig(
         level=getattr(logging, root_level, logging.INFO),
@@ -68,10 +114,16 @@ def setup_logging(cfg: "AppConfig | None" = None) -> None:
         force=True,
     )
 
+    root_logger = logging.getLogger()
+    formatter: logging.Formatter
+    if _should_use_color(color_mode):
+        formatter = _AnsiFormatter(_DEFAULT_FORMAT)
+        for handler in root_logger.handlers:
+            handler.setFormatter(formatter)
+
     if runtime is None:
         return
 
-    root_logger = logging.getLogger()
     runtime_filter = _RuntimeMessageFilter(runtime)
     for handler in root_logger.handlers:
         handler.addFilter(runtime_filter)

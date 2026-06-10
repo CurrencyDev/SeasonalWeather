@@ -582,6 +582,7 @@ class DedupeConfig:
 class LogsRuntimeConfig:
     """Runtime/systemd logging policy knobs."""
     level: str = "INFO"
+    color: str = "never"  # never|auto|always
     httpx_level: str = "WARNING"
     httpcore_level: str = "WARNING"
     uvicorn_access_level: str = "WARNING"
@@ -1519,6 +1520,7 @@ def load_config(path: str) -> AppConfig:
     _lr = _get(raw, "logs", "runtime") or {}
     _logs_runtime = LogsRuntimeConfig(
         level=str(_get(_lr, "level", default="INFO") or "INFO").strip().upper(),
+        color=str(_get(_lr, "color", default="never") or "never").strip().lower(),
         httpx_level=str(_get(_lr, "httpx_level", default="WARNING") or "WARNING").strip().upper(),
         httpcore_level=str(_get(_lr, "httpcore_level", default="WARNING") or "WARNING").strip().upper(),
         uvicorn_access_level=str(_get(_lr, "uvicorn_access_level", default="WARNING") or "WARNING").strip().upper(),

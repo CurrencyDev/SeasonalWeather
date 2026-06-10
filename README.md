@@ -194,25 +194,52 @@ cd /tmp/SeasonalWeather
 sudo bash scripts/00-bootstrap.sh
 ```
 
-Optional backend installs:
+The bootstrapper is interactive by default when attached to a TTY. It tries to
+use `dialog` or `whiptail` for a terminal menu, then falls back to numbered
+stdout/stdin prompts with a notice if those helpers are unavailable. Automation
+can keep using env vars or pass `--non-interactive`.
+
+Install profiles:
 
 ```bash
-SEASONAL_DECTALK=1 sudo -E bash scripts/00-bootstrap.sh
-SEASONAL_VOICETEXT_PAUL=1 sudo -E bash scripts/00-bootstrap.sh
+sudo bash scripts/00-bootstrap.sh --profile standard
+sudo bash scripts/00-bootstrap.sh --profile voicetext-paul
+sudo bash scripts/00-bootstrap.sh --profile dectalk
+sudo bash scripts/00-bootstrap.sh --profile minimal
 ```
 
-The bootstrap installs the pinned Rust `samedec` decoder by default because ERN/GWES
-monitoring uses it when available. To skip it on a minimal/native-decoder-only
-host, run:
+Optional feature flags remain available for scripted installs:
 
 ```bash
-SEASONAL_SAMEDEC=0 sudo -E bash scripts/00-bootstrap.sh
+SEASONAL_ESPEAK=1 SEASONAL_SAMEDEC=1 sudo -E bash scripts/00-bootstrap.sh --non-interactive
+SEASONAL_PIPER=1 sudo -E bash scripts/00-bootstrap.sh --non-interactive
+SEASONAL_FESTIVAL=1 sudo -E bash scripts/00-bootstrap.sh --non-interactive
+SEASONAL_DECTALK=1 sudo -E bash scripts/00-bootstrap.sh --non-interactive
+SEASONAL_VOICETEXT_PAUL=1 sudo -E bash scripts/00-bootstrap.sh --non-interactive
+```
+
+The base Python requirements no longer install the Piper/ONNX/NumPy stack.
+Piper is installed only when `SEASONAL_PIPER=1` or the custom interactive
+selection enables it. Festival and DECtalk build dependencies are likewise
+feature-selected instead of being installed for every host.
+
+The configuration assistant defaults to preserving an existing live config when
+`/etc/seasonalweather/config.yaml` already exists. Use `--profile standard`,
+`--profile voicetext-paul`, or another explicit profile only when intentionally
+regenerating those high-level config choices.
+
+The bootstrap installs the pinned Rust `samedec` decoder by default in the
+standard, DECtalk, and VoiceText Paul profiles because ERN/GWES monitoring uses
+it when available. To skip it on a minimal/native-decoder-only host, run:
+
+```bash
+SEASONAL_SAMEDEC=0 sudo -E bash scripts/00-bootstrap.sh --non-interactive
 ```
 
 To deliberately refresh or change the pinned crate version:
 
 ```bash
-SEASONAL_SAMEDEC_VERSION=0.4.2 sudo -E bash scripts/00-bootstrap.sh
+SEASONAL_SAMEDEC_VERSION=0.4.2 sudo -E bash scripts/00-bootstrap.sh --non-interactive
 ```
 
 VoiceText Paul is smoke-tested during bootstrap. The repo-owned wrapper retries
@@ -228,6 +255,18 @@ between short-lived synth invocations. Operators may set
 `VOICETEXT_PAUL_WINEARCH=auto` only as a known-good fallback.
 
 ### 3) Configure the live files
+
+Use the configuration assistant to generate a candidate live config:
+
+```bash
+sudo seasonalweather-configure
+```
+
+The assistant writes `/etc/seasonalweather/config.yaml.new`, validates that the
+application can load it, and offers to back up and apply it. It is profile-driven
+and covers common operational settings; advanced operators may still edit the
+live YAML directly. Generated candidate YAML does not preserve comments from the
+source file.
 
 ```bash
 # Behaviour — this is the LIVE config the service reads
@@ -269,6 +308,7 @@ Example live config snippet:
 logs:
   runtime:
     level: INFO
+    color: never        # never|auto|always; ANSI output is presentation-only
     httpx_level: WARNING
     httpcore_level: WARNING
     uvicorn_access_level: WARNING
@@ -284,7 +324,7 @@ logs:
       seasonalweather.nwws: INFO
 ```
 
-Set the per-logger levels back to `INFO` or enable the boolean toggles when you want the firehose during troubleshooting.
+Set the per-logger levels back to `INFO` or enable the boolean toggles when you want the firehose during troubleshooting. Set `logs.runtime.color` to `auto` for local foreground runs, or `always` only when you deliberately want ANSI color preserved in journal output.
 
 ### 6) Listen
 

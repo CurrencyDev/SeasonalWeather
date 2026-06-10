@@ -554,13 +554,15 @@ class TTS:
 
                     shutil.copyfile(out_src, tmp_wav)
                     out_src.unlink(missing_ok=True)
-            else:
-                # default: espeak-ng
+            elif self.backend in {"espeak-ng", "espeak_ng", "espeak"}:
                 if not shutil.which("espeak-ng"):
-                    raise RuntimeError("espeak-ng not found")
+                    raise RuntimeError("espeak-ng backend selected but espeak-ng not found")
 
                 cmd = ["espeak-ng", "-v", self.voice, "-s", str(int(self.rate_wpm)), "-w", str(tmp_wav), msg]
                 subprocess.run(cmd, check=True)
+
+            else:
+                raise RuntimeError(f"unsupported TTS backend selected: {self.backend!r}")
 
             # Normalize to <sample_rate> stereo 16-bit for clean concatenation
             if not shutil.which("ffmpeg"):

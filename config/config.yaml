@@ -663,6 +663,7 @@ service_area:
 logs:
   runtime:
     level: "INFO"                 # root logger level for SeasonalWeather itself
+    color: "never"                # never|auto|always; ANSI color is presentation-only
     httpx_level: "WARNING"        # raise to INFO to see every outbound HTTP request again
     httpcore_level: "WARNING"
     uvicorn_access_level: "WARNING"
