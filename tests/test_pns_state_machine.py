@@ -96,3 +96,84 @@ $$
     assert decision.action == "ui_only"
     assert not decision.is_audio
     assert {"metadata", "table_header", "aligned_rows", "reject_keyword"}.intersection(decision.signals)
+
+
+def test_recent_severe_weather_safety_rules_pns_with_overnight_ugc_expiry_is_audio() -> None:
+    text = """464
+NOUS41 KLWX 112052
+PNSLWX
+DCZ001-MDZ003>006-008-011-013-014-016>018-501>510-VAZ025>031-
+036>040-050-051-053>057-501>508-526-527-WVZ050>053-055-501>506-
+120200-
+
+Public Information Statement
+National Weather Service Baltimore MD/Washington DC
+452 PM EDT Thu Jun 11 2026
+
+...SEVERE WEATHER SAFETY RULES...
+
+Severe thunderstorms capable of producing damaging winds and large
+hail are possible this afternoon into this evening across eastern
+West Virginia, northern and central Virginia, most of Maryland, and
+the District of Columbia.
+
+Residents in these areas should monitor this situation very closely
+and ensure your NOAA weather radios are set to alert mode. Severe
+weather warnings for imminent damaging storms may become necessary.
+
+Here are some safety rules to keep in mind when severe weather is
+expected or is occurring. If a warning is issued, seek shelter
+indoors immediately.
+
+Stay tuned to NOAA weather radio, commercial radio, information
+sources from your phone, or television for the latest on this
+potential severe weather event. Additional weather information can
+be found at weather.gov/washington or weather.gov/baltimore.
+
+$$
+"""
+    pns = PnsStateMachine(_cfg(), tz=ZoneInfo("America/New_York"))
+    decision = pns.evaluate(
+        text,
+        wfo="KLWX",
+        awips_id="PNSLWX",
+        now=dt.datetime(2026, 6, 11, 20, 52, 11, tzinfo=dt.timezone.utc),
+    )
+
+    assert decision.action == "audio"
+    assert decision.subtype == "severe_weather_safety_rules"
+    assert decision.issued_utc == dt.datetime(2026, 6, 11, 20, 52, tzinfo=dt.timezone.utc)
+    assert decision.expires_utc == dt.datetime(2026, 6, 12, 2, 0, tzinfo=dt.timezone.utc)
+
+
+def test_pns_api_candidate_must_match_nwws_issuance() -> None:
+    from seasonalweather.broadcast.pns import pns_text_same_issuance
+
+    raw_text = """NOUS41 KLWX 112052
+PNSLWX
+DCZ001-
+120200-
+
+Public Information Statement
+National Weather Service Baltimore MD/Washington DC
+452 PM EDT Thu Jun 11 2026
+
+...SEVERE WEATHER SAFETY RULES...
+$$
+"""
+    stale_api_text = """NOUS41 KLWX 111300
+PNSLWX
+DCZ001-
+111700-
+
+Public Information Statement
+National Weather Service Baltimore MD/Washington DC
+900 AM EDT Thu Jun 11 2026
+
+...SEVERE WEATHER SAFETY RULES...
+$$
+"""
+    matching_api_text = raw_text.replace("DCZ001-", "DCZ001-MDZ003-")
+
+    assert not pns_text_same_issuance(raw_text, stale_api_text)
+    assert pns_text_same_issuance(raw_text, matching_api_text)

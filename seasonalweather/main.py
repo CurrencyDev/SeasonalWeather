@@ -82,7 +82,7 @@ from .database.inserts import CycleInsertRepository
 from .database.station_feed import StationFeedRepository
 from .discord_log import DiscordLogger
 from .health_state import HealthStateMachine
-from .broadcast.pns import PnsStateMachine
+from .broadcast.pns import PnsStateMachine, parse_nws_header_issued_dt, pns_text_same_issuance
 from .broadcast.ern_script import (
     build_ern_relay_script as _build_ern_relay_script,
     _parse_duration_minutes as _ern_parse_duration_minutes,
@@ -3548,6 +3548,7 @@ class Orchestrator:
         # CycleConductor + SegmentRefresher own routine cycle scheduling.
         tasks.append(asyncio.create_task(self.conductor.run(), name="conductor"))
         tasks.append(asyncio.create_task(self.refresher.run(), name="segment_refresher"))
+        tasks.append(asyncio.create_task(self._pns_backfill_loop(), name="pns_api_backfill"))
 
         if self.cfg.nwws.credentials_defaulted:
             log.warning(
@@ -3829,9 +3830,33 @@ class Orchestrator:
                         if pid_pns:
                             prod_pns = await self.api.get_product(pid_pns)
                             if prod_pns and prod_pns.product_text:
-                                official_pns = prod_pns.product_text
+                                same_product = self._nwws_api_product_matches_raw(parsed, prod_pns.product_text)
+                                same_issuance = pns_text_same_issuance(
+                                    parsed.raw_text or "",
+                                    prod_pns.product_text,
+                                    raw_fallback=getattr(parsed, "issued", None),
+                                    candidate_fallback=getattr(prod_pns, "issuance_time", None),
+                                )
+                                if same_product and same_issuance:
+                                    official_pns = prod_pns.product_text
+                                else:
+                                    raw_issued = parse_nws_header_issued_dt(
+                                        parsed.raw_text or "", fallback=getattr(parsed, "issued", None)
+                                    )
+                                    api_issued = parse_nws_header_issued_dt(
+                                        prod_pns.product_text, fallback=getattr(prod_pns, "issuance_time", None)
+                                    )
+                                    log.warning(
+                                        "PNS API override rejected (stale/mismatched product): wfo=%s awips=%s pid=%s same_product=%s raw_issued=%s api_issued=%s",
+                                        parsed.wfo,
+                                        parsed.awips_id or "",
+                                        pid_pns,
+                                        same_product,
+                                        raw_issued.isoformat() if raw_issued else "",
+                                        api_issued.isoformat() if api_issued else "",
+                                    )
                     except Exception:
-                        pass
+                        log.exception("PNS official-text resolution failed; falling back to raw NWWS payload")
 
                     decision = self.pns_state.evaluate(
                         official_pns,
@@ -3839,53 +3864,123 @@ class Orchestrator:
                         awips_id=parsed.awips_id or "",
                         issued=getattr(parsed, "issued", None),
                     )
-                    if not decision.is_audio:
-                        log.info(
-                            "PNS audio suppressed; wfo=%s awips=%s action=%s subtype=%s reason=%s signals=%s",
-                            parsed.wfo,
-                            parsed.awips_id or "",
-                            decision.action,
-                            decision.subtype,
-                            decision.reason,
-                            ",".join(decision.signals) or "-",
-                        )
-                        continue
-
-                    ok_pns, _ = await self._dedupe_reserve([decision.key])
-                    if not ok_pns:
-                        log.info("PNS skipped (dedupe) id=%s subtype=%s wfo=%s", decision.key, decision.subtype, parsed.wfo)
-                        continue
-
-                    pns_exp_utc = decision.expires_utc or (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=4))
-                    pns_issued_utc = decision.issued_utc or dt.datetime.now(dt.timezone.utc)
-                    pns_ae = ActiveAlert(
-                        id=decision.key,
-                        source="PNS_CYCLE",
-                        event=decision.event,
-                        code=decision.code,
-                        vtec=[],
-                        headline=decision.headline or decision.event,
-                        script_text=decision.script_text,
-                        audio_path=None,
-                        expires=pns_exp_utc.isoformat(),
-                        issued=pns_issued_utc.isoformat(),
-                        same_locs=list(self.cfg.service_area.same_fips_all or []),
-                        cycle_only=True,
+                    queued = await self._queue_pns_decision(
+                        decision,
+                        wfo=parsed.wfo or "",
+                        awips_id=parsed.awips_id or "",
+                        context="nwws",
                     )
-                    self.alert_tracker.add_or_update(pns_ae)
-                    self._schedule_cycle_refill(f"pns-{decision.subtype}")
-                    log.info(
-                        "PNS queued for cycle id=%s subtype=%s event=%s wfo=%s awips=%s expires=%s signals=%s",
-                        decision.key,
-                        decision.subtype,
-                        decision.event,
-                        parsed.wfo,
-                        parsed.awips_id or "",
-                        pns_exp_utc.isoformat(),
-                        ",".join(decision.signals) or "-",
-                    )
+                    if not queued:
+                        continue
                 except Exception:
                     log.exception("PNS handler error wfo=%s", parsed.wfo)
+
+    async def _queue_pns_decision(self, decision, *, wfo: str, awips_id: str, context: str) -> bool:
+        """Queue an accepted PNS decision as cycle-only active-alert state."""
+        if not decision.is_audio:
+            log.info(
+                "PNS audio suppressed; source=%s wfo=%s awips=%s action=%s subtype=%s reason=%s signals=%s",
+                context,
+                wfo,
+                awips_id or "",
+                decision.action,
+                decision.subtype,
+                decision.reason,
+                ",".join(decision.signals) or "-",
+            )
+            return False
+
+        ok_pns, _ = await self._dedupe_reserve([decision.key])
+        if not ok_pns:
+            log.info("PNS skipped (dedupe); source=%s id=%s subtype=%s wfo=%s", context, decision.key, decision.subtype, wfo)
+            return False
+
+        pns_exp_utc = decision.expires_utc or (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=4))
+        pns_issued_utc = decision.issued_utc or dt.datetime.now(dt.timezone.utc)
+        pns_ae = ActiveAlert(
+            id=decision.key,
+            source="PNS_CYCLE",
+            event=decision.event,
+            code=decision.code,
+            vtec=[],
+            headline=decision.headline or decision.event,
+            script_text=decision.script_text,
+            audio_path=None,
+            expires=pns_exp_utc.isoformat(),
+            issued=pns_issued_utc.isoformat(),
+            same_locs=list(self.cfg.service_area.same_fips_all or []),
+            cycle_only=True,
+        )
+        self.alert_tracker.add_or_update(pns_ae)
+        self._schedule_cycle_refill(f"pns-{decision.subtype}")
+        log.info(
+            "PNS queued for cycle; source=%s id=%s subtype=%s event=%s wfo=%s awips=%s expires=%s signals=%s",
+            context,
+            decision.key,
+            decision.subtype,
+            decision.event,
+            wfo,
+            awips_id or "",
+            pns_exp_utc.isoformat(),
+            ",".join(decision.signals) or "-",
+        )
+        return True
+
+    def _pns_backfill_wfos(self) -> list[str]:
+        """Return 3-letter offices to poll for latest PNS backfill."""
+        offices: set[str] = set()
+        for raw in self._nwws_allowed_wfos:
+            s = str(raw or "").strip().upper()
+            if len(s) == 4 and s.startswith("K"):
+                offices.add(s[1:])
+            elif len(s) == 3:
+                offices.add(s)
+        return sorted(offices)
+
+    async def _pns_backfill_latest_once(self) -> int:
+        """Fetch latest API PNS products and queue any still-current audio-worthy PNS."""
+        if not getattr(self.cfg.pns, "enabled", True):
+            return 0
+
+        queued = 0
+        offices = self._pns_backfill_wfos()
+        if not offices:
+            log.debug("PNS API backfill skipped; no nwws.allowed_wfos configured")
+            return 0
+
+        for office in offices:
+            try:
+                pid = await self.api.latest_product_id("PNS", office)
+                if not pid:
+                    continue
+                prod = await self.api.get_product(pid)
+                if not prod or not prod.product_text:
+                    continue
+
+                parsed = parse_product_text(prod.product_text)
+                wfo = (getattr(parsed, "wfo", None) or f"K{office}").strip().upper() if parsed else f"K{office}"
+                awips_id = (getattr(parsed, "awips_id", None) or f"PNS{office}").strip().upper() if parsed else f"PNS{office}"
+
+                decision = self.pns_state.evaluate(
+                    prod.product_text,
+                    wfo=wfo,
+                    awips_id=awips_id,
+                    issued=getattr(prod, "issuance_time", None),
+                )
+                if await self._queue_pns_decision(decision, wfo=wfo, awips_id=awips_id, context=f"api-backfill:{pid}"):
+                    queued += 1
+            except Exception:
+                log.exception("PNS API backfill failed for office=%s", office)
+        return queued
+
+    async def _pns_backfill_loop(self) -> None:
+        """Small recovery poller for missed NWWS-OI PNS products."""
+        await asyncio.sleep(15)
+        while True:
+            queued = await self._pns_backfill_latest_once()
+            if queued:
+                log.info("PNS API backfill queued %d product(s)", queued)
+            await asyncio.sleep(120)
 
     def _cap_is_actionable(self, ev: "CapAlertEvent") -> bool:  # type: ignore[name-defined]
         try:

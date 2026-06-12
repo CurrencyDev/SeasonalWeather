@@ -249,6 +249,30 @@ def parse_nws_header_issued_dt(text: str, fallback: Any = None) -> dt.datetime |
     return _parse_dt(fallback)
 
 
+def pns_text_same_issuance(
+    raw_text: str,
+    candidate_text: str,
+    *,
+    raw_fallback: Any = None,
+    candidate_fallback: Any = None,
+    tolerance_seconds: float = 90.0,
+) -> bool:
+    """Return True when two PNS texts appear to be the same issuance.
+
+    api.weather.gov can briefly lag NWWS-OI during active issuance.  For
+    VTEC-less text products such as PNS, matching only AWIPS/WFO is not enough:
+    an older product can otherwise replace the live NWWS payload and make fresh
+    products look stale because their UGC expiry came from the previous PNS.
+    """
+    raw_issued = parse_nws_header_issued_dt(raw_text, fallback=raw_fallback)
+    candidate_issued = parse_nws_header_issued_dt(candidate_text, fallback=candidate_fallback)
+    if raw_issued is None and candidate_issued is None:
+        return True
+    if raw_issued is None or candidate_issued is None:
+        return False
+    return abs((candidate_issued - raw_issued).total_seconds()) <= max(0.0, tolerance_seconds)
+
+
 def parse_ugc_expiry_utc(text: str, issued_utc: dt.datetime | None) -> dt.datetime | None:
     if issued_utc is None:
         return None

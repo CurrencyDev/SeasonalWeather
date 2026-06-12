@@ -10,6 +10,7 @@ Creates a SeasonalWeather release commit and annotated vX.Y.Z tag.
 Environment:
   SKIP_TESTS=1        skip pytest during release preparation
   ALLOW_NON_MAIN=1    allow releasing from a branch other than main
+  RELEASE_PYTHON=...  Python interpreter to use for compile/tests
 EOF
 }
 
@@ -52,10 +53,32 @@ python3 tools/semver_guard.py check-newer "$version"
 python3 tools/semver_guard.py replace-version "$version"
 python3 tools/semver_guard.py check-working
 
-python3 -m compileall -q seasonalweather tools
+release_python="${RELEASE_PYTHON:-}"
+if [[ -z "$release_python" ]]; then
+  for candidate in \
+    "$repo_root/.venv/bin/python" \
+    "/opt/seasonalweather/venv/bin/python"; do
+    if [[ -x "$candidate" ]]; then
+      release_python="$candidate"
+      break
+    fi
+  done
+fi
+
+if [[ -n "$release_python" && -x "$release_python" ]]; then
+  echo "Using release Python: $release_python" >&2
+  "$release_python" -m compileall -q seasonalweather tools
+else
+  echo "[!]: SeasonalWeather venv Python not available, using python3 for compileall" >&2
+  python3 -m compileall -q seasonalweather tools
+fi
 
 if [[ "${SKIP_TESTS:-0}" != "1" ]]; then
-  python3 -m pytest
+  if [[ -n "$release_python" && -x "$release_python" ]]; then
+    "$release_python" -m pytest
+  else
+    echo "[!]: SeasonalWeather venv Python not available, disabling tests" >&2
+  fi
 else
   echo "warning: SKIP_TESTS=1 set; pytest was not run" >&2
 fi
