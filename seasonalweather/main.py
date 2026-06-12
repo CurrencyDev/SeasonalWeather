@@ -6132,17 +6132,17 @@ class Orchestrator:
                             # Hydrologic statements often carry scoped cancellation
                             # prose and public instructions that are too important to
                             # collapse into a one-sentence "has ended" summary.
-                            hydrologic_terminal_script = ""
-                            if (parsed.product_type or "").strip().upper() in {"FLS", "FFS"}:
-                                hydrologic_terminal_script = _build_nwws_terminal_cancel_expiry_script(
+                            detailed_terminal_script = ""
+                            if (parsed.product_type or "").strip().upper() in {"FLS", "FFS", "SVS"}:
+                                detailed_terminal_script = _build_nwws_terminal_cancel_expiry_script(
                                     sf_event_label,
                                     official_text,
                                 )
 
-                            if hydrologic_terminal_script:
-                                spoken.script = hydrologic_terminal_script
+                            if detailed_terminal_script:
+                                spoken.script = detailed_terminal_script
                                 log.info(
-                                    'NWWS hydrologic terminal CAN/EXP script built (act=%s type=%s awips=%s wfo=%s)',
+                                    'NWWS detailed terminal CAN/EXP script built (act=%s type=%s awips=%s wfo=%s)',
                                     ','.join(sorted(vtec_actions))[:64],
                                     parsed.product_type,
                                     parsed.awips_id or '',

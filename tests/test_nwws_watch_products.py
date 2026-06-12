@@ -235,8 +235,8 @@ def test_wcn_mixed_can_con_uses_watch_specific_partial_script():
 
     assert "Severe Thunderstorm Watch Number 234 has been cancelled" in script
     assert "in Maryland: Washington, Allegany, and Garrett" in script
-    assert "Severe Thunderstorm Watch Number 234 remains in effect until 8 PM this evening." in script
-    assert "This watch includes the District of Columbia." in script
+    assert "Severe Thunderstorm Watch Number 234 remains in effect until 8 PM this evening for the District of Columbia and the following counties:" in script
+    assert "This watch includes the District of Columbia." not in script
     assert "in Virginia: Clarke, Fauquier, Loudoun, and Prince William" in script
     assert "404 WWUS61" not in script
     assert "WATCH COUNTY NOTIFICATION" not in script
@@ -244,3 +244,82 @@ def test_wcn_mixed_can_con_uses_watch_specific_partial_script():
     assert "MDC001" not in script
     assert "THE NATIONAL WEATHER SERVICE HAS CANCELLED" not in script
     assert script.endswith("End of message.")
+
+
+WCN_SVA_MIXED_EXP_CON = """WWUS61 KLWX 120204
+WCNLWX
+
+WATCH COUNTY NOTIFICATION FOR WATCHES 315/317
+NATIONAL WEATHER SERVICE BALTIMORE MD/WASHINGTON DC
+1004 PM EDT THU JUN 11 2026
+
+MDC003-005-025-510-120315-
+/O.EXP.KLWX.SV.A.0315.000000T0000Z-260612T0200Z/
+
+THE NATIONAL WEATHER SERVICE HAS ALLOWED SEVERE THUNDERSTORM
+WATCH 315 TO EXPIRE FOR THE FOLLOWING AREAS
+
+IN MARYLAND THIS ALLOWS TO EXPIRE 4 COUNTIES
+
+IN CENTRAL MARYLAND
+
+ANNE ARUNDEL
+
+IN NORTHERN MARYLAND
+
+BALTIMORE
+BALTIMORE CITY
+HARFORD
+
+THIS INCLUDES THE CITIES OF ABERDEEN, ANNAPOLIS, AND BALTIMORE.
+
+$$
+
+MDC009-015-017-037-VAC099-179-120400-
+/O.CON.KLWX.SV.A.0317.000000T0000Z-260612T0400Z/
+
+SEVERE THUNDERSTORM WATCH 317 REMAINS VALID UNTIL MIDNIGHT EDT
+TONIGHT FOR THE FOLLOWING AREAS
+
+IN MARYLAND THIS WATCH INCLUDES 4 COUNTIES
+
+IN NORTHEAST MARYLAND
+
+CECIL
+
+IN SOUTHERN MARYLAND
+
+CALVERT                       CHARLES
+ST. MARYS
+
+IN VIRGINIA THIS WATCH INCLUDES 2 COUNTIES
+
+IN CENTRAL VIRGINIA
+
+KING GEORGE
+
+IN NORTHERN VIRGINIA
+
+STAFFORD
+
+THIS INCLUDES THE CITIES OF ANDORA, BARKSDALE, AND WALDORF.
+
+$$
+"""
+
+
+def test_wcn_mixed_exp_con_uses_lifecycle_county_wording_and_midnight_tonight():
+    script = build_nwws_watch_partial_cancel_script(
+        WCN_SVA_MIXED_EXP_CON,
+        [
+            "/O.EXP.KLWX.SV.A.0315.000000T0000Z-260612T0200Z/",
+            "/O.CON.KLWX.SV.A.0317.000000T0000Z-260612T0400Z/",
+        ],
+        local_tz=ZoneInfo("America/New_York"),
+        now=dt.datetime(2026, 6, 11, 22, 4, tzinfo=ZoneInfo("America/New_York")),
+    )
+
+    assert "Severe Thunderstorm Watch Number 315 has been allowed to expire for the following counties: in Maryland: Anne Arundel, Baltimore, Baltimore City, and Harford." in script
+    assert "Severe Thunderstorm Watch Number 317 remains in effect until midnight tonight for the following counties: in Maryland: Cecil, Calvert, Charles, and St. Marys; in Virginia: King George and Stafford." in script
+    assert "has been allowed to expire for the following areas.\n\nThis watch includes" not in script
+    assert "Remember, a severe thunderstorm watch means" in script

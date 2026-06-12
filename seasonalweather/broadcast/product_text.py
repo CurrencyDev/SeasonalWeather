@@ -687,7 +687,7 @@ def parse_nwws_product_segments(product_text: str) -> list[NwwsProductSegment]:
                 in_area_skip = True
                 continue
             if _SEG_LOC_RE.match(s):
-                body_parts.append("Locations impacted include.")
+                body_parts.append("Locations impacted include:")
                 in_locations_block = True
                 continue
             if in_locations_block:
@@ -878,7 +878,8 @@ _WCN_AREA_STOP_RE = re.compile(
     re.IGNORECASE,
 )
 _WCN_STATE_COUNT_RE = re.compile(
-    r"^IN (?P<state>[A-Z ]+?) THIS (?:WATCH INCLUDES|CANCELS) \d+ "
+    r"^IN (?P<state>[A-Z ]+?) THIS "
+    r"(?:WATCH INCLUDES|CANCELS|ALLOWS TO EXPIRE|ALLOWED TO EXPIRE) \d+ "
     r"(?P<kind>COUNTY|COUNTIES|CITY|CITIES|INDEPENDENT CITIES)\b",
     re.IGNORECASE,
 )
@@ -929,6 +930,14 @@ def _watch_time_phrase(end_utc: dt.datetime | None, *, local_tz: dt.tzinfo | Non
     end_local = end_utc.astimezone(tz)
     ref = now.astimezone(tz) if now is not None else dt.datetime.now(tz=tz)
 
+    day_delta = (end_local.date() - ref.date()).days
+    if end_local.hour == 0 and end_local.minute == 0:
+        if day_delta == 1:
+            return "midnight tonight"
+        if day_delta == 0:
+            return "midnight"
+        return f"midnight on {end_local.strftime('%A')}"
+
     hour12 = end_local.hour % 12 or 12
     ampm = "AM" if end_local.hour < 12 else "PM"
     t = f"{hour12} {ampm}" if end_local.minute == 0 else f"{hour12}:{end_local.minute:02d} {ampm}"
@@ -942,9 +951,9 @@ def _watch_time_phrase(end_utc: dt.datetime | None, *, local_tz: dt.tzinfo | Non
     else:
         part = "tonight"
 
-    if end_local.date() == ref.date():
+    if day_delta == 0:
         return f"{t} tonight" if part == "tonight" else f"{t} this {part}"
-    if (end_local.date() - ref.date()).days == 1:
+    if day_delta == 1:
         return f"{t} tomorrow night" if part == "tonight" else f"{t} tomorrow {part}"
     return f"{t} on {end_local.strftime('%A')}"
 
@@ -1078,7 +1087,22 @@ def _extract_wcn_area_desc(text: str) -> str:
     return "; ".join(p for p in parts if p).strip()
 
 
+def _watch_area_group_phrases(groups: dict[str, list[str]], order: list[str]) -> list[str]:
+    segs: list[str] = []
+    for st in order:
+        st_full = STATE_NAME_FULL.get(st, st)
+        county_list = join_oxford(groups.get(st, []))
+        if county_list:
+            segs.append(f"in {st_full}: {county_list}")
+    return segs
+
+
 def _watch_area_sentence(area_desc: str) -> str:
+    """Return NEW-watch area boilerplate.
+
+    Lifecycle WCN sections use _watch_lifecycle_area_phrase() so CAN/EXP/CON
+    narration can attach the area list directly to the action sentence.
+    """
     groups, order, misc = parse_cap_area_by_state(area_desc or "")
     lines: list[str] = []
 
@@ -1086,25 +1110,43 @@ def _watch_area_sentence(area_desc: str) -> str:
         lines.append("This watch includes " + join_oxford(misc) + ".")
 
     if groups:
-        if len(order) == 1:
-            st = order[0]
-            st_full = STATE_NAME_FULL.get(st, st)
-            county_list = join_oxford(groups.get(st, []))
-            if county_list:
-                lines.append(f"This watch includes the following counties, in {st_full}: {county_list}.")
-        else:
-            segs: list[str] = []
-            for st in order:
-                st_full = STATE_NAME_FULL.get(st, st)
-                county_list = join_oxford(groups.get(st, []))
-                if county_list:
-                    segs.append(f"in {st_full}: {county_list}")
-            if segs:
-                lines.append("This watch includes the following counties: " + "; ".join(segs) + ".")
+        segs = _watch_area_group_phrases(groups, order)
+        if len(segs) == 1 and len(order) == 1:
+            lines.append("This watch includes the following counties: " + segs[0] + ".")
+        elif segs:
+            lines.append("This watch includes the following counties: " + "; ".join(segs) + ".")
     elif area_desc:
         lines.append(f"This watch includes the following areas: {area_desc.strip(' .')}.")
 
     return "\n".join(lines).strip()
+
+
+def _watch_lifecycle_area_phrase(area_desc: str) -> str:
+    """Return the area object for WCN lifecycle action sentences.
+
+    Examples:
+      - the following counties: in Maryland: Frederick
+      - the District of Columbia and the following counties: in Maryland: Anne Arundel
+
+    This intentionally avoids NEW-style "This watch includes..." boilerplate.
+    """
+    groups, order, misc = parse_cap_area_by_state(area_desc or "")
+    county_phrase = ""
+    if groups:
+        segs = _watch_area_group_phrases(groups, order)
+        if segs:
+            county_phrase = "the following counties: " + "; ".join(segs)
+
+    misc_phrase = join_oxford(misc) if misc else ""
+    if misc_phrase and county_phrase:
+        return f"{misc_phrase} and {county_phrase}"
+    if county_phrase:
+        return county_phrase
+    if misc_phrase:
+        return misc_phrase
+    if area_desc:
+        return "the following areas: " + area_desc.strip(" .")
+    return ""
 
 
 
@@ -1211,24 +1253,28 @@ def _watch_section_script_lines(
     )
     until = _watch_time_phrase(parsed.get("end_utc"), local_tz=local_tz, now=now)
     until_part = f" until {until}" if until else ""
-    area_sentence = _watch_area_sentence(area_desc)
+    area_phrase = _watch_lifecycle_area_phrase(area_desc)
 
-    lines: list[str] = []
+    def with_area(prefix: str) -> str:
+        return f"{prefix} for {area_phrase}." if area_phrase else f"{prefix}."
+
     if action == "CAN":
-        lines.append(f"{label_with_num} has been cancelled for the following areas.")
-    elif action == "EXP":
-        lines.append(f"{label_with_num} has been allowed to expire for the following areas.")
-    elif action in {"CON", "EXT"}:
-        lines.append(f"{label_with_num} remains in effect{until_part}.")
-    elif action in {"EXA", "EXB"}:
-        lines.append(f"{label_with_num} remains in effect{until_part}.")
-        lines.append("This watch now includes additional areas.")
-    else:
-        return []
-
-    if area_sentence:
-        lines.append(area_sentence)
-    return lines
+        return [with_area(f"{label_with_num} has been cancelled")]
+    if action == "EXP":
+        return [with_area(f"{label_with_num} has been allowed to expire")]
+    if action == "CON":
+        return [with_area(f"{label_with_num} remains in effect{until_part}")]
+    if action == "EXT":
+        return [with_area(f"{label_with_num} is now in effect{until_part}")]
+    if action == "EXA":
+        if area_phrase:
+            return [f"{label_with_num} remains in effect{until_part}, and now includes {area_phrase}."]
+        return [f"{label_with_num} remains in effect{until_part}, and now includes additional areas."]
+    if action == "EXB":
+        if area_phrase:
+            return [f"{label_with_num} is now in effect{until_part}, and now includes {area_phrase}."]
+        return [f"{label_with_num} is now in effect{until_part}, and now includes additional areas."]
+    return []
 
 
 def build_nwws_watch_partial_cancel_script(
@@ -1281,6 +1327,12 @@ def build_nwws_watch_partial_cancel_script(
 
     if not lines:
         return ""
+    _watch_label, _label_with_num, remember = _watch_label_and_remember(
+        str(parsed_sections[0][0].get("kind") or "severe"),
+        parsed_sections[0][0].get("watch_number"),
+    )
+    if remember:
+        lines.append(remember)
     lines.append(
         "Stay tuned to NOAA Weather Radio, commercial radio, and television outlets, "
         "or internet sources for the latest severe weather information."
@@ -1317,29 +1369,21 @@ def build_nwws_watch_vtec_script(
     until_part = f" until {until}" if until else ""
 
     lines: list[str] = []
-    if action in {"CAN"}:
-        lines.append(f"{label_with_num} has been cancelled for the following areas.")
-        if area_sentence:
-            lines.append(area_sentence)
-    elif action in {"EXP"}:
-        lines.append(f"{label_with_num} has been allowed to expire for the following areas.")
-        if area_sentence:
-            lines.append(area_sentence)
-    elif action in {"CON", "EXT"}:
-        lines.append(f"{label_with_num} remains in effect{until_part}.")
-        if area_sentence:
-            lines.append(area_sentence)
-    elif action in {"EXA", "EXB"}:
-        lines.append(f"{label_with_num} remains in effect{until_part}.")
-        lines.append("This watch now includes additional areas.")
-        if area_sentence:
-            lines.append(area_sentence)
+    if action in {"CAN", "EXP", "CON", "EXT", "EXA", "EXB"}:
+        lines.extend(_watch_section_script_lines(
+            parsed=parsed,
+            area_desc=area_desc,
+            local_tz=local_tz,
+            now=now,
+        ))
     else:
         lines.append(f"The National Weather Service has issued {label_with_num}.")
         if until:
             lines.append(f"Effective until {until}.")
         if area_sentence:
             lines.append(area_sentence)
+
+    if remember:
         lines.append(remember)
 
     lines.append(

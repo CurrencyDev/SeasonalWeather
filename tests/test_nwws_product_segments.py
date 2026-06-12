@@ -110,7 +110,7 @@ def test_partial_can_con_svs_segments_include_cancel_and_continuation_text():
     assert segments[1].expiry_phrase == "700 PM EDT"
     assert "60 mph wind gusts and quarter size hail" in segments[1].reason_text
     assert "For your protection move to an interior room" in segments[1].precautions
-    assert "Locations impacted include. Winchester, Martinsburg" in segments[1].reason_text
+    assert "Locations impacted include: Winchester, Martinsburg" in segments[1].reason_text
 
 
 def test_partial_can_con_script_says_cancelled_and_remains_in_effect():
@@ -121,7 +121,7 @@ def test_partial_can_con_script_says_cancelled_and_remains_in_effect():
     assert "The severe thunderstorm warning for southeastern morgan and southeastern hampshire counties is cancelled." in script
     assert "A severe thunderstorm warning remains in effect until 700 PM EDT" in script
     assert "The Severe Thunderstorm Warning remains in effect" not in script
-    assert "Locations impacted include. Winchester, Martinsburg" in script
+    assert "Locations impacted include: Winchester, Martinsburg" in script
     assert script.endswith("End of message.")
 
 KCTP_PARTIAL_CAN_CON_SVS = """930
@@ -448,5 +448,5 @@ def test_partial_can_con_klwx_preserves_nws_headlines_and_locations():
     assert "The Severe Thunderstorm Warning has been cancelled for the following areas" not in script
     assert "A severe thunderstorm warning remains in effect until 445 PM EDT for central loudoun and north central fauquier counties." in script
     assert "The Severe Thunderstorm Warning remains in effect until 445 PM EDT for the following areas" not in script
-    assert "Locations impacted include. Leesburg, Broadlands" in script
+    assert "Locations impacted include: Leesburg, Broadlands" in script
     assert "For your protection move to an interior room" in script
