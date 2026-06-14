@@ -24,6 +24,11 @@ from .station_feed import FeedSender, StationFeedAlert, build_station_feed_paylo
 
 log = logging.getLogger("seasonalweather")
 
+_NWS_HEADER_ISSUED_RE = re.compile(
+    r"^(?P<hhmm>\d{3,4})\s*(?P<ampm>AM|PM)\s*(?P<tz>[A-Z]{2,4})\s+"
+    r"(?P<dow>[A-Za-z]{3})\s+(?P<mon>[A-Za-z]{3})\s+(?P<day>\d{1,2})\s+(?P<year>\d{4})\s*$"
+)
+
 _APP_CFG: AppConfig | None = None
 
 
