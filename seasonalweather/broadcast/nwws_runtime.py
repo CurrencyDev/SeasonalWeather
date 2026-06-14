@@ -8,7 +8,7 @@ from ..alerts.builder import build_spoken_alert
 from ..alerts.product import ParsedProduct, parse_product_text
 from ..alerts.vtec import toneout_policy as _vtec_toneout_policy
 from .audio_origination import safe_event_code as _safe_event_code
-from .cap_policy import best_expiry_from_vtec
+from .cap_policy import best_expiry_from_vtec, vtec_matches_configured_toneout_code
 from .pns import parse_nws_header_issued_dt, pns_text_same_issuance
 from .product_text import render_nwws_product_script
 from .station_feed_runtime import (
@@ -68,7 +68,7 @@ class NwwsRuntime:
             allowed_wfo = (not self._nwws_allowed_wfos) or (parsed.wfo in self._nwws_allowed_wfos)
             toneout = parsed.product_type in self.cfg.policy.toneout_product_types
             raw_vtec = self._extract_vtec(parsed.raw_text or "")
-            vtec_lifecycle = (not toneout) and self._vtec_matches_configured_toneout_code(raw_vtec)
+            vtec_lifecycle = (not toneout) and vtec_matches_configured_toneout_code(self.cfg, raw_vtec)
 
             first_n = max(0, int(self._nwws_decision_log_first_n))
             every = max(0, int(self._nwws_decision_log_every))
@@ -209,7 +209,7 @@ class NwwsRuntime:
         official_text, pid = await self._resolve_nwws_official_text(parsed)
 
         # --- NEW: derive SAME targeting from UGC zones (NWWS-only) ---
-        zones, in_area_same, src, mapped_ok, ugc_expires_utc = await self._nwws_same_targets_from_texts(parsed.raw_text or "", official_text or "")
+        zones, in_area_same, src, mapped_ok, ugc_expires_utc = await self.target_resolver._nwws_same_targets_from_texts(parsed.raw_text or "", official_text or "")
 
         if zones:
             log.info(
@@ -227,7 +227,7 @@ class NwwsRuntime:
             and (_pre_policy.same_code or "").strip().upper() in {"SVA", "TOA"}
         )
         if _pre_is_wcn_watch and not in_area_same:
-            area_same = await self._nwws_wcn_watch_same_targets_from_area_desc(official_text or "")
+            area_same = await self.target_resolver._nwws_wcn_watch_same_targets_from_area_desc(official_text or "")
             if area_same:
                 in_area_same = area_same
                 mapped_ok = True
@@ -336,7 +336,7 @@ class NwwsRuntime:
             sf_area_text = ""
             if in_area_same:
                 try:
-                    sf_area_text = await self._sf_area_text_from_same_codes(list(in_area_same))
+                    sf_area_text = await self.target_resolver._sf_area_text_from_same_codes(list(in_area_same))
                 except Exception:
                     sf_area_text = ""
             if not sf_area_text:

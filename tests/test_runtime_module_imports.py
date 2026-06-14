@@ -18,3 +18,14 @@ def test_source_runtime_modules_importable() -> None:
     assert RequiredTestRuntime is not None
     assert ManualOriginationRuntime is not None
     assert SeasonalWeatherServiceRuntime is not None
+
+def test_nwws_runtime_does_not_reference_removed_orchestrator_shims() -> None:
+    import inspect
+
+    from seasonalweather.broadcast import nwws_runtime
+
+    source = inspect.getsource(nwws_runtime.NwwsRuntime)
+    assert "self._vtec_matches_configured_toneout_code" not in source
+    assert "self._nwws_same_targets_from_texts" not in source
+    assert "self._nwws_wcn_watch_same_targets_from_area_desc" not in source
+    assert "self._sf_area_text_from_same_codes" not in source
