@@ -6,6 +6,15 @@ from types import SimpleNamespace
 
 from ..alerts.active import ActiveAlert, _vtec_track_id
 from ..alerts.vtec import VTEC_PARSE_RE as _VTEC_PARSE_RE, toneout_policy as _vtec_toneout_policy
+from .cap_policy import (
+    alert_expires_from_cap,
+    alert_tracker_id_for_cap,
+    cap_event_to_same_code,
+    cap_should_full,
+    cap_should_update,
+    cap_should_voice,
+    cap_vtec_list,
+)
 from .station_feed_runtime import (
     cap_reference_ids as _sf_cap_reference_ids,
     note_cap as _station_feed_note_cap,
@@ -26,18 +35,18 @@ class CapRuntime:
         while True:
             ev = await o.cap_queue.get()
 
-            vtec = o._cap_vtec_list(ev)
+            vtec = cap_vtec_list(ev)
             tracks = o._vtec_tracks(vtec)
             cap_mt = str(getattr(ev, "message_type", None) or "").strip().lower()
             cap_ref_ids = _sf_cap_reference_ids(ev)
 
             if cap_mt == "cancel" and not tracks:
                 try:
-                    same_code = o._cap_event_to_same_code((ev.event or "").strip())
+                    same_code = cap_event_to_same_code((ev.event or "").strip())
                     same_locs = o._filter_same_locations_to_service_area(
                         list(getattr(ev, "same_fips", None) or [])
                     )
-                    o.alert_tracker.remove(o._alert_tracker_id_for_cap(ev, same_code))
+                    o.alert_tracker.remove(alert_tracker_id_for_cap(ev, same_code))
                     o._remove_matching_ipaws_state(
                         code=same_code,
                         same_locs=same_locs,
@@ -80,16 +89,16 @@ class CapRuntime:
             if o.cfg.cap.dryrun:
                 continue
 
-            if o._cap_should_full(ev):
+            if cap_should_full(o.cfg, ev):
                 await self.air_full(ev)
                 continue
 
             # CON/EXT/CAN/EXP for watched/warned events → voice-only update narration
-            if o._cap_should_update(ev):
+            if cap_should_update(o.cfg, ev, o._vtec_tracks):
                 await self.air_update(ev)
                 continue
 
-            if o._cap_should_voice(ev):
+            if cap_should_voice(o.cfg, ev):
                 await self.air_voice(ev)
 
     async def air_full(self, ev: "CapAlertEvent") -> None:  # type: ignore[name-defined]
@@ -102,7 +111,7 @@ class CapRuntime:
             log.info("CAP full: cooldown active; skipping id=%s sent=%s event=%s", ev.alert_id, ev.sent, ev.event)
             return
 
-        vtec = o._cap_vtec_list(ev)
+        vtec = cap_vtec_list(ev)
         tracks = o._vtec_tracks(vtec)
         vtec_actions = {act for (_t, act) in tracks} if tracks else set()
 
@@ -150,7 +159,7 @@ class CapRuntime:
         if not script.strip():
             return
 
-        same_code = _vtec_toneout_policy(vtec).same_code or o._cap_event_to_same_code(ev_event)
+        same_code = _vtec_toneout_policy(vtec).same_code or cap_event_to_same_code(ev_event)
         same_locs_raw = list(ev.same_fips) if getattr(ev, "same_fips", None) else []
         same_locs = o._filter_same_locations_to_service_area(same_locs_raw)
 
@@ -245,8 +254,8 @@ class CapRuntime:
 
             # ---- Register to AlertTracker for active cycle rotation ----
             try:
-                tracker_id = o._alert_tracker_id_for_cap(ev, same_code)
-                expires_iso = o._alert_expires_from_cap(ev, vtec)
+                tracker_id = alert_tracker_id_for_cap(ev, same_code)
+                expires_iso = alert_expires_from_cap(ev, vtec, best_expiry_from_vtec=o._best_expiry_from_vtec)
                 _is_watch = (ev.event or "").strip() in {"Tornado Watch", "Severe Thunderstorm Watch"}
                 _watch_num: int | None = None
                 if _is_watch:
@@ -301,10 +310,10 @@ class CapRuntime:
         if not script.strip():
             return
 
-        vtec = o._cap_vtec_list(ev)
+        vtec = cap_vtec_list(ev)
         tracks = o._vtec_tracks(vtec)
 
-        same_code = _vtec_toneout_policy(vtec).same_code or o._cap_event_to_same_code((ev.event or "").strip())
+        same_code = _vtec_toneout_policy(vtec).same_code or cap_event_to_same_code((ev.event or "").strip())
         same_locs_raw = list(ev.same_fips) if getattr(ev, "same_fips", None) else []
         same_locs = o._filter_same_locations_to_service_area(same_locs_raw)
 
@@ -368,9 +377,9 @@ class CapRuntime:
 
             # Register to AlertTracker (cycle_only → no SAME retone on cycle replay)
             try:
-                vtec_v = o._cap_vtec_list(ev)
-                tracker_id_v = o._alert_tracker_id_for_cap(ev, same_code)
-                expires_iso_v = o._alert_expires_from_cap(ev, vtec_v)
+                vtec_v = cap_vtec_list(ev)
+                tracker_id_v = alert_tracker_id_for_cap(ev, same_code)
+                expires_iso_v = alert_expires_from_cap(ev, vtec_v, best_expiry_from_vtec=o._best_expiry_from_vtec)
                 _ae = ActiveAlert(
                     id=tracker_id_v,
                     source="CAP",
@@ -414,7 +423,7 @@ class CapRuntime:
         No SAME tones.  Removes entry from AlertTracker on CAN/EXP.
         """
         now = dt.datetime.now(tz=o._tz)
-        vtec = o._cap_vtec_list(ev)
+        vtec = cap_vtec_list(ev)
         tracks = o._vtec_tracks(vtec)
         vtec_actions = {act for (_t, act) in tracks} if tracks else set()
 
@@ -452,7 +461,7 @@ class CapRuntime:
             log.info("CAP update: empty script, skipping event=%s vtec_actions=%s", ev_event, vtec_actions)
             return
 
-        same_code = o._cap_event_to_same_code(ev_event)
+        same_code = cap_event_to_same_code(ev_event)
         same_locs_raw = list(ev.same_fips) if getattr(ev, "same_fips", None) else []
         same_locs = o._filter_same_locations_to_service_area(same_locs_raw)
 
@@ -493,7 +502,7 @@ class CapRuntime:
 
             # Update or remove from AlertTracker
             try:
-                tracker_id = o._alert_tracker_id_for_cap(ev, same_code)
+                tracker_id = alert_tracker_id_for_cap(ev, same_code)
                 if vtec_actions & {"CAN", "EXP"}:
                     removed = o.alert_tracker.remove(tracker_id)
                     if not removed:
