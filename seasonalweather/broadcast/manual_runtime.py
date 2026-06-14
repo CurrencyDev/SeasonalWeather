@@ -47,7 +47,7 @@ class ManualOriginationRuntime:
         if mode not in {"voice_only", "full_eas"}:
             raise ValueError(f"Unsupported voice mode: {voice_mode}")
 
-        same_codes = self.orch._filter_same_locations_to_service_area(
+        same_codes = self.orch.target_resolver._filter_same_locations_to_service_area(
             same_locations,
             allow_statewide_input=False,
         )
@@ -95,7 +95,7 @@ class ManualOriginationRuntime:
         manual_area_text = ""
         if same_codes:
             try:
-                manual_area_text = await self.orch._sf_area_text_from_same_codes(same_codes)
+                manual_area_text = await self.orch.target_resolver._sf_area_text_from_same_codes(same_codes)
             except Exception:
                 manual_area_text = ""
         if not manual_area_text:
@@ -142,7 +142,7 @@ class ManualOriginationRuntime:
         code = _safe_event_code(event_code)
         mode = (voice_mode or "voice_only").strip().lower()
         if mode == "full_eas":
-            filtered_same = self.orch._filter_same_locations_to_service_area(
+            filtered_same = self.orch.target_resolver._filter_same_locations_to_service_area(
                 same_locations,
                 allow_statewide_input=False,
             )
@@ -197,7 +197,7 @@ class ManualOriginationRuntime:
         self.orch.audio_originator.assert_station_wav_format(path)
 
         if mode == "full_eas":
-            filtered_same = self.orch._filter_same_locations_to_service_area(
+            filtered_same = self.orch.target_resolver._filter_same_locations_to_service_area(
                 same_locations,
                 allow_statewide_input=False,
             )

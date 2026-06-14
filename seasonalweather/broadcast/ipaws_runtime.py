@@ -55,7 +55,7 @@ class IpawsRuntime:
             )
 
             if message_type == "cancel":
-                same_locs = host._filter_same_locations_to_service_area(
+                same_locs = host.target_resolver._filter_same_locations_to_service_area(
                     list(getattr(ev, "same_fips", None) or [])
                 )
                 removed_direct = host.alert_tracker.remove(f"IPAWS:{(ev.identifier or '').strip()}")
@@ -142,7 +142,7 @@ class IpawsRuntime:
             return
 
         same_locs_raw = list(ev.same_fips) if ev.same_fips else []
-        same_locs = host._filter_same_locations_to_service_area(same_locs_raw)
+        same_locs = host.target_resolver._filter_same_locations_to_service_area(same_locs_raw)
 
         keys: list[str] = []
 
@@ -286,7 +286,7 @@ class IpawsRuntime:
             return
 
         same_locs_raw = list(ev.same_fips) if ev.same_fips else []
-        same_locs = host._filter_same_locations_to_service_area(same_locs_raw)
+        same_locs = host.target_resolver._filter_same_locations_to_service_area(same_locs_raw)
 
         id_part = host._sha1_12((ev.identifier or "") + "|" + (ev.sent or ""))
         key_str = f"IPAWSVOICE:{id_part}"

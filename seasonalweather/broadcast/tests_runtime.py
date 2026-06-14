@@ -89,7 +89,7 @@ class RequiredTestRuntime:
         auto_area_text = ""
         if codes:
             try:
-                auto_area_text = await orch._sf_area_text_from_same_codes(codes)
+                auto_area_text = await orch.target_resolver._sf_area_text_from_same_codes(codes)
             except Exception:
                 auto_area_text = ""
         auto_area_text = auto_area_text or service_area_name

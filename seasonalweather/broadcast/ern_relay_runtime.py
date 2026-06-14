@@ -81,7 +81,7 @@ class ErnRelayRuntime:
                 log.info("ERN relay: cooldown active; skipping event=%s sender=%s", code, ev.sender)
                 continue
 
-            in_area_locs = host._filter_same_locations_to_service_area(getattr(ev, "locations", None))
+            in_area_locs = host.target_resolver._filter_same_locations_to_service_area(getattr(ev, "locations", None))
             if not in_area_locs:
                 log.info(
                     "ERN relay: no in-area SAME locations after filtering; skipping event=%s sender=%s decoded=%s",
@@ -120,7 +120,7 @@ class ErnRelayRuntime:
             sf_ev = ev
             area_text = ""
             try:
-                area_text = await host._sf_area_text_from_same_codes(in_area_locs)
+                area_text = await host.target_resolver._sf_area_text_from_same_codes(in_area_locs)
                 if area_text:
                     try:
                         setattr(sf_ev, "area", area_text)

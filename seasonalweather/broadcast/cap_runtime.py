@@ -44,7 +44,7 @@ class CapRuntime:
             if cap_mt == "cancel" and not tracks:
                 try:
                     same_code = cap_event_to_same_code((ev.event or "").strip())
-                    same_locs = o._filter_same_locations_to_service_area(
+                    same_locs = o.target_resolver._filter_same_locations_to_service_area(
                         list(getattr(ev, "same_fips", None) or [])
                     )
                     o.alert_tracker.remove(alert_tracker_id_for_cap(ev, same_code))
@@ -162,7 +162,7 @@ class CapRuntime:
 
         same_code = _vtec_toneout_policy(vtec).same_code or cap_event_to_same_code(ev_event)
         same_locs_raw = list(ev.same_fips) if getattr(ev, "same_fips", None) else []
-        same_locs = o._filter_same_locations_to_service_area(same_locs_raw)
+        same_locs = o.target_resolver._filter_same_locations_to_service_area(same_locs_raw)
 
         keys: list[str] = []
 
@@ -316,7 +316,7 @@ class CapRuntime:
 
         same_code = _vtec_toneout_policy(vtec).same_code or cap_event_to_same_code((ev.event or "").strip())
         same_locs_raw = list(ev.same_fips) if getattr(ev, "same_fips", None) else []
-        same_locs = o._filter_same_locations_to_service_area(same_locs_raw)
+        same_locs = o.target_resolver._filter_same_locations_to_service_area(same_locs_raw)
 
         keys: list[str] = []
         for track_id, _act in tracks:
@@ -464,7 +464,7 @@ class CapRuntime:
 
         same_code = cap_event_to_same_code(ev_event)
         same_locs_raw = list(ev.same_fips) if getattr(ev, "same_fips", None) else []
-        same_locs = o._filter_same_locations_to_service_area(same_locs_raw)
+        same_locs = o.target_resolver._filter_same_locations_to_service_area(same_locs_raw)
 
         key_str = f"CAPUPDATE:{(ev.alert_id or '').strip()}:{(ev.sent or '').strip()}"
         keys = [key_str]
