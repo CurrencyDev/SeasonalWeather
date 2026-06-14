@@ -27,7 +27,6 @@ from .logging_config import setup_logging
 # Module-level config reference — set once at startup before Orchestrator is created.
 _APP_CFG: "AppConfig | None" = None
 from .alerts.nws_api import NWSApi
-from .nwws.client import NWWSClient
 from .alerts.product import parse_product_text, ParsedProduct
 from .tts.tts import TTS
 from .liquidsoap_telnet import LiquidsoapTelnet
@@ -44,6 +43,7 @@ from .broadcast.nwws_runtime import NwwsRuntime
 from .broadcast.pns_runtime import PnsRuntime
 from .broadcast.tests_runtime import RequiredTestRuntime
 from .broadcast.manual_runtime import ManualOriginationRuntime
+from .broadcast.service_runtime import SeasonalWeatherServiceRuntime
 
 # Active alert tracker (persistent cycle state across restarts)
 from .alerts.active import AlertTracker, _vtec_track_id
@@ -69,37 +69,13 @@ from .alerts.vtec import (
 from .same.targeting import SameTargetResolver
 from .same.locations import normalize_same_allow_set as _normalize_same_allow_set
 
-# Optional CAP (api.weather.gov/alerts/active)
-try:
-    from .alerts.cap_nws import NwsCapPoller, CapAlertEvent
-except Exception:  # pragma: no cover
-    NwsCapPoller = None  # type: ignore
-    CapAlertEvent = None  # type: ignore
-
-# Optional IPAWS CAP (apps.fema.gov IPAWS Open feed)
-try:
-    from .alerts.ipaws_cap import IpawsCapPoller, IpawsCapEvent
-except Exception:  # pragma: no cover
-    IpawsCapPoller = None  # type: ignore
-    IpawsCapEvent = None  # type: ignore
-
-
-# Optional ERN/GWES SAME monitor (Level 3 source)
-try:
-    from .broadcast.ern_gwes import ErnGwesMonitor, ErnSameEvent
-except Exception:  # pragma: no cover
-    ErnGwesMonitor = None  # type: ignore
-    ErnSameEvent = None  # type: ignore
-
 
 log = logging.getLogger("seasonalweather")
 
 from .broadcast.station_feed_runtime import (
     set_app_config as _sf_set_app_config,
     set_repository as _sf_set_repository,
-    enabled as _sf_enabled,
     station_feed_housekeeping_start as _sf_station_feed_hk_start,
-    seed_from_alert_tracker as _station_feed_seed_from_alert_tracker,
     remove_ern_relays_matching as _sf_remove_ern_relays_matching,
 )
 
@@ -259,6 +235,7 @@ class Orchestrator:
         self.nwws_runtime = NwwsRuntime(self)
         self.tests_runtime = RequiredTestRuntime(self)
         self.manual_runtime = ManualOriginationRuntime(self)
+        self.service_runtime = SeasonalWeatherServiceRuntime(self)
 
 
         # SegmentStore: persistent per-segment audio cache.
@@ -982,196 +959,7 @@ class Orchestrator:
         await self.tests_runtime.originate_required_test(event_code)
 
     async def run(self) -> None:
-        work, audio, cache, logs = self._paths()
-        for p in (work, audio, cache, logs):
-            p.mkdir(parents=True, exist_ok=True)
-
-        await self._wait_for_liquidsoap()
-        self.discord.service_started(
-            cap_enabled=self._cap_enabled(),
-            ern_enabled=self._ern_enabled(),
-            tests_enabled=self._tests_enabled(),
-            mode=self.mode,
-        )
-
-        # --- Persistent alert state: restore from disk, drop expired ---
-        try:
-            _loaded = self.alert_tracker.load()
-            _purged = self.alert_tracker.purge_expired()
-            log.info(
-                "AlertTracker: loaded %d entries, purged %d expired on startup",
-                _loaded, _purged,
-            )
-        except Exception:
-            log.exception("AlertTracker: startup load/purge failed")
-        # _TRACKER_DL_
-        try:
-            self.discord.alerttracker_lifecycle(
-                loaded=_loaded,
-                purged=_purged,
-                active=len(self.alert_tracker.get_cycle_alerts()),
-            )
-        except Exception:
-            pass
-
-        try:
-            _sf_restored_tracker = _station_feed_seed_from_alert_tracker(self.alert_tracker)
-            if _sf_restored_tracker and _sf_enabled():
-                log.info(
-                    "Station feed: restored %d alerts from AlertTracker into SQLite read model on startup",
-                    _sf_restored_tracker,
-                )
-        except Exception:
-            log.exception("Station feed: startup restore from tracker failed")
-
-        tasks: list[asyncio.Task] = []
-
-        async def _health_probe_cap_api() -> None:
-            await self.api.active_alerts(self.cycle_builder.alert_areas)
-
-        async def _health_probe_nws_api() -> None:
-            await self.api.latest_product_id("HWO", "LWX")
-
-        self.health_state.register_probe("cap_api", _health_probe_cap_api)
-        self.health_state.register_probe("nws_api", _health_probe_nws_api)
-
-        if self.cfg.nwws.credentials_defaulted or not self.cfg.nwws.enabled:
-            self.health_state.mark_disabled("nwws_oi", "nwws_disabled")
-        if not self._cap_enabled():
-            self.health_state.mark_disabled("cap_api", "cap_disabled")
-
-        def _health_changed(_ctx) -> None:
-            try:
-                self.refresher.trigger_immediate("id", "health", "status")
-                self._schedule_cycle_refill("health-state-change")
-            except Exception:
-                log.exception("Health state change refresh failed")
-
-        tasks.append(asyncio.create_task(self.health_state.run_forever(on_change=_health_changed), name="health_state"))
-
-        # CycleConductor + SegmentRefresher own routine cycle scheduling.
-        tasks.append(asyncio.create_task(self.conductor.run(), name="conductor"))
-        tasks.append(asyncio.create_task(self.refresher.run(), name="segment_refresher"))
-        tasks.append(asyncio.create_task(self.pns_runtime.run_backfill_loop(), name="pns_api_backfill"))
-
-        if self.cfg.nwws.credentials_defaulted:
-            log.warning(
-                "NWWS-OI disabled because NWWS_JID/NWWS_PASSWORD are unset or still use the example CHANGEME values; "
-                "update /etc/seasonalweather/seasonalweather.env to enable NWWS-OI."
-            )
-        elif not self.cfg.nwws.enabled:
-            log.info("NWWS-OI disabled (set nwws.enabled: true in config.yaml to enable)")
-        else:
-            xmpp = NWWSClient(
-                self.jid, self.password, self.nwws_server, self.nwws_port, self.nwws_queue,
-                room_jid=self.cfg.nwws.room,
-                nick=self.cfg.nwws.nick,
-                # TODO: wire stall/reconnect callbacks to self.discord.nwws_stall() / .nwws_reconnected() once NWWSClient exposes them
-                stall_seconds=self.cfg.nwws.resiliency.stall_seconds,
-                muc_confirm_seconds=self.cfg.nwws.resiliency.muc_confirm_seconds,
-                start_wait_seconds=self.cfg.nwws.resiliency.start_wait_seconds,
-                join_wait_seconds=self.cfg.nwws.resiliency.join_wait_seconds,
-                backoff_max_seconds=self.cfg.nwws.resiliency.backoff_max_seconds,
-            )
-            tasks.append(asyncio.create_task(xmpp.run_forever(), name="nwws_xmpp"))
-            tasks.append(asyncio.create_task(self.nwws_runtime.run(), name="nwws_consumer"))
-        # CycleConductor runs the cycle continuously.
-
-
-        if self._cap_enabled():
-            if NwsCapPoller is None or CapAlertEvent is None:
-                log.warning("CAP enabled but cap_nws.py import failed; CAP is disabled.")
-            else:
-                kwargs = dict(
-                    out_queue=self.cap_queue,
-                    same_fips_allow=self.cfg.service_area.same_fips_all,
-                    poll_seconds=self._cap_poll_seconds(),
-                    user_agent=self._cap_user_agent(),
-                    ledger_path=self.cfg.cap.ledger_path,
-                    ledger_max_age_days=self.cfg.cap.ledger_max_age_days,
-                    database=self.database,
-                )
-                url = self._cap_url().strip()
-                if url:
-                    kwargs["url"] = url  # type: ignore[assignment]
-
-                cap = NwsCapPoller(**kwargs)  # type: ignore[arg-type]
-                tasks.append(asyncio.create_task(cap.run_forever(), name="cap_poller"))
-                tasks.append(asyncio.create_task(self.cap_runtime.run(), name="cap_consumer"))
-                log.info("CAP ingest enabled (dryrun=%s full=%s voice=%s)", self._cap_dryrun(), self._cap_full_enabled(), self._cap_voice_enabled())
-        else:
-            log.info("CAP ingest disabled (set cap.enabled: true in config.yaml to enable)")
-
-        if self._ipaws_enabled():
-            if IpawsCapPoller is None or IpawsCapEvent is None:
-                log.warning("IPAWS enabled but ipaws_cap.py import failed; IPAWS is disabled.")
-            else:
-                ipaws_poller = IpawsCapPoller(
-                    out_queue=self.ipaws_queue,
-                    same_fips_allow=self.cfg.service_area.same_fips_all,
-                    poll_seconds=self._ipaws_poll_seconds(),
-                    user_agent=self._ipaws_user_agent(),
-                    url=self._ipaws_url(),
-                    ledger_path=self.cfg.ipaws.ledger_path,
-                    ledger_max_age_days=self.cfg.ipaws.ledger_max_age_days,
-                    database=self.database,
-                )
-                tasks.append(asyncio.create_task(ipaws_poller.run_forever(), name="ipaws_poller"))
-                tasks.append(asyncio.create_task(self.ipaws_runtime.run(), name="ipaws_consumer"))
-                log.info(
-                    "IPAWS ingest enabled (dryrun=%s full_events=%s)",
-                    self._ipaws_dryrun(),
-                    ",".join(sorted(self._ipaws_full_events())),
-                )
-        else:
-            log.info("IPAWS ingest disabled (set ipaws.enabled: true in config.yaml to enable)")
-
-        if self._ern_enabled():
-            if ErnGwesMonitor is None or ErnSameEvent is None:
-                log.warning("ERN enabled but ern_gwes.py import failed; ERN is disabled.")
-            else:
-                url = self._ern_url()
-                if not url:
-                    log.warning("ERN enabled but SEASONAL_ERN_URL is empty; ERN is disabled.")
-                else:
-                    ern_cfg = self.cfg.ern
-                    mon = ErnGwesMonitor(
-                        out_queue=self.ern_queue,
-                        same_fips_allow=self.cfg.service_area.same_fips_all,
-                        url=url,
-                        sample_rate=ern_cfg.sample_rate,
-                        dedupe_seconds=ern_cfg.dedupe_seconds,
-                        trigger_ratio=ern_cfg.trigger_ratio,
-                        tail_seconds=ern_cfg.tail_seconds,
-                        confidence_min=ern_cfg.confidence_min,
-                        name=ern_cfg.name,
-                        decoder_backend=ern_cfg.decoder_backend,
-                    )
-                    tasks.append(asyncio.create_task(mon.run_forever(), name="ern_monitor"))
-                    tasks.append(asyncio.create_task(self.ern_relay_runtime.run(), name="ern_consumer"))
-                    log.info(
-                        "ERN monitor enabled (dryrun=%s url=%s relay=%s decoder=%s)",
-                        self._ern_dryrun(),
-                        url,
-                        self._ern_relay_enabled(),
-                        ern_cfg.decoder_backend,
-                    )
-        else:
-            log.info("ERN monitor disabled (set ern.enabled: true in config.yaml to enable)")
-
-        self.tests_runtime.start_scheduler(tasks)
-
-        if self.db_housekeeper is not None:
-            tasks.append(asyncio.create_task(self.db_housekeeper.run_forever(), name="database_housekeeping"))
-
-        tasks.append(asyncio.create_task(self.discord.start(), name="discord_log_drain"))
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-        for t in done:
-            exc = t.exception()
-            if exc:
-                for p in pending:
-                    p.cancel()
-                raise exc
+        await self.service_runtime.run()
 
 
     def _cap_is_actionable(self, ev: "CapAlertEvent") -> bool:  # type: ignore[name-defined]
