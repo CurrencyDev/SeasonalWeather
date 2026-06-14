@@ -702,6 +702,9 @@ class Orchestrator:
             log.exception("AlertTracker: failed removing IPAWS state reason=%s", reason)
             return 0
 
+    async def run(self) -> None:
+        """Run the SeasonalWeather service runtime."""
+        await self.service_runtime.run()
 
 
 def main(argv: list[str] | None = None) -> int:
