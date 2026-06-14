@@ -157,6 +157,8 @@ class Orchestrator:
             local_tz=self._tz,
             same_fips_allow_set=self._same_fips_allow_set,
         )
+        # Public runtime alias retained for extracted source runtimes.
+        self.target_resolver = self.targeting
 
         # --- NWWS flood-gate controls ---
         self._nwws_logger = logging.getLogger("seasonalweather.nwws")

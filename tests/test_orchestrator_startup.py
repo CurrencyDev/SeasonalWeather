@@ -32,6 +32,7 @@ def test_orchestrator_initializes_runtime_wiring(tmp_path, monkeypatch):
     orch = Orchestrator(cfg)
 
     assert orch.cap_text._best_expiry_from_vtec is best_expiry_from_vtec
+    assert orch.target_resolver is orch.targeting
     assert orch.cap_runtime.orchestrator is orch
     assert orch.nwws_runtime._orchestrator is orch
     assert inspect.iscoroutinefunction(orch.run)
