@@ -44,7 +44,7 @@ from .broadcast.pns_runtime import PnsRuntime
 from .broadcast.tests_runtime import RequiredTestRuntime
 from .broadcast.manual_runtime import ManualOriginationRuntime
 from .broadcast.service_runtime import SeasonalWeatherServiceRuntime
-from .broadcast.cap_policy import cap_vtec_list
+from .broadcast.cap_policy import best_expiry_from_vtec, cap_vtec_list
 
 # Active alert tracker (persistent cycle state across restarts)
 from .alerts.active import AlertTracker
@@ -107,7 +107,7 @@ class Orchestrator:
             local_tz=self._tz,
             cap_vtec_list=cap_vtec_list,
             vtec_tracks=self._vtec_tracks,
-            best_expiry_from_vtec=self._best_expiry_from_vtec,
+            best_expiry_from_vtec=best_expiry_from_vtec,
         )
 
         # Isolated policy/state machines. main.py only wires inputs/outputs;

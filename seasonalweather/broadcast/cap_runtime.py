@@ -8,6 +8,7 @@ from ..alerts.active import ActiveAlert, _vtec_track_id
 from ..alerts.vtec import VTEC_PARSE_RE as _VTEC_PARSE_RE, toneout_policy as _vtec_toneout_policy
 from .cap_policy import (
     alert_expires_from_cap,
+    best_expiry_from_vtec,
     alert_tracker_id_for_cap,
     cap_event_to_same_code,
     cap_should_full,
@@ -255,7 +256,7 @@ class CapRuntime:
             # ---- Register to AlertTracker for active cycle rotation ----
             try:
                 tracker_id = alert_tracker_id_for_cap(ev, same_code)
-                expires_iso = alert_expires_from_cap(ev, vtec, best_expiry_from_vtec=o._best_expiry_from_vtec)
+                expires_iso = alert_expires_from_cap(ev, vtec, best_expiry_from_vtec=best_expiry_from_vtec)
                 _is_watch = (ev.event or "").strip() in {"Tornado Watch", "Severe Thunderstorm Watch"}
                 _watch_num: int | None = None
                 if _is_watch:
@@ -379,7 +380,7 @@ class CapRuntime:
             try:
                 vtec_v = cap_vtec_list(ev)
                 tracker_id_v = alert_tracker_id_for_cap(ev, same_code)
-                expires_iso_v = alert_expires_from_cap(ev, vtec_v, best_expiry_from_vtec=o._best_expiry_from_vtec)
+                expires_iso_v = alert_expires_from_cap(ev, vtec_v, best_expiry_from_vtec=best_expiry_from_vtec)
                 _ae = ActiveAlert(
                     id=tracker_id_v,
                     source="CAP",

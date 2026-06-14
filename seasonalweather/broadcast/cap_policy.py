@@ -109,6 +109,54 @@ _CAP_EVENT_TO_SAME_CODE: dict[str, str] = {
 }
 
 
+def _parse_vtec_dt_utc(token: str) -> dt.datetime | None:
+    """Parse a VTEC UTC timestamp token like ``260614T0930Z`` or ``20260614T0930Z``."""
+    token = (token or "").strip().upper()
+    m = re.match(r"^(\d{6}|\d{8})T(\d{4})Z$", token)
+    if not m:
+        return None
+
+    d = m.group(1)
+    hm = m.group(2)
+    try:
+        if len(d) == 8:
+            year = int(d[0:4])
+            month = int(d[4:6])
+            day = int(d[6:8])
+        else:
+            year = 2000 + int(d[0:2])
+            month = int(d[2:4])
+            day = int(d[4:6])
+
+        hour = int(hm[0:2])
+        minute = int(hm[2:4])
+        return dt.datetime(year, month, day, hour, minute, tzinfo=dt.timezone.utc)
+    except Exception:
+        return None
+
+
+def best_expiry_from_vtec(vtec_list: list[str]) -> dt.datetime | None:
+    """Return the latest END time found across VTEC codes, in UTC."""
+    ends: list[dt.datetime] = []
+    for raw in vtec_list or []:
+        s = "".join(str(raw).split()).strip()
+        if not s:
+            continue
+
+        # Pull the END token from the VTEC time pair: ...-YYYYMMDDThhmmZ/
+        m = re.search(r"-((?:\d{8}|\d{6})T\d{4}Z)", s)
+        if not m:
+            continue
+
+        parsed = _parse_vtec_dt_utc(m.group(1))
+        if parsed is not None:
+            ends.append(parsed)
+
+    if not ends:
+        return None
+    return max(ends)
+
+
 def cap_event_to_same_code(event: str) -> str:
     e = (event or "").strip()
     if e in _CAP_EVENT_TO_SAME_CODE:

@@ -8,6 +8,7 @@ from ..alerts.builder import build_spoken_alert
 from ..alerts.product import ParsedProduct, parse_product_text
 from ..alerts.vtec import toneout_policy as _vtec_toneout_policy
 from .audio_origination import safe_event_code as _safe_event_code
+from .cap_policy import best_expiry_from_vtec
 from .pns import parse_nws_header_issued_dt, pns_text_same_issuance
 from .product_text import render_nwws_product_script
 from .station_feed_runtime import (
@@ -249,7 +250,7 @@ class NwwsRuntime:
 
         vtec = vtec_preview
         tracks = self._vtec_tracks(vtec)
-        exp_utc = self._best_expiry_from_vtec(vtec)
+        exp_utc = best_expiry_from_vtec(vtec)
 
         # VTEC toneout policy — vtec.py is authoritative for FULL vs VOICE.
         # This replaces the inline action-only check that ignored significance
@@ -505,7 +506,7 @@ class NwwsRuntime:
                 _nw_vtec = vtec
                 _nw_tracks = tracks
                 _nw_vtec_actions = vtec_actions
-                _nw_exp_utc = self._best_expiry_from_vtec(_nw_vtec)
+                _nw_exp_utc = best_expiry_from_vtec(_nw_vtec)
                 _nw_expires_iso = _nw_exp_utc.isoformat() if _nw_exp_utc else (
                     dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=6)).isoformat()
                 _nw_same_code = _nw_policy.same_code or _safe_event_code(parsed.product_type)
