@@ -41,6 +41,7 @@ from .broadcast.cap_text import CapTextRenderer
 from .broadcast.ipaws_text import build_ipaws_script
 from .broadcast.product_text import render_nwws_product_script
 from .broadcast.audio_origination import AudioOriginator, safe_event_code as _safe_event_code
+from .broadcast.ern_relay_runtime import ErnRelayRuntime
 
 # Active alert tracker (persistent cycle state across restarts)
 from .alerts.active import ActiveAlert, AlertTracker, _vtec_track_id
@@ -53,7 +54,6 @@ from .discord_log import DiscordLogger
 from .health_state import HealthStateMachine
 from .broadcast.pns import PnsStateMachine, parse_nws_header_issued_dt, pns_text_same_issuance
 from .broadcast.ern_script import (
-    build_ern_relay_script as _build_ern_relay_script,
     _parse_duration_minutes as _ern_parse_duration_minutes,
     _same_jday_to_utc as _ern_same_jday_to_utc,
 )
@@ -270,6 +270,8 @@ class Orchestrator:
             paths=self._paths,
             discord=self.discord,
         )
+        self.ern_relay_runtime = ErnRelayRuntime(self)
+
 
         # SegmentStore: persistent per-segment audio cache.
         # Placed last so alert_tracker and all other attributes are available.
@@ -1278,7 +1280,7 @@ class Orchestrator:
                         decoder_backend=ern_cfg.decoder_backend,
                     )
                     tasks.append(asyncio.create_task(mon.run_forever(), name="ern_monitor"))
-                    tasks.append(asyncio.create_task(self._consume_ern(), name="ern_consumer"))
+                    tasks.append(asyncio.create_task(self.ern_relay_runtime.run(), name="ern_consumer"))
                     log.info(
                         "ERN monitor enabled (dryrun=%s url=%s relay=%s decoder=%s)",
                         self._ern_dryrun(),
@@ -2794,203 +2796,6 @@ class Orchestrator:
                     event_code,
                     ev.identifier,
                 )
-
-    async def _consume_ern(self) -> None:
-        while True:
-            ev = await self.ern_queue.get()
-
-            if ev.kind == "header":
-                log.info(
-                    "ERN SAME header: org=%s event=%s sender=%s conf=%.3f same=%s text=%s",
-                    ev.org,
-                    ev.event,
-                    (ev.sender or "").strip(),
-                    ev.confidence,
-                    ",".join(ev.locations[:12]) + ("..." if len(ev.locations) > 12 else ""),
-                    ev.text,
-                )
-
-                try:
-                    if ev.event and ev.event in self.cfg.policy.toneout_product_types and ev.event not in {"RWT", "RMT"}:
-                        self.ern_last_tone_at = dt.datetime.now(tz=self._tz)
-                except Exception:
-                    pass
-            else:
-                log.info("ERN SAME EOM: conf=%.3f text=%s", ev.confidence, ev.text)
-
-            if self._ern_dryrun():
-                continue
-            if not self._ern_relay_enabled():
-                continue
-            if ev.kind != "header":
-                continue
-
-            code = (ev.event or "").strip().upper()
-            if code not in self._ern_relay_events():
-                continue
-
-            conf = float(getattr(ev, "confidence", 0.0) or 0.0)
-            if conf < self._ern_relay_min_confidence():
-                log.info(
-                    "ERN relay: confidence too low (%.3f < %.3f) event=%s sender=%s",
-                    conf,
-                    self._ern_relay_min_confidence(),
-                    code,
-                    ev.sender,
-                )
-                continue
-
-            senders = self._ern_relay_senders()
-            sender_u = (ev.sender or "").strip().upper()
-            if senders and sender_u not in senders:
-                log.info("ERN relay: sender not allowed (sender=%s allowed=%s)", ev.sender, ",".join(sorted(senders)))
-                continue
-
-            now = dt.datetime.now(tz=self._tz)
-            if self._ern_relay_last_any_at and (now - self._ern_relay_last_any_at).total_seconds() < self._ern_relay_cooldown_seconds():
-                log.info("ERN relay: cooldown active; skipping event=%s sender=%s", code, ev.sender)
-                continue
-
-            in_area_locs = self._filter_same_locations_to_service_area(getattr(ev, "locations", None))
-            if not in_area_locs:
-                log.info(
-                    "ERN relay: no in-area SAME locations after filtering; skipping event=%s sender=%s decoded=%s",
-                    code,
-                    ev.sender,
-                    ",".join(getattr(ev, "locations", [])[:12]) + ("..." if len(getattr(ev, "locations", [])) > 12 else ""),
-                )
-                continue
-
-            # Cross-source dedupe: reserve keys BEFORE rendering/airing
-
-            keys: list[str] = []
-
-            fkey3 = self._dedupe_func_full_key(code, in_area_locs)
-
-            if fkey3:
-
-                keys.append(fkey3)
-
-
-            # ERN-specific fallback (suppresses identical repeats even if functional key is absent)
-
-            sender_u2 = (ev.sender or "").strip().upper()
-
-            loc_sig = ",".join(sorted(set(in_area_locs)))[:1200]
-
-            keys.append(f"ERNRELAY:{code}:{self._sha1_12(sender_u2 + '|' + loc_sig)}")
-
-
-            ok, hit = await self._dedupe_reserve(keys)
-
-            if not ok:
-
-                log.info("ERN relay skipped (dedupe hit=%s) event=%s sender=%s same=%s", hit, code, ev.sender, loc_sig[:160])
-
-                continue
-
-
-            sf_ev = ev
-            area_text = ""
-            try:
-                area_text = await self._sf_area_text_from_same_codes(in_area_locs)
-                if area_text:
-                    try:
-                        setattr(sf_ev, "area", area_text)
-                    except Exception:
-                        try:
-                            sf_ev = SimpleNamespace(**getattr(ev, "__dict__", {}))
-                            setattr(sf_ev, "area", area_text)
-                        except Exception:
-                            sf_ev = ev
-            except Exception:
-                area_text = ""
-
-            script = _build_ern_relay_script(
-                ev,
-                same_locations=in_area_locs,
-                area_text=area_text,
-                tz=self._tz,
-            )
-            dummy = SimpleNamespace(product_type=code, awips_id=None, wfo="ERN", raw_text="")
-
-            out_wav = await self.audio_originator.render_alert_audio(dummy, script, same_locations=in_area_locs)
-
-            async with self._cycle_lock:
-                try:
-                    self.telnet.flush_cycle()
-                except Exception:
-                    pass
-                event_label = _same_label_or_code(code)
-                title = self._np_alert_title("ern", event=event_label)
-                meta = self._np_meta(
-                    title=title,
-                    kind="alert",
-                    extra={
-                        "sw_alert_source": "ern",
-                        "sw_event_code": code,
-                        "sw_event": event_label,
-                        "sw_sender": (ev.sender or "").strip(),
-                    },
-                )
-                self.telnet.push_alert(str(out_wav), meta=meta)
-
-            self._ern_relay_last_any_at = now
-            self.last_product_desc = f"ERN {code}".strip()
-
-            try:
-                event_label = _same_label_or_code(code)
-                relay_id = "ERN:%s:%s" % (
-                    code,
-                    self._sha1_12(
-                        "|".join([
-                            (ev.sender or "").strip().upper(),
-                            ",".join(sorted(set(in_area_locs))),
-                            str(getattr(ev, "jjjhhmm", "") or ""),
-                            str(getattr(ev, "tttt", "") or ""),
-                        ])
-                    ),
-                )
-                alert_entry = ActiveAlert(
-                    id=relay_id,
-                    source="ERN",
-                    event=event_label,
-                    code=code,
-                    vtec=[],
-                    headline=f"ERN relay: {event_label}",
-                    script_text=script,
-                    audio_path=str(out_wav),
-                    expires=self._alert_expires_from_ern(ev),
-                    issued=dt.datetime.now(dt.timezone.utc).isoformat(),
-                    same_locs=in_area_locs,
-                    cycle_only=True,
-                    watch_number=None,
-                )
-                self.alert_tracker.add_or_update(alert_entry)
-                self.alert_tracker.mark_aired(relay_id)
-                log.info("AlertTracker: registered ERN relay id=%s code=%s", relay_id, code)
-            except Exception:
-                log.exception("AlertTracker: failed to register ERN relay event=%s sender=%s", code, ev.sender)
-
-            self._schedule_cycle_refill("post-ern-relay")
-            log.info(
-                "ERN ACTION: aired relay event=%s sender=%s same_locs=%d audio=%s",
-                code,
-                ev.sender,
-                len(in_area_locs),
-                out_wav,
-            )
-            # _ERN_DL_
-            self.discord.alert_aired(
-                code=code,
-                event=_same_label_or_code(code),
-                source=f"ERN/GWES ({(ev.sender or '').strip() or 'unknown'})",
-                mode="full",
-                area=area_text,
-                same_codes=in_area_locs,
-                is_ern=True,
-            )
-            _station_feed_note_ern(sf_ev, same_locations=in_area_locs, out_wav=str(out_wav))
 
     async def _handle_toneout(self, parsed: ParsedProduct) -> None:
         log.info("NWWS toneout candidate: type=%s awips=%s wfo=%s", parsed.product_type, parsed.awips_id or "", parsed.wfo)
