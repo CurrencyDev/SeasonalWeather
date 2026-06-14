@@ -1109,27 +1109,6 @@ class Orchestrator:
         return bool(vtec_actions & update_actions)
 
 
-    def _clean_cap_text(self, s: str, *, limit: int = 900) -> str:
-        return self.cap_text._clean_cap_text(s, limit=limit)
-
-
-    def _build_cap_watch_script(self, ev: "CapAlertEvent", *, mode: str = "full") -> str:  # type: ignore[name-defined]
-        return self.cap_text._build_cap_watch_script(ev, mode=mode)
-
-
-    # ------------------------------------------------------------------ #
-    #  VTEC-action script builders (NWR-style update/cancel narration)    #
-    # ------------------------------------------------------------------ #
-
-    def _parse_cap_area_by_state(self, area_desc: str) -> tuple[dict[str, list[str]], list[str], list[str]]:
-        return self.cap_text._parse_cap_area_by_state(area_desc)
-
-    def _join_oxford(self, items: list[str]) -> str:
-        return self.cap_text._join_oxford(items)
-
-    def _fmt_local_from_utc_iso(self, iso_str: str) -> str:
-        return self.cap_text._fmt_local_from_utc_iso(iso)
-
     def _alert_tracker_id_for_cap(self, ev: "CapAlertEvent", same_code: str) -> str:  # type: ignore[name-defined]
         """
         Return a stable AlertTracker ID for a CAP event.
@@ -1196,62 +1175,6 @@ class Orchestrator:
         except Exception:
             log.exception("AlertTracker: failed removing IPAWS state reason=%s", reason)
             return 0
-
-    def _cap_prefers_statement_update_script(self, event: str, vtec_actions: set[str]) -> bool:
-        return self.cap_text._cap_prefers_statement_update_script(event, vtec_actions)
-
-    def _cap_expiry_summary_line(self, text: str) -> str:
-        return self.cap_text._cap_expiry_summary_line(text)
-
-    def _build_statement_vtec_action_script(
-        self,
-        ev: "CapAlertEvent",  # type: ignore[name-defined]
-        vtec_actions: set[str],
-        tracks: list[tuple[str, str]],
-    ) -> str:
-        return self.cap_text._build_statement_vtec_action_script(
-            ev,
-            vtec_actions=vtec_actions,
-            tracks=tracks,
-        )
-
-    def _build_warning_vtec_action_script(
-        self,
-        ev: "CapAlertEvent",  # type: ignore[name-defined]
-        vtec_actions: set[str],
-        tracks: list[tuple[str, str]],
-    ) -> str:
-        return self.cap_text._build_warning_vtec_action_script(
-            ev,
-            vtec_actions=vtec_actions,
-            tracks=tracks,
-        )
-
-    def _build_watch_vtec_action_script(
-        self,
-        ev: "CapAlertEvent",  # type: ignore[name-defined]
-        vtec_actions: set[str],
-        tracks: list[tuple[str, str]],
-        watch_number: int | None,
-        kind: str,
-    ) -> str:
-        return self.cap_text._build_watch_vtec_action_script(
-            ev,
-            vtec_actions=vtec_actions,
-            tracks=tracks,
-            watch_number=watch_number,
-            kind=kind,
-        )
-
-    def _build_watch_expansion_script(self, ev: "CapAlertEvent") -> str:  # type: ignore[name-defined]
-        return self.cap_text._build_watch_expansion_script(ev)
-
-    def _build_cap_full_script(self, ev: "CapAlertEvent") -> str:  # type: ignore[name-defined]
-        return self.cap_text._build_cap_full_script(ev)
-
-    def _build_cap_voice_script(self, ev: "CapAlertEvent") -> str:  # type: ignore[name-defined]
-        return self.cap_text._build_cap_voice_script(ev)
-
 
     def _manual_full_eas_should_heighten(self) -> bool:
         return self.manual_runtime.manual_full_eas_should_heighten()

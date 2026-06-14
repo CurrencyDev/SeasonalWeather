@@ -265,7 +265,7 @@ class IpawsRuntime:
                 mode="full",
                 area=",".join(same_locs or same_locs_raw)[:160],
                 vtec=[],
-                expires=host._fmt_local_from_utc_iso(ev.expires or ""),
+                expires=host.cap_text._fmt_local_from_utc_iso(ev.expires or ""),
             )
 
         except Exception:
@@ -378,7 +378,7 @@ class IpawsRuntime:
                 mode="voice",
                 area=",".join(same_locs or same_locs_raw)[:160],
                 vtec=[],
-                expires=host._fmt_local_from_utc_iso(ev.expires or ""),
+                expires=host.cap_text._fmt_local_from_utc_iso(ev.expires or ""),
             )
 
         except Exception:

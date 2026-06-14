@@ -138,14 +138,14 @@ class CapRuntime:
         if is_watch:
             if vtec_actions & {"EXA", "EXB"}:
                 # Watch expansion: full announcement with SAME for added counties
-                script = o._build_watch_expansion_script(ev)
+                script = o.cap_text._build_watch_expansion_script(ev)
             else:
                 # NEW or UPG watch
-                script = o._build_cap_watch_script(ev, mode="full")
+                script = o.cap_text._build_cap_watch_script(ev, mode="full")
             if not script.strip():
-                script = o._build_cap_full_script(ev)
+                script = o.cap_text._build_cap_full_script(ev)
         else:
-            script = o._build_cap_full_script(ev)
+            script = o.cap_text._build_cap_full_script(ev)
 
         if not script.strip():
             return
@@ -237,7 +237,7 @@ class CapRuntime:
                 mode="full",
                 area=getattr(ev, "area_desc", "") or "",
                 vtec=vtec[:2],
-                expires=o._fmt_local_from_utc_iso(
+                expires=o.cap_text._fmt_local_from_utc_iso(
                     str(getattr(ev, "expires", "") or "")
                 ),
             )
@@ -297,7 +297,7 @@ class CapRuntime:
             log.info("CAP voice: cooldown active; skipping id=%s sent=%s event=%s", ev.alert_id, ev.sent, ev.event)
             return
 
-        script = o._build_cap_voice_script(ev)
+        script = o.cap_text._build_cap_voice_script(ev)
         if not script.strip():
             return
 
@@ -442,11 +442,11 @@ class CapRuntime:
                 break
 
         if is_watch:
-            script = o._build_watch_vtec_action_script(ev, vtec_actions, tracks, watch_number, watch_kind)
-        elif o._cap_prefers_statement_update_script(ev_event, vtec_actions):
-            script = o._build_statement_vtec_action_script(ev, vtec_actions, tracks)
+            script = o.cap_text._build_watch_vtec_action_script(ev, vtec_actions, tracks, watch_number, watch_kind)
+        elif o.cap_text._cap_prefers_statement_update_script(ev_event, vtec_actions):
+            script = o.cap_text._build_statement_vtec_action_script(ev, vtec_actions, tracks)
         else:
-            script = o._build_warning_vtec_action_script(ev, vtec_actions, tracks)
+            script = o.cap_text._build_warning_vtec_action_script(ev, vtec_actions, tracks)
 
         if not script.strip():
             log.info("CAP update: empty script, skipping event=%s vtec_actions=%s", ev_event, vtec_actions)
