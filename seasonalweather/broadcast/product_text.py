@@ -60,6 +60,164 @@ STATE_NAME_FULL: dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
+# NWS header / spoken time helpers
+# ---------------------------------------------------------------------------
+_TZ_NAME_MAP = {
+    "EST": "Eastern Standard Time",
+    "EDT": "Eastern Daylight Time",
+    "CST": "Central Standard Time",
+    "CDT": "Central Daylight Time",
+    "MST": "Mountain Standard Time",
+    "MDT": "Mountain Daylight Time",
+    "PST": "Pacific Standard Time",
+    "PDT": "Pacific Daylight Time",
+    "AKST": "Alaska Standard Time",
+    "AKDT": "Alaska Daylight Time",
+    "HST": "Hawaii Standard Time",
+    "AST": "Atlantic Standard Time",
+    "ADT": "Atlantic Daylight Time",
+    "UTC": "Coordinated Universal Time",
+    "GMT": "Greenwich Mean Time",
+}
+
+_NWS_HEADER_ISSUED_RE = re.compile(
+    r"^(?P<hhmm>\d{3,4})\s*(?P<ampm>AM|PM)\s*(?P<tz>[A-Z]{2,4})\s+"
+    r"(?P<dow>[A-Za-z]{3})\s+(?P<mon>[A-Za-z]{3})\s+(?P<day>\d{1,2})\s+(?P<year>\d{4})\s*$"
+)
+
+_SPS_INTRO_LEAD_RE = re.compile(
+    r"(?is)^(?:This is a statement from the National Weather Service\.|The National Weather Service has issued the following message\.)\s*"
+)
+
+
+def expand_tz_token(token: str) -> str:
+    tok = (token or "").strip()
+    if not tok:
+        return "local"
+    return _TZ_NAME_MAP.get(tok.upper(), tok)
+
+
+def fmt_local_from_utc_iso(iso_str: str, *, local_tz: dt.tzinfo | None = None) -> str:
+    """Parse an ISO-8601 UTC timestamp and return a human-friendly local time phrase."""
+    s = (iso_str or "").strip()
+    if not s:
+        return ""
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        utc_dt = dt.datetime.fromisoformat(s)
+        if local_tz is not None:
+            local_dt = utc_dt.astimezone(local_tz)
+        else:
+            local_dt = utc_dt
+        hour12 = local_dt.hour % 12 or 12
+        ampm = "AM" if local_dt.hour < 12 else "PM"
+        tz_name = expand_tz_token(local_dt.strftime("%Z"))
+        if local_dt.minute == 0:
+            return f"{hour12} {ampm} {tz_name}"
+        return f"{hour12}:{local_dt.minute:02d} {ampm} {tz_name}"
+    except Exception:
+        return ""
+
+
+def nws_header_issued_phrase(text: str) -> str | None:
+    """
+    Extract a spoken timestamp from a common NWS header line such as:
+      "310 PM EST Sun Jan 11 2026"
+    """
+    if not text:
+        return None
+
+    dow_map = {
+        "SUN": "Sunday",
+        "MON": "Monday",
+        "TUE": "Tuesday",
+        "WED": "Wednesday",
+        "THU": "Thursday",
+        "FRI": "Friday",
+        "SAT": "Saturday",
+    }
+    mon_map = {
+        "JAN": "January",
+        "FEB": "February",
+        "MAR": "March",
+        "APR": "April",
+        "MAY": "May",
+        "JUN": "June",
+        "JUL": "July",
+        "AUG": "August",
+        "SEP": "September",
+        "OCT": "October",
+        "NOV": "November",
+        "DEC": "December",
+    }
+
+    for ln in (text or "").splitlines()[:80]:
+        raw = (ln or "").strip()
+        if not raw:
+            continue
+        m = _NWS_HEADER_ISSUED_RE.match(raw)
+        if not m:
+            continue
+
+        hhmm = m.group("hhmm")
+        ampm = m.group("ampm").upper()
+        tz = expand_tz_token(m.group("tz").upper())
+        dow = dow_map.get(m.group("dow").strip().upper(), m.group("dow").strip())
+        mon = mon_map.get(m.group("mon").strip().upper(), m.group("mon").strip())
+        day = str(int(m.group("day")))
+        year = m.group("year")
+
+        if len(hhmm) == 3:
+            hour = int(hhmm[0])
+            minute = int(hhmm[1:])
+        else:
+            hour = int(hhmm[:2])
+            minute = int(hhmm[2:])
+
+        return f"{hour}:{minute:02d} {ampm} {tz} {dow} {mon} {day} {year}"
+
+    return None
+
+
+def sps_preamble(sent_iso: str | None = None, *, local_tz: dt.tzinfo | None = None) -> str:
+    """
+    Build the NWR-style Special Weather Statement preamble used by CAP and NWWS paths.
+    """
+    issued = fmt_local_from_utc_iso(sent_iso or "", local_tz=local_tz)
+    if issued:
+        return (
+            "And now a Special Weather Statement from your National Weather Service, "
+            f"issued at {issued}."
+        )
+    return "And now a Special Weather Statement from your National Weather Service."
+
+
+def fix_sps_preamble(script: str, official_text: str) -> str:
+    """
+    Normalize NWWS SPS narration to the same NWR-style preamble as CAP SPS.
+    """
+    body = (script or "").strip()
+    if not body:
+        return body
+
+    issued = nws_header_issued_phrase(official_text)
+    lead = "And now a Special Weather Statement from your National Weather Service."
+    if issued:
+        lead = (
+            "And now a Special Weather Statement from your National Weather Service, "
+            f"issued at {issued}."
+        )
+
+    out = _SPS_INTRO_LEAD_RE.sub(lead + "\n", body, count=1)
+    if out == body:
+        out = lead + "\n" + body
+
+    out = re.sub(r"(?im)^\s*Special Weather Statement\.\s*", "", out, count=1)
+    return out.strip()
+
+
+# ---------------------------------------------------------------------------
 # Text utilities
 # ---------------------------------------------------------------------------
 
@@ -1394,13 +1552,187 @@ def build_nwws_watch_vtec_script(
     return "\n\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
 
 
+@dataclass(frozen=True)
+class NwwsScriptRenderResult:
+    script: str
+    changed: bool = False
+    renderer: str = "base"
+    notes: tuple[str, ...] = ()
+
+
+def build_nwws_statement_vtec_action_script(
+    *,
+    event_text: str,
+    area_text: str,
+    official_text: str,
+    headline: str,
+    vtec_actions: set[str],
+) -> str:
+    """Build the lighter NWWS statement/advisory/message EXP/CAN narration."""
+    return build_statement_vtec_action_script(
+        event=event_text,
+        area_desc=area_text or _extract_county_area_text(official_text) or "",
+        description=official_text,
+        headline=headline,
+        vtec=[],
+        vtec_actions=vtec_actions,
+        parameters=None,
+        sps_preamble=lambda sent_iso=None: sps_preamble(sent_iso),
+    )
+
+
+def render_nwws_product_script(
+    *,
+    product_type: str,
+    base_script: str,
+    official_text: str,
+    vtec: list[str],
+    vtec_actions: set[str],
+    has_tracks: bool,
+    should_full: bool,
+    event_text: str,
+    area_text: str,
+    headline: str,
+    local_tz: dt.tzinfo | None = None,
+) -> NwwsScriptRenderResult:
+    """
+    Normalize NWWS spoken scripts after the generic alert builder.
+
+    This function owns the product-specific narration overrides that used to live
+    in main.py: WCN watch wording, SPS preambles, partial cancels, terminal
+    cancels/expirations, and statement-style CAN/EXP narration.
+    """
+    ptype = (product_type or "").strip().upper()
+    script = base_script or ""
+    changed = False
+    renderer = "base"
+    notes: list[str] = []
+
+    watch_script = build_nwws_watch_vtec_script(
+        official_text,
+        vtec,
+        local_tz=local_tz,
+        area_text=area_text,
+    )
+    if watch_script:
+        script = watch_script
+        changed = True
+        renderer = "nwws-watch-vtec"
+
+    if ptype == "SPS":
+        fixed = fix_sps_preamble(script, official_text)
+        if fixed.strip() != script.strip():
+            script = fixed
+            changed = True
+            renderer = "nwws-sps-preamble"
+
+    if not (has_tracks and not should_full and ({"EXP", "CAN"} & vtec_actions)):
+        return NwwsScriptRenderResult(
+            script=script,
+            changed=changed,
+            renderer=renderer,
+            notes=tuple(notes),
+        )
+
+    has_continuation = bool(vtec_actions & {"CON", "EXT", "EXA", "EXB"})
+
+    if has_continuation:
+        if ptype == "WCN":
+            watch_partial_script = build_nwws_watch_partial_cancel_script(
+                official_text,
+                vtec,
+                local_tz=local_tz,
+            )
+            if watch_partial_script:
+                return NwwsScriptRenderResult(
+                    script=watch_partial_script,
+                    changed=True,
+                    renderer="nwws-watch-partial-cancel",
+                    notes=tuple(notes),
+                )
+            notes.append("warning: WCN watch partial-cancel parser returned no script; preserving prior script")
+            return NwwsScriptRenderResult(
+                script=script,
+                changed=changed,
+                renderer=renderer,
+                notes=tuple(notes),
+            )
+
+        segments = parse_nwws_product_segments(official_text)
+        partial_script = build_nwws_partial_cancel_script(event_text, segments)
+        if partial_script:
+            return NwwsScriptRenderResult(
+                script=partial_script,
+                changed=True,
+                renderer="nwws-partial-cancel",
+                notes=tuple([*notes, f"segments={len(segments)}"]),
+            )
+        notes.append("warning: partial-cancel segment parser returned no script; preserving prior script")
+        return NwwsScriptRenderResult(
+            script=script,
+            changed=changed,
+            renderer=renderer,
+            notes=tuple(notes),
+        )
+
+    if cap_prefers_statement_update_script(event_text, vtec_actions):
+        return NwwsScriptRenderResult(
+            script=build_nwws_statement_vtec_action_script(
+                event_text=event_text,
+                area_text=area_text,
+                official_text=official_text,
+                headline=headline,
+                vtec_actions=vtec_actions,
+            ),
+            changed=True,
+            renderer="nwws-statement-vtec-action",
+            notes=tuple(notes),
+        )
+
+    detailed_terminal_script = ""
+    if ptype in {"FLS", "FFS", "SVS"}:
+        detailed_terminal_script = build_nwws_terminal_cancel_expiry_script(
+            event_text,
+            official_text,
+        )
+
+    if detailed_terminal_script:
+        return NwwsScriptRenderResult(
+            script=detailed_terminal_script,
+            changed=True,
+            renderer="nwws-detailed-terminal-cancel-expiry",
+            notes=tuple(notes),
+        )
+
+    summary = expiry_summary_script(official_text)
+    if summary:
+        return NwwsScriptRenderResult(
+            script=summary,
+            changed=True,
+            renderer="nwws-terminal-summary",
+            notes=tuple(notes),
+        )
+
+    return NwwsScriptRenderResult(
+        script=script,
+        changed=changed,
+        renderer=renderer,
+        notes=tuple(notes),
+    )
+
+
 __all__ = [
     # Constants
     "STATE_NAME_FULL",
     # Text utilities
     "clean_cap_text",
+    "expand_tz_token",
+    "fix_sps_preamble",
+    "fmt_local_from_utc_iso",
     "join_oxford",
+    "nws_header_issued_phrase",
     "parse_cap_area_by_state",
+    "sps_preamble",
     # CAP helpers (pre-existing)
     "cap_area_label",
     "cap_expiry_summary_line",
@@ -1415,6 +1747,7 @@ __all__ = [
     # Script builders
     "build_statement_vtec_action_script",
     "build_warning_vtec_action_script",
+    "build_nwws_statement_vtec_action_script",
     # NWWS helpers
     "expiry_summary_script",
     "NwwsProductSegment",
@@ -1425,4 +1758,6 @@ __all__ = [
     "match_nwws_wcn_area_same",
     "build_nwws_watch_vtec_script",
     "build_nwws_watch_partial_cancel_script",
+    "NwwsScriptRenderResult",
+    "render_nwws_product_script",
 ]

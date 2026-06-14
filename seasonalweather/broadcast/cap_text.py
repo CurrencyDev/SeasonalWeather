@@ -10,6 +10,7 @@ from .product_text import (
     build_statement_vtec_action_script as _build_statement_vtec_action_script_fn,
     build_warning_vtec_action_script as _build_warning_vtec_action_script_fn,
     cap_expiry_summary_line as _cap_expiry_summary_line,
+    fmt_local_from_utc_iso as _fmt_local_from_utc_iso,
     cap_full_opening_line as _cap_full_opening_line,
     cap_normalize_nws_headline as _cap_normalize_nws_headline,
     cap_prefers_statement_update_script as _cap_prefers_statement_update_script_fn,
@@ -17,6 +18,8 @@ from .product_text import (
     clean_cap_text as _pt_clean_cap_text,
     join_oxford as _pt_join_oxford,
     parse_cap_area_by_state as _pt_parse_cap_area_by_state,
+    nws_header_issued_phrase as _pt_nws_header_issued_phrase,
+    sps_preamble as _pt_sps_preamble,
 )
 from ..alerts.vtec import VTEC_PARSE_RE as _VTEC_PARSE_RE
 
@@ -38,78 +41,10 @@ class CapTextRenderer:
         self._best_expiry_from_vtec = best_expiry_from_vtec
 
     def _nws_header_issued_phrase(self, text: str) -> str | None:
-        """
-        Extract a nicer spoken timestamp from an NWS header line like:
-          "310 PM EST Sun Jan 11 2026"
-        Returns e.g. "3:10 PM EST Sunday January 11 2026"
-        """
-        if not text:
-            return None
-
-        dow_map = {
-            "SUN": "Sunday",
-            "MON": "Monday",
-            "TUE": "Tuesday",
-            "WED": "Wednesday",
-            "THU": "Thursday",
-            "FRI": "Friday",
-            "SAT": "Saturday",
-        }
-        mon_map = {
-            "JAN": "January",
-            "FEB": "February",
-            "MAR": "March",
-            "APR": "April",
-            "MAY": "May",
-            "JUN": "June",
-            "JUL": "July",
-            "AUG": "August",
-            "SEP": "September",
-            "OCT": "October",
-            "NOV": "November",
-            "DEC": "December",
-        }
-
-        for ln in (text or "").splitlines()[:80]:
-            s = (ln or "").strip()
-            if not s:
-                continue
-            m = _NWS_HEADER_ISSUED_RE.match(s)
-            if not m:
-                continue
-
-            hhmm = m.group("hhmm")
-            ampm = m.group("ampm").upper()
-            tz = _expand_tz_token(m.group("tz").upper())
-            dow = dow_map.get(m.group("dow").strip().upper(), m.group("dow").strip())
-            mon = mon_map.get(m.group("mon").strip().upper(), m.group("mon").strip())
-            day = str(int(m.group("day")))
-            year = m.group("year")
-
-            # hhmm: "310" or "1234"
-            if len(hhmm) == 3:
-                hour = int(hhmm[0])
-                minute = int(hhmm[1:])
-            else:
-                hour = int(hhmm[:2])
-                minute = int(hhmm[2:])
-
-            return f"{hour}:{minute:02d} {ampm} {tz} {dow} {mon} {day} {year}"
-
-        return None
+        return _pt_nws_header_issued_phrase(text)
 
     def _cap_sps_preamble(self, sent_iso: str | None) -> str:
-        """
-        CAP SPS should use the same NWR-style spoken preamble as NWWS SPS.
-        We prefer the CAP sent timestamp and speak it in local station time.
-        """
-        issued = self._fmt_local_from_utc_iso(sent_iso or "")
-        if issued:
-            return (
-                "And now a Special Weather Statement from your National Weather Service, "
-                f"issued at {issued}."
-            )
-        return "And now a Special Weather Statement from your National Weather Service."
+        return _pt_sps_preamble(sent_iso, local_tz=self._tz)
 
     def _clean_cap_text(self, s: str, *, limit: int = 900) -> str:
         """Shim → product_text.clean_cap_text()."""
@@ -358,23 +293,7 @@ class CapTextRenderer:
         return _pt_join_oxford(items)
 
     def _fmt_local_from_utc_iso(self, iso_str: str) -> str:
-        """Parse an ISO-8601 UTC string and return a human-friendly local time phrase."""
-        s = (iso_str or "").strip()
-        if not s:
-            return ""
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        try:
-            utc_dt = dt.datetime.fromisoformat(s)
-            local_dt = utc_dt.astimezone(self._tz)
-            hour12 = local_dt.hour % 12 or 12
-            ampm = "AM" if local_dt.hour < 12 else "PM"
-            tz_name = _expand_tz_token(local_dt.strftime("%Z"))
-            if local_dt.minute == 0:
-                return f"{hour12} {ampm} {tz_name}"
-            return f"{hour12}:{local_dt.minute:02d} {ampm} {tz_name}"
-        except Exception:
-            return ""
+        return _fmt_local_from_utc_iso(iso_str, local_tz=self._tz)
 
     def _cap_prefers_statement_update_script(self, event: str, vtec_actions: set[str]) -> bool:
         """Shim → product_text.cap_prefers_statement_update_script()."""

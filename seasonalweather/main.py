@@ -44,15 +44,7 @@ from .broadcast.conductor import CycleConductor
 from .broadcast.segment_refresher import SegmentRefresher
 from .broadcast.cap_text import CapTextRenderer
 from .broadcast.ipaws_text import build_ipaws_script
-from .broadcast.product_text import (
-    expiry_summary_script as _expiry_summary_script_fn,
-    build_statement_vtec_action_script as _build_statement_vtec_action_script_fn,
-    build_nwws_partial_cancel_script as _build_nwws_partial_cancel_script,
-    build_nwws_terminal_cancel_expiry_script as _build_nwws_terminal_cancel_expiry_script,
-    build_nwws_watch_vtec_script as _build_nwws_watch_vtec_script,
-    build_nwws_watch_partial_cancel_script as _build_nwws_watch_partial_cancel_script,
-    parse_nwws_product_segments as _parse_nwws_product_segments,
-)
+from .broadcast.product_text import render_nwws_product_script
 
 # Active alert tracker (persistent cycle state across restarts)
 from .alerts.active import ActiveAlert, AlertTracker, _vtec_track_id
@@ -149,30 +141,6 @@ from .broadcast.station_feed_runtime import (
 )
 
 
-# We surgically remove the stale time sentence from the Station ID segment,
-# because we will insert a live-updating time WAV right after it.
-_TIME_SENTENCE_RE = re.compile(r"\bThe current time is [^.]+\.\s*", re.IGNORECASE)
-
-
-# NWS header timestamp line (common in SPS/SVS/etc):
-#   "310 PM EST Sun Jan 11 2026"
-_NWS_HEADER_ISSUED_RE = re.compile(
-    r"^(?P<hhmm>\d{3,4})\s*(?P<ampm>AM|PM)\s*(?P<tz>[A-Z]{2,4})\s+"
-    r"(?P<dow>[A-Za-z]{3})\s+(?P<mon>[A-Za-z]{3})\s+(?P<day>\d{1,2})\s+(?P<year>\d{4})\s*$"
-)
-
-# Generic intro sentences we may have at the top of spoken scripts (we replace these for SPS).
-_SPS_INTRO_LEAD_RE = re.compile(
-    r"(?is)^(?:This is a statement from the National Weather Service\.|The National Weather Service has issued the following message\.)\s*"
-)
-
-# Expiration-ish lines that are usually the only thing we actually want to narrate on EXP/CAN updates.
-_EXPIRY_LINE_RE = re.compile(
-    r"\b(has expired|has been allowed to expire|has ended|is no longer in effect)\b",
-    re.IGNORECASE
-)
-
-
 # _VTEC_FIND_RE and _VTEC_PARSE_RE are now imported from .alerts.vtec above.
 
 
@@ -189,41 +157,6 @@ def _safe_event_code(raw: str | None) -> str:
         return "SPS"
     s = "".join(ch for ch in str(raw).upper() if ch.isalnum())
     return s[:3] if len(s) >= 3 else "SPS"
-
-
-def _fmt_time(now: dt.datetime) -> str:
-    # 12-hour like "6:42 PM"
-    return now.strftime("%-I:%M %p")
-
-
-_TZ_NAME_MAP = {
-    "EST": "Eastern Standard Time",
-    "EDT": "Eastern Daylight Time",
-    "CST": "Central Standard Time",
-    "CDT": "Central Daylight Time",
-    "MST": "Mountain Standard Time",
-    "MDT": "Mountain Daylight Time",
-    "PST": "Pacific Standard Time",
-    "PDT": "Pacific Daylight Time",
-    "AKST": "Alaska Standard Time",
-    "AKDT": "Alaska Daylight Time",
-    "HST": "Hawaii Standard Time",
-    "AST": "Atlantic Standard Time",
-    "ADT": "Atlantic Daylight Time",
-    "UTC": "Coordinated Universal Time",
-    "GMT": "Greenwich Mean Time",
-}
-
-
-def _expand_tz_token(token: str) -> str:
-    tok = (token or "").strip()
-    if not tok:
-        return "local"
-    return _TZ_NAME_MAP.get(tok.upper(), tok)
-
-
-def _short_tz(now: dt.datetime) -> str:
-    return _expand_tz_token(now.tzname() or "local")
 
 
 class Orchestrator:
@@ -1018,65 +951,7 @@ class Orchestrator:
         )
 
 
-    # ---- Spoken-script post-processing (NWWS path) ----
-    def _nws_header_issued_phrase(self, text: str) -> str | None:
-        return self.cap_text._nws_header_issued_phrase(text)
-
-    def _fix_sps_preamble(self, script: str, official_text: str) -> str:
-        """
-        SPS should sound like LWX/NWR-style: "And now a Special Weather
-        Statement from your National Weather Service, issued at ..."
-        We also try to include the issued time from the product header.
-        """
-        s = (script or "").strip()
-        if not s:
-            return s
-
-        issued = self._nws_header_issued_phrase(official_text)
-        lead = "And now a Special Weather Statement from your National Weather Service."
-        if issued:
-            lead = (
-                "And now a Special Weather Statement from your National Weather Service, "
-                f"issued at {issued}."
-            )
-
-        s2 = _SPS_INTRO_LEAD_RE.sub(lead + "\n", s, count=1)
-        if s2 == s:
-            s2 = lead + "\n" + s
-
-        # If the next line is literally "Special Weather Statement.", drop it to avoid double-intro.
-        s2 = re.sub(r"(?im)^\s*Special Weather Statement\.\s*", "", s2, count=1)
-        return s2.strip()
-
-    def _cap_sps_preamble(self, sent_iso: str | None) -> str:
-        return self.cap_text._cap_sps_preamble(sent_iso)
-
-    def _expiry_summary_script(self, official_text: str) -> str | None:
-        """Shim → product_text.expiry_summary_script()."""
-        return _expiry_summary_script_fn(official_text)
-
     # ---- NWWS UGC -> SAME targeting helpers ----
-    def _build_nwws_statement_vtec_action_script(
-        self,
-        *,
-        event_text: str,
-        area_text: str,
-        official_text: str,
-        headline: str,
-        vtec_actions: set[str],
-    ) -> str:
-        """Shim → product_text.build_statement_vtec_action_script()."""
-        return _build_statement_vtec_action_script_fn(
-            event=event_text,
-            area_desc=area_text or _sf_nwws_area_from_text(official_text) or "",
-            description=official_text,
-            headline=headline,
-            vtec=[],
-            vtec_actions=vtec_actions,
-            parameters=None,
-            sps_preamble=self._cap_sps_preamble,
-        )
-
     def _state_to_fips2(self, st: str) -> str | None:
         return self.targeting._state_to_fips2(st)
 
@@ -3581,145 +3456,36 @@ class Orchestrator:
             )
 
             try:
-                watch_script = _build_nwws_watch_vtec_script(
-                    official_text,
-                    vtec,
-                    local_tz=self._tz,
+                rendered_script = render_nwws_product_script(
+                    product_type=parsed.product_type,
+                    base_script=spoken.script,
+                    official_text=official_text,
+                    vtec=vtec,
+                    vtec_actions=vtec_actions,
+                    has_tracks=bool(tracks),
+                    should_full=should_full,
+                    event_text=sf_event_label,
                     area_text=sf_area_text,
+                    headline=sf_headline,
+                    local_tz=self._tz,
                 )
-                if watch_script:
-                    spoken.script = watch_script
+                spoken.script = rendered_script.script
+                if rendered_script.changed:
                     log.info(
-                        "NWWS watch script normalized (type=%s awips=%s wfo=%s vtec=%s)",
+                        "NWWS script normalized by %s (act=%s type=%s awips=%s wfo=%s)",
+                        rendered_script.renderer,
+                        ','.join(sorted(vtec_actions))[:64],
                         parsed.product_type,
-                        parsed.awips_id or "",
+                        parsed.awips_id or '',
                         parsed.wfo,
-                        ",".join(vtec[:2]) if vtec else "",
                     )
+                for note in rendered_script.notes:
+                    if note.startswith("warning:"):
+                        log.warning("NWWS script renderer note: %s", note[8:].strip())
+                    else:
+                        log.info("NWWS script renderer note: %s", note)
             except Exception:
-                log.exception("NWWS watch script normalization failed; continuing with original script")
-
-            # --- Less-urgent polish / todos ---
-            # SPS preamble: NWR-ish intro, avoid duplicated boilerplate.
-            try:
-                if (parsed.product_type or '').strip().upper() == 'SPS':
-                    old0 = (spoken.script or '').strip()
-                    spoken.script = self._fix_sps_preamble(spoken.script, official_text)
-                    if (spoken.script or '').strip() != old0:
-                        log.info('NWWS SPS preamble normalized (awips=%s wfo=%s)', parsed.awips_id or '', parsed.wfo)
-            except Exception:
-                log.exception('NWWS SPS preamble normalization failed; continuing with original script')
-
-            # EXP/CAN narration — partial cancel-aware.
-            #
-            # Three cases:
-            #   1. Mixed CAN+CON (partial cancel): parse per-segment and build
-            #      a single voice piece that describes what cancelled AND what
-            #      remains active.  Applies to MWS and similar.
-            #   2. Pure CAN/EXP on warning-class events: use warning-style builder
-            #      (e.g. "The Special Marine Warning has been cancelled for…").
-            #   3. Pure CAN/EXP on advisory/statement/message: use the lighter
-            #      statement-style builder.
-            try:
-                if tracks and not should_full:
-                    if ('EXP' in vtec_actions) or ('CAN' in vtec_actions):
-                        has_continuation = bool(vtec_actions & {"CON", "EXT", "EXA", "EXB"})
-
-                        if has_continuation:
-                            # Partial cancel: some zones cancelled, others active.
-                            # WCN watch products do not have SVS/MWS-style headline
-                            # markers, so keep them on the watch-specific formatter.
-                            if (parsed.product_type or "").strip().upper() == "WCN":
-                                watch_partial_script = _build_nwws_watch_partial_cancel_script(
-                                    official_text,
-                                    vtec,
-                                    local_tz=self._tz,
-                                )
-                                if watch_partial_script:
-                                    spoken.script = watch_partial_script
-                                    log.info(
-                                        'NWWS WCN watch partial cancel script built (act=%s type=%s awips=%s wfo=%s)',
-                                        ','.join(sorted(vtec_actions))[:64],
-                                        parsed.product_type,
-                                        parsed.awips_id or '',
-                                        parsed.wfo,
-                                    )
-                                else:
-                                    log.warning(
-                                        'NWWS WCN watch partial cancel: watch parser empty, preserving prior watch script (act=%s type=%s)',
-                                        ','.join(sorted(vtec_actions))[:64],
-                                        parsed.product_type,
-                                    )
-                            else:
-                                segs = _parse_nwws_product_segments(official_text)
-                                partial_script = _build_nwws_partial_cancel_script(sf_event_label, segs)
-                                if partial_script:
-                                    spoken.script = partial_script
-                                    log.info(
-                                        'NWWS partial cancel script built (act=%s type=%s awips=%s wfo=%s segs=%d)',
-                                        ','.join(sorted(vtec_actions))[:64],
-                                        parsed.product_type,
-                                        parsed.awips_id or '',
-                                        parsed.wfo,
-                                        len(segs),
-                                    )
-                                else:
-                                    log.warning(
-                                        'NWWS partial cancel: segment parse empty, using raw script (act=%s type=%s)',
-                                        ','.join(sorted(vtec_actions))[:64],
-                                        parsed.product_type,
-                                    )
-
-                        elif self._cap_prefers_statement_update_script(sf_event_label, vtec_actions):
-                            # Advisory / statement / message — lighter style.
-                            spoken.script = self._build_nwws_statement_vtec_action_script(
-                                event_text=sf_event_label,
-                                area_text=sf_area_text,
-                                official_text=official_text,
-                                headline=sf_headline,
-                                vtec_actions=vtec_actions,
-                            )
-                            log.info(
-                                'NWWS statement-style EXP/CAN enabled (act=%s type=%s awips=%s wfo=%s)',
-                                ','.join(sorted(vtec_actions))[:64],
-                                parsed.product_type,
-                                parsed.awips_id or '',
-                                parsed.wfo,
-                            )
-                        else:
-                            # Warning-class full cancel/expiry.
-                            # Hydrologic statements often carry scoped cancellation
-                            # prose and public instructions that are too important to
-                            # collapse into a one-sentence "has ended" summary.
-                            detailed_terminal_script = ""
-                            if (parsed.product_type or "").strip().upper() in {"FLS", "FFS", "SVS"}:
-                                detailed_terminal_script = _build_nwws_terminal_cancel_expiry_script(
-                                    sf_event_label,
-                                    official_text,
-                                )
-
-                            if detailed_terminal_script:
-                                spoken.script = detailed_terminal_script
-                                log.info(
-                                    'NWWS detailed terminal CAN/EXP script built (act=%s type=%s awips=%s wfo=%s)',
-                                    ','.join(sorted(vtec_actions))[:64],
-                                    parsed.product_type,
-                                    parsed.awips_id or '',
-                                    parsed.wfo,
-                                )
-                            else:
-                                summ = self._expiry_summary_script(official_text)
-                                if summ:
-                                    spoken.script = summ
-                                    log.info(
-                                        'NWWS EXP/CAN summary enabled (act=%s type=%s awips=%s wfo=%s)',
-                                        ','.join(sorted(vtec_actions))[:64],
-                                        parsed.product_type,
-                                        parsed.awips_id or '',
-                                        parsed.wfo,
-                                    )
-            except Exception:
-                log.exception('NWWS EXP/CAN summary failed; continuing with original script')
+                log.exception("NWWS script normalization failed; continuing with original script")
 
             if should_full:
                 # If we have in-area SAME targets, use them. Otherwise, AIR WITHOUT SAME (no 67 fallback).

@@ -450,3 +450,39 @@ def test_partial_can_con_klwx_preserves_nws_headlines_and_locations():
     assert "The Severe Thunderstorm Warning remains in effect until 445 PM EDT for the following areas" not in script
     assert "Locations impacted include: Leesburg, Broadlands" in script
     assert "For your protection move to an interior room" in script
+
+
+def test_nwws_render_facade_normalizes_sps_preamble():
+    from seasonalweather.broadcast.product_text import render_nwws_product_script
+
+    official = """WWUS81 KLWX 141930
+SPSLWX
+
+Special Weather Statement
+National Weather Service Baltimore MD/Washington DC
+330 PM EDT Sun Jun 14 2026
+
+MDC031-142000-
+
+A strong thunderstorm will impact Montgomery County.
+"""
+
+    rendered = render_nwws_product_script(
+        product_type="SPS",
+        base_script="This is a statement from the National Weather Service. Special Weather Statement. A strong thunderstorm will impact Montgomery County.",
+        official_text=official,
+        vtec=[],
+        vtec_actions=set(),
+        has_tracks=False,
+        should_full=False,
+        event_text="Special Weather Statement",
+        area_text="Montgomery, MD",
+        headline="",
+    )
+
+    assert rendered.changed is True
+    assert rendered.renderer == "nwws-sps-preamble"
+    assert rendered.script.startswith(
+        "And now a Special Weather Statement from your National Weather Service, issued at 3:30 PM Eastern Daylight Time Sunday June 14 2026."
+    )
+    assert "Special Weather Statement. A strong" not in rendered.script

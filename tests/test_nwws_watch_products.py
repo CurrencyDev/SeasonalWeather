@@ -323,3 +323,52 @@ def test_wcn_mixed_exp_con_uses_lifecycle_county_wording_and_midnight_tonight():
     assert "Severe Thunderstorm Watch Number 317 remains in effect until midnight tonight for the following counties: in Maryland: Cecil, Calvert, Charles, and St. Marys; in Virginia: King George and Stafford." in script
     assert "has been allowed to expire for the following areas.\n\nThis watch includes" not in script
     assert "Remember, a severe thunderstorm watch means" in script
+
+
+def test_nwws_render_facade_normalizes_wcn_watch_script():
+    from seasonalweather.broadcast.product_text import render_nwws_product_script
+
+    rendered = render_nwws_product_script(
+        product_type="WCN",
+        base_script="WATCH COUNTY NOTIFICATION raw fallback.",
+        official_text=WCN_SVA_NEW,
+        vtec=["/O.NEW.KLWX.SV.A.0234.260520T1639Z-260521T0000Z/"],
+        vtec_actions={"NEW"},
+        has_tracks=True,
+        should_full=False,
+        event_text="Severe Thunderstorm Watch",
+        area_text="",
+        headline="",
+        local_tz=ZoneInfo("America/New_York"),
+    )
+
+    assert rendered.changed is True
+    assert rendered.renderer == "nwws-watch-vtec"
+    assert "Severe Thunderstorm Watch Number 234" in rendered.script
+    assert "WATCH COUNTY NOTIFICATION raw fallback" not in rendered.script
+
+
+def test_nwws_render_facade_normalizes_wcn_partial_cancel_script():
+    from seasonalweather.broadcast.product_text import render_nwws_product_script
+
+    rendered = render_nwws_product_script(
+        product_type="WCN",
+        base_script="raw partial cancel fallback.",
+        official_text=WCN_SVA_MIXED_CAN_CON,
+        vtec=[
+            "/O.CAN.KLWX.SV.A.0234.000000T0000Z-260521T0000Z/",
+            "/O.CON.KLWX.SV.A.0234.000000T0000Z-260521T0000Z/",
+        ],
+        vtec_actions={"CAN", "CON"},
+        has_tracks=True,
+        should_full=False,
+        event_text="Severe Thunderstorm Watch",
+        area_text="",
+        headline="",
+        local_tz=ZoneInfo("America/New_York"),
+    )
+
+    assert rendered.changed is True
+    assert rendered.renderer == "nwws-watch-partial-cancel"
+    assert "Severe Thunderstorm Watch Number 234 has been cancelled" in rendered.script
+    assert "raw partial cancel fallback" not in rendered.script
