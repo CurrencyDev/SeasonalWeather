@@ -782,19 +782,6 @@ class Orchestrator:
             return None
         return max(ends)
 
-    # ---- RWT/RMT control API compatibility ----
-    async def _local_test_presentation(self, code: str, same_codes: list[str] | None = None) -> tuple[str, str, str]:
-        return await self.tests_runtime.local_test_presentation(code, same_codes)
-
-    def _test_same_codes_for_presentation(self) -> list[str]:
-        return self.tests_runtime.same_codes_for_presentation()
-
-    def _tests_gate(self, event_code: str = "") -> tuple[bool, str]:
-        return self.tests_runtime.gate(event_code)
-
-    async def _originate_required_test(self, event_code: str) -> None:
-        await self.tests_runtime.originate_required_test(event_code)
-
     async def run(self) -> None:
         await self.service_runtime.run()
 
@@ -1013,90 +1000,6 @@ class Orchestrator:
             log.exception("AlertTracker: failed removing IPAWS state reason=%s", reason)
             return 0
 
-    def _manual_full_eas_should_heighten(self) -> bool:
-        return self.manual_runtime.manual_full_eas_should_heighten()
-
-
-    async def _push_manual_originated_audio(
-        self,
-        *,
-        wav_path: Path,
-        headline: str,
-        event_code: str,
-        voice_mode: str,
-        sender: str | None = None,
-        actor: str | None = None,
-        interrupt_policy: str = "interrupt_then_refill",
-        same_locations: list[str] | None = None,
-        expires_in_minutes: int | None = None,
-        heightened_override: bool | None = None,
-    ) -> dict[str, object]:
-        return await self.manual_runtime.push_manual_originated_audio(
-            wav_path=wav_path,
-            headline=headline,
-            event_code=event_code,
-            voice_mode=voice_mode,
-            sender=sender,
-            actor=actor,
-            interrupt_policy=interrupt_policy,
-            same_locations=same_locations,
-            expires_in_minutes=expires_in_minutes,
-            heightened_override=heightened_override,
-        )
-
-    async def originate_manual_text(
-        self,
-        *,
-        event_code: str,
-        headline: str,
-        script_text: str,
-        voice_mode: str = "voice_only",
-        same_locations: list[str] | None = None,
-        sender: str | None = None,
-        actor: str | None = None,
-        interrupt_policy: str = "interrupt_then_refill",
-        expires_in_minutes: int | None = None,
-        heightened_override: bool | None = None,
-    ) -> dict[str, object]:
-        return await self.manual_runtime.originate_text(
-            event_code=event_code,
-            headline=headline,
-            script_text=script_text,
-            voice_mode=voice_mode,
-            same_locations=same_locations,
-            sender=sender,
-            actor=actor,
-            interrupt_policy=interrupt_policy,
-            expires_in_minutes=expires_in_minutes,
-            heightened_override=heightened_override,
-        )
-
-    async def originate_manual_audio(
-        self,
-        *,
-        event_code: str,
-        headline: str,
-        wav_path: str | Path,
-        voice_mode: str = "voice_only",
-        same_locations: list[str] | None = None,
-        sender: str | None = None,
-        actor: str | None = None,
-        interrupt_policy: str = "interrupt_then_refill",
-        expires_in_minutes: int | None = None,
-        heightened_override: bool | None = None,
-    ) -> dict[str, object]:
-        return await self.manual_runtime.originate_audio(
-            event_code=event_code,
-            headline=headline,
-            wav_path=wav_path,
-            voice_mode=voice_mode,
-            same_locations=same_locations,
-            sender=sender,
-            actor=actor,
-            interrupt_policy=interrupt_policy,
-            expires_in_minutes=expires_in_minutes,
-            heightened_override=heightened_override,
-        )
 
 
 def main(argv: list[str] | None = None) -> int:

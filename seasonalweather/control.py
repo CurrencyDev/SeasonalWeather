@@ -477,10 +477,10 @@ class OrchestratorControl:
 
     async def originate_test(self, *, event_code: str, actor: str) -> dict[str, Any]:
         self._ensure_backend_ready()
-        allowed, why = self.orch._tests_gate()
+        allowed, why = self.orch.tests_runtime.gate()
         if not allowed:
             raise ConflictError("test_gate_blocked", "Required test origination is currently blocked.", details={"reason": why})
-        await self.orch._originate_required_test(event_code)
+        await self.orch.tests_runtime.originate_required_test(event_code)
         # _API_ORIGINATE_TEST_DL_
         try:
             self.orch.discord.api_action(
@@ -646,7 +646,7 @@ class OrchestratorControl:
             same_codes = self._same_codes_in_service_area(same_codes)
 
         try:
-            _ot_result = await self.orch.originate_manual_text(
+            _ot_result = await self.orch.manual_runtime.originate_text(
                 event_code=req.event_code,
                 headline=req.headline,
                 script_text=req.text,
@@ -705,7 +705,7 @@ class OrchestratorControl:
         shutil.copy2(source_wav, out_path)
 
         try:
-            result = await self.orch.originate_manual_audio(
+            result = await self.orch.manual_runtime.originate_audio(
                 event_code=req.event_code,
                 headline=req.headline,
                 wav_path=out_path,
