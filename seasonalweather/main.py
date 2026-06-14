@@ -43,6 +43,7 @@ from .broadcast.ipaws_runtime import IpawsRuntime
 from .broadcast.cap_runtime import CapRuntime
 from .broadcast.nwws_runtime import NwwsRuntime
 from .broadcast.pns_runtime import PnsRuntime
+from .broadcast.tests_runtime import RequiredTestRuntime
 
 # Active alert tracker (persistent cycle state across restarts)
 from .alerts.active import AlertTracker, _vtec_track_id
@@ -65,13 +66,8 @@ from .alerts.vtec import (
     VTEC_FIND_RE as _VTEC_FIND_RE,
     VTEC_PARSE_RE as _VTEC_PARSE_RE,
 )
-from .same.events import label_or_code as _same_label_or_code
 from .same.targeting import SameTargetResolver
 from .same.locations import normalize_same_allow_set as _normalize_same_allow_set
-
-# RWT/RMT scheduler
-from .broadcast.rwt_rmt import RwtRmtSchedule, RwtRmtScheduler
-from .broadcast.tests import default_test_script_lines, format_test_presentation_template
 
 # Optional CAP (api.weather.gov/alerts/active)
 try:
@@ -106,7 +102,6 @@ from .broadcast.station_feed_runtime import (
     seed_from_alert_tracker as _station_feed_seed_from_alert_tracker,
     remove_ern_relays_matching as _sf_remove_ern_relays_matching,
     note_manual as _station_feed_note_manual,
-    note_required_test as _station_feed_note_required_test,
 )
 
 
@@ -263,6 +258,7 @@ class Orchestrator:
         self.cap_runtime = CapRuntime(self)
         self.pns_runtime = PnsRuntime(self)
         self.nwws_runtime = NwwsRuntime(self)
+        self.tests_runtime = RequiredTestRuntime(self)
 
 
         # SegmentStore: persistent per-segment audio cache.
@@ -974,136 +970,16 @@ class Orchestrator:
         return self.cfg.tests.ern_block_seconds
 
     async def _local_test_presentation(self, code: str, same_codes: list[str] | None = None) -> tuple[str, str, str]:
-        event_text = _same_label_or_code(code)
-        station_name = str(self.cfg.station.name or "SeasonalWeather").strip() or "SeasonalWeather"
-        service_area_name = str(self.cfg.station.service_area_name or "service area").strip() or "service area"
-        codes = [str(x).strip() for x in (same_codes or []) if str(x).strip()]
-
-        auto_area_text = ""
-        if codes:
-            try:
-                auto_area_text = await self._sf_area_text_from_same_codes(codes)
-            except Exception:
-                auto_area_text = ""
-        auto_area_text = auto_area_text or service_area_name
-
-        pres = self.cfg.tests.presentation
-        fmt_ctx = {
-            "code": str(code or "").strip().upper(),
-            "event": event_text,
-            "station_name": station_name,
-            "service_area_name": service_area_name,
-            "auto_area_text": auto_area_text,
-        }
-        headline = format_test_presentation_template(
-            pres.headline_template,
-            **fmt_ctx,
-        ) or f"{event_text} for the {service_area_name}"
-        area_text = format_test_presentation_template(
-            pres.area_text,
-            **fmt_ctx,
-        ) or auto_area_text
-        discord_area_text = format_test_presentation_template(
-            pres.discord_area_text,
-            **{**fmt_ctx, "area_text": area_text},
-        ) or area_text
-        return headline, area_text, discord_area_text
+        return await self.tests_runtime.local_test_presentation(code, same_codes)
 
     def _test_same_codes_for_presentation(self) -> list[str]:
-        try:
-            codes = sorted(getattr(self, "_same_fips_allow_set", None) or [])
-        except Exception:
-            codes = []
-        return [str(x).strip() for x in codes if str(x).strip()]
+        return self.tests_runtime.same_codes_for_presentation()
 
     def _tests_gate(self, event_code: str = "") -> tuple[bool, str]:
-        now = dt.datetime.now(tz=self._tz)
-        code = str(event_code or "").strip().upper()
-        test_cfg = self.cfg.tests.rwt if code == "RWT" else self.cfg.tests.rmt
-        gate = test_cfg.gate
-
-        if gate.block_heightened and self.heightened_until and now < self.heightened_until:
-            return (False, "heightened mode active")
-        if gate.block_recent_toneout and self.last_toneout_at:
-            if (now - self.last_toneout_at).total_seconds() < self._tests_toneout_cooldown_seconds():
-                return (False, "recent tone-out cooldown")
-
-        if gate.block_recent_severe_cap and self.cap_last_severe_at:
-            if (now - self.cap_last_severe_at).total_seconds() < self._tests_cap_block_seconds():
-                return (False, "recent severe CAP match")
-
-        if gate.block_recent_ern and self.ern_last_tone_at:
-            if (now - self.ern_last_tone_at).total_seconds() < self._tests_ern_block_seconds():
-                return (False, "recent ERN SAME activity")
-
-        return (True, "ok")
+        return self.tests_runtime.gate(event_code)
 
     async def _originate_required_test(self, event_code: str) -> None:
-        """
-        Originates a local RWT/RMT using the existing SAME+audio pipeline.
-        Does NOT trigger heightened mode.
-        """
-        code = (event_code or "").strip().upper()
-        if code not in {"RWT", "RMT"}:
-            return
-
-        # Script: use config override when provided, else fall back to built-in default.
-        _cfg_lines: tuple[str, ...] = (
-            self.cfg.tests.rwt.script_lines if code == "RWT" else self.cfg.tests.rmt.script_lines
-        )
-        if _cfg_lines:
-            lines = list(_cfg_lines)
-        else:
-            lines = default_test_script_lines(code)
-
-        spoken = "\n".join(lines).strip()
-
-        dummy = SimpleNamespace(product_type=code, awips_id=None, wfo="KLWX", raw_text="")
-        out_wav = await self.audio_originator.render_alert_audio(dummy, spoken)
-
-        async with self._cycle_lock:
-            try:
-                self.telnet.flush_cycle()
-            except Exception:
-                pass
-            tkey = "rwt" if code == "RWT" else "rmt"
-            title = self._np_alert_title(tkey, event="")
-            meta = self._np_meta(title=title, kind="test", extra={"sw_alert_source": "local", "sw_event_code": code})
-            self.telnet.push_alert(str(out_wav), meta=meta)
-
-        # --- Station feed note (radio UI/API handled-alerts feed) ---
-        local_test_same_codes = self._test_same_codes_for_presentation()
-        test_headline = f"Required {'Weekly' if code == 'RWT' else 'Monthly'} Test"
-        test_area_text = str(self.cfg.station.service_area_name or "SeasonalWeather").strip() or "SeasonalWeather"
-        discord_test_area_text = test_area_text
-        try:
-            test_headline, test_area_text, discord_test_area_text = await self._local_test_presentation(
-                code,
-                local_test_same_codes,
-            )
-        except Exception:
-            pass
-
-        _station_feed_note_required_test(
-            code=code,
-            headline=test_headline,
-            area_text=test_area_text,
-            same_codes=local_test_same_codes,
-            out_wav=str(out_wav),
-        )
-
-        self._schedule_cycle_refill("post-test")
-        log.info("Originated %s test (audio=%s)", code, out_wav)
-        # _TEST_DL_v3_
-        self.discord.alert_aired(
-            code=code,
-            event=f"Required {'Weekly' if code == 'RWT' else 'Monthly'} Test",
-            source="SeasonalWeather (local)",
-            mode="full",
-            area=discord_test_area_text,
-            same_codes=local_test_same_codes,
-            is_test=True,
-        )
+        await self.tests_runtime.originate_required_test(event_code)
 
     async def run(self) -> None:
         work, audio, cache, logs = self._paths()
@@ -1283,56 +1159,7 @@ class Orchestrator:
         else:
             log.info("ERN monitor disabled (set ern.enabled: true in config.yaml to enable)")
 
-        if self._tests_enabled():
-            try:
-                state_path = str(Path(self.cfg.paths.work_dir) / "rwt_rmt_state.json")
-
-                sched = RwtRmtSchedule(
-                    enabled=True,
-                    tz_name=self.cfg.station.timezone,
-
-                    rwt_enabled=True,
-                    rwt_weekday=self.cfg.tests.rwt.weekday,
-                    rwt_hour=self.cfg.tests.rwt.hour,
-                    rwt_minute=self.cfg.tests.rwt.minute,
-
-                    rmt_enabled=True,
-                    rmt_nth=self.cfg.tests.rmt.nth,
-                    rmt_weekday=self.cfg.tests.rmt.weekday,
-                    rmt_hour=self.cfg.tests.rmt.hour,
-                    rmt_minute=self.cfg.tests.rmt.minute,
-
-                    jitter_seconds=self._tests_jitter_seconds(),
-                    postpone_minutes=self._tests_postpone_minutes(),
-                    max_postpone_hours=self._tests_max_postpone_hours(),
-                    state_path=state_path,
-                    state_key="rwt_rmt",
-                    rwt_postpone_policy=self.cfg.tests.rwt.postpone_policy,
-                    rwt_postpone_minutes=self.cfg.tests.rwt.postpone_minutes,
-                    rwt_max_postpone_hours=self.cfg.tests.rwt.max_postpone_hours,
-                    rwt_max_postpone_days=self.cfg.tests.rwt.max_postpone_days,
-                    rmt_postpone_policy=self.cfg.tests.rmt.postpone_policy,
-                    rmt_postpone_minutes=self.cfg.tests.rmt.postpone_minutes,
-                    rmt_max_postpone_hours=self.cfg.tests.rmt.max_postpone_hours,
-                    rmt_max_postpone_days=self.cfg.tests.rmt.max_postpone_days,
-                )
-
-                def _rlog(s: str) -> None:
-                    log.info("%s", s)
-
-                rsch = RwtRmtScheduler(
-                    schedule=sched,
-                    gate_fn=self._tests_gate,
-                    fire_fn=self._originate_required_test,
-                    log_fn=_rlog,
-                    database=self.database,
-                )
-                tasks.append(asyncio.create_task(rsch.run_forever(), name="rwt_rmt_scheduler"))
-                log.info("RWT/RMT scheduler enabled (state=%s)", state_path)
-            except Exception:
-                log.exception("Failed to start RWT/RMT scheduler")
-        else:
-            log.info("RWT/RMT scheduler disabled (set tests.enabled: true in config.yaml to enable)")
+        self.tests_runtime.start_scheduler(tasks)
 
         if self.db_housekeeper is not None:
             tasks.append(asyncio.create_task(self.db_housekeeper.run_forever(), name="database_housekeeping"))
