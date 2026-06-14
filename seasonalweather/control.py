@@ -111,9 +111,6 @@ class OrchestratorControl:
         except Exception:
             return None
 
-    def _station_feed_path(self) -> Path:
-        return Path(self.orch.cfg.station_feed.path)
-
     def _empty_station_feed_payload(self) -> dict[str, Any]:
         return {
             "stationId": self.orch.cfg.station_feed.station_id,
@@ -350,25 +347,12 @@ class OrchestratorControl:
                         "Station feed SQLite read model could not be loaded.",
                     ) from exc
 
-        path = self._station_feed_path()
-        if not path.exists():
-            if missing_ok:
-                return self._empty_station_feed_payload()
-            raise NotFoundError(
-                "station_feed_missing",
-                "Station feed JSON was not found.",
-                details={"path": str(path)},
-            )
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            if missing_ok:
-                return self._empty_station_feed_payload()
-            raise ControlError(
-                "station_feed_invalid_json",
-                "Station feed JSON exists but could not be parsed.",
-                details={"path": str(path)},
-            ) from exc
+        if missing_ok:
+            return self._empty_station_feed_payload()
+        raise ControlError(
+            "station_feed_database_unavailable",
+            "Station feed SQLite read model is unavailable.",
+        )
 
     async def get_public_handled_alerts(self) -> dict[str, Any]:
         return await self.get_station_feed(missing_ok=True)

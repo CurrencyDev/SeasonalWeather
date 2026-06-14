@@ -1,5 +1,4 @@
 from __future__ import annotations
-import json
 
 # =========================================================================================
 #      MP"""""`MM                                                       dP              MM'"""'YMM
@@ -17,14 +16,9 @@ import asyncio
 import datetime as dt
 import hashlib
 import logging
-import math
-import os
-import shutil
 import time
 
 import re
-import sys
-import uuid
 import wave
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,36 +34,23 @@ _APP_CFG: "AppConfig | None" = None
 from .alerts.nws_api import NWSApi
 from .nwws.client import NWWSClient
 from .alerts.product import parse_product_text, ParsedProduct
-from .alerts.builder import build_spoken_alert, strip_nws_product_headers
+from .alerts.builder import build_spoken_alert
 from .tts.tts import TTS
-from .tts.audio import write_sine_wav, write_silence_wav, concat_wavs, wav_duration_seconds
+from .tts.audio import write_sine_wav, write_silence_wav, concat_wavs
 from .liquidsoap_telnet import LiquidsoapTelnet
-from .broadcast.cycle import CycleBuilder, CycleContext, CycleSegment
+from .broadcast.cycle import CycleBuilder, CycleContext
 from .broadcast.segment_store import SegmentStore
 from .broadcast.conductor import CycleConductor
 from .broadcast.segment_refresher import SegmentRefresher
+from .broadcast.cap_text import CapTextRenderer
+from .broadcast.ipaws_text import build_ipaws_script
 from .broadcast.product_text import (
-    # pre-existing helpers
-    cap_full_opening_line as _cap_full_opening_line,
-    cap_normalize_nws_headline as _cap_normalize_nws_headline,
-    cap_statement_area_noun as _cap_statement_area_noun,
-    cap_statement_intro as _cap_statement_intro,
-    # newly moved / newly added
-    STATE_NAME_FULL as _STATE_NAME_FULL_MAP,
-    cap_expiry_summary_line as _cap_expiry_summary_line,
-    cap_prefers_statement_update_script as _cap_prefers_statement_update_script_fn,
-    clean_cap_text as _pt_clean_cap_text,
     expiry_summary_script as _expiry_summary_script_fn,
-    join_oxford as _pt_join_oxford,
-    parse_cap_area_by_state as _pt_parse_cap_area_by_state,
     build_statement_vtec_action_script as _build_statement_vtec_action_script_fn,
-    build_warning_vtec_action_script as _build_warning_vtec_action_script_fn,
     build_nwws_partial_cancel_script as _build_nwws_partial_cancel_script,
     build_nwws_terminal_cancel_expiry_script as _build_nwws_terminal_cancel_expiry_script,
     build_nwws_watch_vtec_script as _build_nwws_watch_vtec_script,
     build_nwws_watch_partial_cancel_script as _build_nwws_watch_partial_cancel_script,
-    extract_nwws_wcn_area_desc as _extract_nwws_wcn_area_desc,
-    match_nwws_wcn_area_same as _match_nwws_wcn_area_same,
     parse_nwws_product_segments as _parse_nwws_product_segments,
 )
 
@@ -93,20 +74,12 @@ from .broadcast.ern_script import (
 from .alerts.vtec import (
     toneout_policy as _vtec_toneout_policy,
     same_codes_for_vtec as _vtec_same_codes_for_vtec,
-    phen_sig_label as _vtec_phen_sig_label,
     VTEC_FIND_RE as _VTEC_FIND_RE,
     VTEC_PARSE_RE as _VTEC_PARSE_RE,
 )
-from .same.events import (
-    label_or_code as _same_label_or_code,
-    label_for as _same_label_for,
-    org_broadcast_prefix as _eas_org_broadcast_prefix,
-)
-from .same import ugc as _ugc
-from .same.locations import (
-    filter_same_locations_to_service_area as _same_filter_locations_to_service_area,
-    normalize_same_allow_set as _normalize_same_allow_set,
-)
+from .same.events import label_or_code as _same_label_or_code
+from .same.targeting import SameTargetResolver
+from .same.locations import normalize_same_allow_set as _normalize_same_allow_set
 
 # RWT/RMT scheduler
 from .broadcast.rwt_rmt import RwtRmtSchedule, RwtRmtScheduler
@@ -136,15 +109,6 @@ except Exception:  # pragma: no cover
     IpawsCapEvent = None  # type: ignore
 
 
-# Optional Station Alert Feed (handled alerts API read model + legacy JSON mirror)
-try:
-    from .broadcast.station_feed import FeedSender, StationFeedAlert, atomic_write_json, build_station_feed_payload
-except Exception:
-    FeedSender = None  # type: ignore
-    StationFeedAlert = None  # type: ignore
-    atomic_write_json = None  # type: ignore
-    build_station_feed_payload = None  # type: ignore
-
 # Optional ERN/GWES SAME monitor (Level 3 source)
 try:
     from .broadcast.ern_gwes import ErnGwesMonitor, ErnSameEvent
@@ -156,1400 +120,33 @@ except Exception:  # pragma: no cover
 
 log = logging.getLogger("seasonalweather")
 
-# --- Station Alert Feed (handled alerts API read model + legacy JSON mirror) ---
-# SQLite is the preferred backing store for /v1/handled-alerts. The legacy
-# handled-alerts.json file remains a compatibility mirror for older consumers.
-
-_STATION_FEED_STATE = {}  # id -> (StationFeedAlert, expires_ts)
-_STATION_FEED_LAST_WRITE_TS = 0.0
-_STATION_FEED_REPO: StationFeedRepository | None = None
-
-
-def _sf_now_iso() -> str:
-    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
-
-
-def _sf_parse_dt(value):
-    if value is None:
-        return None
-    if isinstance(value, dt.datetime):
-        return value
-    if isinstance(value, str):
-        s = value.strip()
-        if not s:
-            return None
-        try:
-            if s.endswith("Z"):
-                s = s[:-1] + "+00:00"
-            return dt.datetime.fromisoformat(s)
-        except Exception:
-            return None
-    return None
-
-
-def _sf_iso(value):
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value
-    if hasattr(value, "isoformat"):
-        try:
-            return value.isoformat()
-        except Exception:
-            return str(value)
-    return str(value)
-
-
-def _sf_sha1_12(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8", "ignore")).hexdigest()[:12]
-
-
-def _sf_enabled() -> bool:
-    if StationFeedAlert is None or atomic_write_json is None or build_station_feed_payload is None:
-        return False
-    if _APP_CFG is None:
-        return False
-    return _APP_CFG.station_feed.enabled
-
-
-def _sf_cfg():
-    if _APP_CFG is None:
-        return "seasonalweather", "/srv/seasonalweather/api/station/handled-alerts.json", "seasonalweather", 24, 7200, 0.5
-    sf = _APP_CFG.station_feed
-    return sf.station_id, sf.path, sf.source, sf.max_items, sf.ttl_seconds, sf.min_write_seconds
-
-
-def _sf_set_repository(repo: StationFeedRepository | None) -> None:
-    global _STATION_FEED_REPO
-    _STATION_FEED_REPO = repo
-
-
-def _sf_alert_payload(alert):
-    station_id, _path, source, _max_items, _ttl_s, _min_write_s = _sf_cfg()
-    payload = build_station_feed_payload(
-        station_id=station_id,
-        source=source,
-        generated_at_iso=_sf_now_iso(),
-        alerts=[alert],
-    )
-    alerts = payload.get("alerts") if isinstance(payload, dict) else None
-    if isinstance(alerts, list) and alerts and isinstance(alerts[0], dict):
-        return alerts[0]
-    return {}
-
-
-def _sf_repo_upsert(alert, *, expires_at=None) -> None:
-    if _STATION_FEED_REPO is None:
-        return
-    try:
-        payload = _sf_alert_payload(alert)
-        if payload:
-            _STATION_FEED_REPO.upsert_alert(
-                alert_id=str(getattr(alert, "id", "") or ""),
-                payload=payload,
-                expires_at=expires_at or payload.get("expires") or payload.get("ends"),
-            )
-    except Exception:
-        log.exception("Station feed: failed to persist alert to SQLite read model")
-
-
-def _sf_repo_delete(ids) -> None:
-    if _STATION_FEED_REPO is None:
-        return
-    try:
-        _STATION_FEED_REPO.delete_alerts(str(x) for x in (ids or []))
-    except Exception:
-        log.exception("Station feed: failed to delete alerts from SQLite read model")
-
-
-def _sf_repo_housekeep(now_ts: float, *, max_items: int) -> int:
-    if _STATION_FEED_REPO is None:
-        return 0
-    try:
-        now = dt.datetime.fromtimestamp(float(now_ts), tz=dt.timezone.utc)
-        removed = _STATION_FEED_REPO.prune_expired(now=now, grace_seconds=_sf_hk_grace_s())
-        removed += _STATION_FEED_REPO.trim_to_max(max_items)
-        return removed
-    except Exception:
-        log.exception("Station feed housekeeping: SQLite read model prune failed")
-        return 0
-
-
-def _sf_prune(now_ts: float, *, max_items: int) -> list[str]:
-    removed: list[str] = []
-    expired = [k for k, (_, exp) in _STATION_FEED_STATE.items() if exp <= now_ts]
-    for k in expired:
-        if _STATION_FEED_STATE.pop(k, None) is not None:
-            removed.append(str(k))
-    if len(_STATION_FEED_STATE) > max_items:
-        items = sorted(_STATION_FEED_STATE.items(), key=lambda kv: kv[1][1], reverse=True)
-        keep_keys = {str(k) for k, _v in items[:max_items]}
-        for k in list(_STATION_FEED_STATE.keys()):
-            if str(k) not in keep_keys:
-                _STATION_FEED_STATE.pop(k, None)
-                removed.append(str(k))
-    if removed:
-        _sf_repo_delete(removed)
-    return removed
-
-
-def _sf_write(now_ts: float) -> None:
-    global _STATION_FEED_LAST_WRITE_TS
-    station_id, path, source, max_items, ttl_s, min_write_s = _sf_cfg()
-    if now_ts - _STATION_FEED_LAST_WRITE_TS < min_write_s:
-        return
-    _sf_prune(now_ts, max_items=max_items)
-    alerts = [a for (a, _) in _STATION_FEED_STATE.values()]
-    payload = build_station_feed_payload(
-        station_id=station_id,
-        source=source,
-        generated_at_iso=_sf_now_iso(),
-        alerts=alerts,
-    )
-    atomic_write_json(path, payload)
-    _STATION_FEED_LAST_WRITE_TS = now_ts
-
-
-def _sf_try_write(now_ts: float, *, context: str) -> None:
-    try:
-        _sf_write(now_ts)
-    except PermissionError as exc:
-        _station_id, path, _source, _max_items, _ttl_s, _min_write_s = _sf_cfg()
-        log.warning(
-            "Station feed: legacy handled-alerts JSON mirror not writable during %s (path=%s); SQLite read model remains authoritative: %s",
-            context,
-            path,
-            exc,
-        )
-    except Exception:
-        log.exception("Station feed: failed to write legacy handled-alerts JSON mirror during %s", context)
-
-
-def _sf_emit(alert, *, expires_at=None) -> None:
-    if not _sf_enabled():
-        return
-    try:
-        _station_id, _path, _source, max_items, ttl_s, _min_write_s = _sf_cfg()
-        _sf_station_feed_hk_start()
-        now_ts = time.time()
-        exp_dt = _sf_parse_dt(expires_at)
-        exp_ts = exp_dt.timestamp() if exp_dt else (now_ts + ttl_s)
-        _STATION_FEED_STATE[alert.id] = (alert, exp_ts)
-        _sf_repo_upsert(alert, expires_at=exp_dt or expires_at or dt.datetime.fromtimestamp(exp_ts, tz=dt.timezone.utc))
-        _sf_try_write(now_ts, context="update")
-    except Exception:
-        log.exception("Station feed: failed to update handled-alerts feed")
-
-
-def _sf_remove_ids(ids) -> int:
-    if not _sf_enabled():
-        return 0
-    removed = 0
-    try:
-        now_ts = time.time()
-        requested_ids = []
-        for raw in ids or []:
-            sid = str(raw or "").strip()
-            if not sid:
-                continue
-            requested_ids.append(sid)
-            if _STATION_FEED_STATE.pop(sid, None) is not None:
-                removed += 1
-        if requested_ids:
-            _sf_repo_delete(requested_ids)
-        if removed:
-            _sf_try_write(now_ts, context="remove")
-    except Exception:
-        log.exception("Station feed: failed removing ids=%s", ids)
-    return removed
-
-
-def _sf_remove_by_vtec_tracks(tracks) -> int:
-    track_ids = {(t[0] if isinstance(t, tuple) else t) for t in (tracks or []) if (t[0] if isinstance(t, tuple) else t)}
-    return _sf_remove_ids(track_ids)
-
-
-def _sf_remove_ern_relays_matching(code: str | None, same_locs) -> int:
-    """Remove ERN relay feed entries shadowed by authoritative alert state."""
-    if not _sf_enabled():
-        return 0
-    code_u = (code or "").strip().upper()
-    wanted_locs = {str(x).strip() for x in (same_locs or []) if str(x).strip()}
-    if not code_u or not wanted_locs:
-        return 0
-    wanted_event = _same_label_or_code(code_u)
-    remove_ids: list[str] = []
-    try:
-        for sid, item in list(_STATION_FEED_STATE.items()):
-            alert = item[0]
-            links = getattr(alert, "links", None) or {}
-            sender = getattr(alert, "from_", None)
-            sender_kind = getattr(sender, "kind", "") if sender is not None else ""
-            is_ern = str(links.get("via", "")).upper() == "ERN/GWES" or str(sender_kind).lower() == "relay"
-            if not is_ern:
-                continue
-            event_text = str(getattr(alert, "event", "") or "").strip()
-            if event_text and event_text.upper() not in {code_u, wanted_event.upper()}:
-                continue
-            alert_locs = {str(x).strip() for x in (getattr(alert, "sameCodes", None) or []) if str(x).strip()}
-            if alert_locs and alert_locs.issubset(wanted_locs):
-                remove_ids.append(str(sid))
-    except Exception:
-        log.exception("Station feed: failed scanning ERN relay entries for code=%s", code_u)
-        return 0
-    return _sf_remove_ids(remove_ids)
-
-
-def _sf_cap_reference_ids(ev) -> list[str]:
-    refs = getattr(ev, "references", None)
-    if not isinstance(refs, (list, tuple)):
-        return []
-    out: list[str] = []
-    seen: set[str] = set()
-    for raw in refs:
-        s = str(raw or "").strip()
-        if not s or s in seen:
-            continue
-        seen.add(s)
-        out.append(s)
-    return out
-
-
-def _sf_vtec_track_ids(vtec_list) -> list[str]:
-    out: list[str] = []
-    seen: set[str] = set()
-    for raw in (vtec_list or []):
-        tid = _vtec_track_id(str(raw))
-        if not tid or tid in seen:
-            continue
-        seen.add(tid)
-        out.append(tid)
-    return out
-
-
-def _sf_vtec_tracks(vtec_list) -> list[tuple[str, str]]:
-    """
-    Module-level VTEC parser for station-feed helpers.
-    Returns [(track_id, action)] where track_id := OFFICE.PHEN.SIG.ETN.
-    """
-    out: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for raw in (vtec_list or []):
-        s = "".join(str(raw).split()).strip()
-        if not s:
-            continue
-        m = _VTEC_PARSE_RE.search(s)
-        if not m:
-            continue
-        track = f"{m.group('office')}.{m.group('phen')}.{m.group('sig')}.{m.group('etn')}"
-        act = (m.group('act') or '').upper()
-        key = f"{track}|{act}"
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append((track, act))
-    return out
-
-
-def _sf_nws_alert_url(alert_ref) -> str | None:
-    s = str(alert_ref or "").strip()
-    if not s:
-        return None
-    if s.startswith(("https://", "http://")):
-        return s
-    return f"https://api.weather.gov/alerts/{s}"
-
-
-def _sf_is_vtec_track_id(value) -> bool:
-    s = str(value or "").strip().upper()
-    if not s:
-        return False
-    return bool(re.fullmatch(r"[A-Z]{4}\.[A-Z]{2}\.[A-Z]\.[0-9]{4}", s))
-
-
-def _sf_bad_nws_alert_link_track(value) -> str | None:
-    s = str(value or "").strip()
-    if not s:
-        return None
-    prefix = "https://api.weather.gov/alerts/"
-    if not s.startswith(prefix):
-        return None
-    target = s[len(prefix):].strip()
-    return target if _sf_is_vtec_track_id(target) else None
-
-
-def _sf_active_alerts_for_link_repair() -> list[dict]:
-    try:
-        import requests  # type: ignore
-        r = requests.get(
-            "https://api.weather.gov/alerts/active",
-            headers={"User-Agent": "(seasonalnet.org, info@seasonalnet.org)"},
-            timeout=10,
-        )
-        if not r.ok:
-            return []
-        feats = (r.json() or {}).get("features") or []
-        return [f for f in feats if isinstance(f, dict)]
-    except Exception:
-        return []
-
-
-def _sf_repair_restored_links(alert_id, item, links, *, active_features=None):
-    out = dict(links or {})
-    bad_track = _sf_bad_nws_alert_link_track(out.get("nws"))
-    if not bad_track:
-        return out
-
-    track_ids = _sf_vtec_track_ids(out.get("vtec") or [])
-    if not track_ids and _sf_is_vtec_track_id(alert_id):
-        track_ids = [str(alert_id).strip()]
-    if bad_track not in track_ids:
-        track_ids.insert(0, bad_track)
-
-    candidates = []
-    for feat in (active_features or []):
-        try:
-            props = feat.get("properties") if isinstance(feat, dict) else None
-            if not isinstance(props, dict):
-                continue
-            params = props.get("parameters") if isinstance(props.get("parameters"), dict) else {}
-            raw_vtec = params.get("VTEC") if isinstance(params, dict) else []
-            feat_tracks = _sf_vtec_track_ids(raw_vtec or [])
-            if not feat_tracks or not any(t in feat_tracks for t in track_ids):
-                continue
-
-            score = 0
-            if bad_track in feat_tracks:
-                score += 100
-
-            feat_event = str(props.get("event") or "")
-            item_event = str(item.get("event") or "")
-            if feat_event and item_event and feat_event == item_event:
-                score += 20
-
-            feat_sent = _sf_iso(props.get("sent"))
-            item_sent = _sf_iso(item.get("sent"))
-            if feat_sent and item_sent and feat_sent == item_sent:
-                score += 15
-
-            feat_effective = _sf_iso(props.get("effective"))
-            item_effective = _sf_iso(item.get("effective"))
-            if feat_effective and item_effective and feat_effective == item_effective:
-                score += 10
-
-            feat_ends = _sf_iso(props.get("ends") or props.get("eventEndingTime"))
-            item_ends = _sf_iso(item.get("ends"))
-            if feat_ends and item_ends and feat_ends == item_ends:
-                score += 10
-
-            feat_area = str(props.get("areaDesc") or "")
-            item_area = str(item.get("area") or "")
-            if feat_area and item_area and feat_area == item_area:
-                score += 10
-
-            feat_same = {str(x).strip() for x in (((props.get("geocode") or {}).get("SAME") or []) if isinstance(props.get("geocode"), dict) else []) if str(x).strip()}
-            item_same = {str(x).strip() for x in (item.get("sameCodes") or []) if str(x).strip()}
-            if feat_same and item_same:
-                if feat_same == item_same:
-                    score += 20
-                elif feat_same & item_same:
-                    score += 5
-
-            url = _sf_nws_alert_url(props.get("id") or props.get("@id") or feat.get("id"))
-            if not url:
-                continue
-            candidates.append((score, url))
-        except Exception:
-            continue
-
-    if not candidates:
-        return out
-
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    best_score, best_url = candidates[0]
-    if best_score <= 0:
-        return out
-    tied = {url for score, url in candidates if score == best_score}
-    if len(tied) != 1:
-        return out
-
-    out["nws"] = best_url
-    try:
-        log.info("Station feed: repaired restored NWS link id=%s track=%s url=%s", alert_id, bad_track, best_url)
-    except Exception:
-        pass
-    return out
-
-
-def _sf_eas_article(word: str) -> str:
-    w = (word or "").strip()
-    return "an" if (w[:1].lower() in "aeiou") else "a"
-
-
-# EAS org prefix and event labels are now authoritative in:
-#   .same.events  → _eas_org_broadcast_prefix(), _same_label_for(), _same_label_or_code()
-# The shim below keeps _sf_make_eas_headline() working without further changes.
-_SF_EAS_ORG_PREFIX = None  # unused sentinel; callers use _eas_org_broadcast_prefix()
-
-# Minimal SAME/ERN relay event map (retained for ERN relay path only).
-# For all other label lookups use _same_label_or_code() / _same_label_for().
-_SF_EAS_EVENT_LABELS = {
-    "RWT": "Required Weekly Test",
-    "RMT": "Required Monthly Test",
-    "DMO": "Practice/Demo Warning",
-    "FFW": "Flash Flood Warning",
-    "FFA": "Flash Flood Watch",
-    "FLW": "Flood Warning",
-    "FLS": "Flood Statement",
-    "SVR": "Severe Thunderstorm Warning",
-    "SVA": "Severe Thunderstorm Watch",
-    "TOR": "Tornado Warning",
-    "TOA": "Tornado Watch",
-    "SMW": "Special Marine Warning",
-    "SPS": "Special Weather Statement",
-}
-
-
-# ZCZC-ORG-EEE-LLLLLL-LLLLLL+TTTT-JJJHHMM-SENDER-
-_SF_ZCZC_RE = re.compile(
-    r"^ZCZC-"
-    r"(?P<org>[A-Z]{3})-"
-    r"(?P<event>[A-Z0-9]{3})-"
-    r"(?P<locs>\d{6}(?:-\d{6})*)"
-    r"\+(?P<dur>\d{4})-"
-    r"(?P<jday>\d{3})(?P<hh>\d{2})(?P<mm>\d{2})-"
-    r"(?P<sender>[^-]{1,16})-?$"
+from .broadcast.station_feed import FeedSender, StationFeedAlert
+from .broadcast.station_feed_runtime import (
+    set_app_config as _sf_set_app_config,
+    set_repository as _sf_set_repository,
+    emit as _sf_emit,
+    enabled as _sf_enabled,
+    cfg as _sf_cfg,
+    parse_dt as _sf_parse_dt,
+    iso as _sf_iso,
+    sha1_12 as _sf_sha1_12,
+    repo_upsert as _sf_repo_upsert,
+    prune as _sf_prune,
+    station_feed_housekeeping_start as _sf_station_feed_hk_start,
+    is_non_alert_station_item as _sf_is_non_alert_station_item,
+    remove_ids as _sf_remove_ids,
+    remove_ern_relays_matching as _sf_remove_ern_relays_matching,
+    cap_reference_ids as _sf_cap_reference_ids,
+    nwws_best_issued_dt as _sf_nwws_best_issued_dt,
+    nwws_event_label as _sf_nwws_event_label,
+    nwws_area_from_text as _sf_nwws_area_from_text,
+    nwws_make_headline as _sf_nwws_make_headline,
+    nwws_extract_issuer as _sf_nwws_extract_issuer,
+    make_eas_headline as _sf_make_eas_headline,
+    note_cap as _station_feed_note_cap,
+    note_ern as _station_feed_note_ern,
+    note_nwws as _station_feed_note_nwws,
 )
-
-def _sf_same_jday_to_utc(jday: int, hh: int, mm: int):
-    now = dt.datetime.now(dt.timezone.utc)
-    base = dt.datetime(now.year, 1, 1, tzinfo=dt.timezone.utc)
-    cand = base + dt.timedelta(days=jday - 1, hours=hh, minutes=mm)
-
-    # Year rollover sanity: choose the closest plausible year
-    cands = [cand]
-    try:
-        cands.append(cand.replace(year=cand.year - 1))
-        cands.append(cand.replace(year=cand.year + 1))
-    except Exception:
-        pass
-    return min(cands, key=lambda x: abs((x - now).total_seconds()))
-
-def _sf_parse_same_header(zczc_text):
-    s = str(zczc_text or "").strip()
-    # Sometimes downstream strings may include extra whitespace/newlines
-    s = "".join(s.split())
-    m = _SF_ZCZC_RE.match(s)
-    if not m:
-        return None
-    org = m.group("org")
-    event_code = m.group("event")
-    same_codes = [x for x in m.group("locs").split("-") if x]
-    dur = m.group("dur")
-    jday = int(m.group("jday"))
-    hh = int(m.group("hh"))
-    mm = int(m.group("mm"))
-    sender = m.group("sender")
-
-    start_utc = _sf_same_jday_to_utc(jday, hh, mm)
-    end_utc = start_utc + dt.timedelta(hours=int(dur[:2]), minutes=int(dur[2:]))
-
-    return {
-        "org": org,
-        "event_code": event_code,
-        "same_codes": same_codes,
-        "sender": sender,
-        "start_utc": start_utc,
-        "end_utc": end_utc,
-        "raw": s,
-    }
-
-def _sf_fmt_local(dt_obj):
-    try:
-        return dt_obj.astimezone().strftime("%-I:%M %p on %b %-d, %Y")
-    except Exception:
-        try:
-            return dt_obj.isoformat()
-        except Exception:
-            return str(dt_obj)
-
-def _sf_make_eas_headline(*, org, event_text, area_text, start_utc, end_utc, sender):
-    prefix = _eas_org_broadcast_prefix(org)
-    event_text = str(event_text or "Alert").strip() or "Alert"
-    area_text = str(area_text or "").strip() or "Unknown area"
-    article = _sf_eas_article(event_text)
-    return (
-        f"{prefix} {article.upper()} {event_text.upper()} for the following counties or areas: "
-        f"{area_text}; at {_sf_fmt_local(start_utc)} Effective until {_sf_fmt_local(end_utc)}. "
-        f"Message from {sender}."
-    )
-
-
-
-# VTEC phen.sig → event label lookup is now authoritative in:
-#   .alerts.vtec.phen_sig_label()  (imported as _vtec_phen_sig_label)
-# Config-level overrides are merged in _sf_nwws_event_label() below.
-
-
-_DEFAULT_SF_NWWS_TZ_OFFSETS: dict[str, dt.tzinfo] = {
-    "UTC": dt.timezone.utc,
-    "GMT": dt.timezone.utc,
-    "EST": dt.timezone(dt.timedelta(hours=-5)),
-    "EDT": dt.timezone(dt.timedelta(hours=-4)),
-    "CST": dt.timezone(dt.timedelta(hours=-6)),
-    "CDT": dt.timezone(dt.timedelta(hours=-5)),
-    "MST": dt.timezone(dt.timedelta(hours=-7)),
-    "MDT": dt.timezone(dt.timedelta(hours=-6)),
-    "PST": dt.timezone(dt.timedelta(hours=-8)),
-    "PDT": dt.timezone(dt.timedelta(hours=-7)),
-    "AKST": dt.timezone(dt.timedelta(hours=-9)),
-    "AKDT": dt.timezone(dt.timedelta(hours=-8)),
-    "HST": dt.timezone(dt.timedelta(hours=-10)),
-    "AST": dt.timezone(dt.timedelta(hours=-4)),
-    "ADT": dt.timezone(dt.timedelta(hours=-3)),
-}
-
-
-def _sf_nwws_tzinfo_from_override(value):
-    if value is None:
-        return None
-    if isinstance(value, dt.tzinfo):
-        return value
-    s = str(value).strip()
-    if not s:
-        return None
-    su = s.upper()
-    if su in {"UTC", "GMT", "Z"}:
-        return dt.timezone.utc
-    m = re.fullmatch(r"([+-])(\d{1,2}):(\d{2})", s)
-    if m:
-        sign = 1 if m.group(1) == "+" else -1
-        hours = int(m.group(2))
-        minutes = int(m.group(3))
-        return dt.timezone(sign * dt.timedelta(hours=hours, minutes=minutes))
-    if re.fullmatch(r"[+-]?\d+", s):
-        try:
-            mins = int(s)
-            return dt.timezone(dt.timedelta(minutes=mins))
-        except Exception:
-            return None
-    return None
-
-
-def _sf_nwws_tz_offsets() -> dict[str, dt.tzinfo]:
-    out = dict(_DEFAULT_SF_NWWS_TZ_OFFSETS)
-    try:
-        cfg = getattr(getattr(_APP_CFG, "station_feed", None), "nwws", None)
-        overrides = getattr(cfg, "tz_abbrev_overrides", {}) if cfg is not None else {}
-        if isinstance(overrides, dict):
-            for raw_key, raw_val in overrides.items():
-                key = str(raw_key or "").strip().upper()
-                if not key:
-                    continue
-                tzinfo = _sf_nwws_tzinfo_from_override(raw_val)
-                if tzinfo is not None:
-                    out[key] = tzinfo
-    except Exception:
-        pass
-    return out
-
-
-def _sf_nwws_event_label(prod_type: str, *, vtec_list=None, text: str = "") -> str:
-    """
-    Resolve an NWWS product to a human-readable event label.
-
-    Priority:
-      1. Config-level vtec_event_labels overrides (if any)
-      2. vtec.phen_sig_label() — authoritative table in vtec.py
-      3. _sf_nwws_event_from_text() — product body text extraction
-      4. EAS event code via events.label_or_code() as last resort
-    """
-    # Load any config-level overrides
-    config_overrides: dict[str, str] = {}
-    try:
-        cfg = getattr(getattr(_APP_CFG, "station_feed", None), "nwws", None)
-        raw_ovr = getattr(cfg, "vtec_event_labels", {}) if cfg is not None else {}
-        if isinstance(raw_ovr, dict):
-            for raw_key, raw_val in raw_ovr.items():
-                key = str(raw_key or "").strip().upper()
-                val = str(raw_val or "").strip()
-                if key and val:
-                    config_overrides[key] = val
-    except Exception:
-        pass
-
-    for raw in (vtec_list or []):
-        m = _VTEC_PARSE_RE.search(str(raw or ""))
-        if not m:
-            continue
-        phen_sig = f"{m.group('phen')}.{m.group('sig')}"
-        # Config overrides take highest priority
-        if phen_sig in config_overrides:
-            return config_overrides[phen_sig]
-        label = _vtec_phen_sig_label(phen_sig)
-        if label:
-            return label
-
-    text_label = _sf_nwws_event_from_text(text)
-    if text_label:
-        return text_label
-    return _same_label_or_code(prod_type)
-
-
-def _sf_nwws_titlecase_event(text: str) -> str:
-    s = re.sub(r"\s+", " ", str(text or "")).strip(" .")
-    if not s:
-        return ""
-    if s.upper() == s:
-        s = s.title().replace("Nws", "NWS")
-    return s
-
-
-def _sf_nwws_parse_header_issued_dt(text: str):
-    tz_map = _sf_nwws_tz_offsets()
-    for ln in (text or "").splitlines()[:120]:
-        s = (ln or "").strip()
-        m = _NWS_HEADER_ISSUED_RE.match(s)
-        if not m:
-            continue
-        hhmm = m.group("hhmm")
-        if len(hhmm) == 3:
-            hour = int(hhmm[0]); minute = int(hhmm[1:])
-        else:
-            hour = int(hhmm[:2]); minute = int(hhmm[2:])
-        ampm = m.group("ampm").upper()
-        if ampm == "AM":
-            hour = 0 if hour == 12 else hour
-        else:
-            hour = 12 if hour == 12 else hour + 12
-        month = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,"JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}.get(m.group("mon").strip().upper())
-        tzinfo = tz_map.get(m.group("tz").strip().upper())
-        if month is None or tzinfo is None:
-            continue
-        try:
-            return dt.datetime(int(m.group("year")), month, int(m.group("day")), hour, minute, tzinfo=tzinfo)
-        except Exception:
-            continue
-    return None
-
-
-def _sf_nwws_best_issued_dt(parsed, official_text: str):
-    issued = _sf_parse_dt(getattr(parsed, "issued", None))
-    if issued is not None:
-        if issued.tzinfo is None:
-            issued = issued.replace(tzinfo=dt.timezone.utc)
-        return issued
-    return _sf_nwws_parse_header_issued_dt(official_text)
-
-
-def _sf_nwws_extract_issuer(text: str, fallback_wfo: str = "") -> str:
-    for ln in (text or "").splitlines()[:80]:
-        s = re.sub(r"\s+", " ", (ln or "").strip())
-        if s.lower().startswith("national weather service "):
-            return "NWS " + s[len("National Weather Service "):].strip()
-    f = (fallback_wfo or "").strip()
-    return f"NWS {f}".strip() if f else "NWS"
-
-
-def _sf_nwws_event_from_text(text: str) -> str:
-    for ln in (strip_nws_product_headers(text or "") or "").splitlines()[:80]:
-        s = re.sub(r"\s+", " ", (ln or "").strip())
-        if not s:
-            continue
-        m = re.match(r"^\.\.\.(?P<ev>.+?)(?:\s+(?:NOW\s+)?IN EFFECT.*)?\.\.\.$", s, flags=re.IGNORECASE)
-        if m:
-            ev = _sf_nwws_titlecase_event(m.group("ev"))
-            if re.search(r"\b(?:warning|watch|advisory|statement|emergency|message)\b", ev, flags=re.IGNORECASE):
-                return ev
-        if re.search(r"\b(?:warning|watch|advisory|statement|emergency|message)\b$", s, flags=re.IGNORECASE):
-            return _sf_nwws_titlecase_event(s)
-    return ""
-
-
-
-def _sf_nwws_area_from_text(text: str) -> str:
-    lines = [re.sub(r"\s+", " ", (ln or "").strip()) for ln in (strip_nws_product_headers(text or "") or "").splitlines()]
-    lines = [ln for ln in lines if ln]
-    for i, ln in enumerate(lines):
-        if re.match(r"^\*\s*WHERE\.\.\.", ln, flags=re.IGNORECASE):
-            parts = [re.sub(r"^\*\s*WHERE\.\.\.\s*", "", ln, flags=re.IGNORECASE).strip()]
-            j = i + 1
-            while j < len(lines):
-                nxt = lines[j]
-                if re.match(r"^\*\s*[A-Z][A-Z /-]*\.\.\.", nxt) or nxt.startswith("*"):
-                    break
-                parts.append(nxt.strip())
-                j += 1
-            out = re.sub(r"\s+", " ", " ".join(p for p in parts if p)).strip(" .")
-            if out:
-                return out
-    for i, ln in enumerate(lines):
-        if re.match(r"^\*\s+.+?\s+for\.\.\.$", ln, flags=re.IGNORECASE):
-            parts = []
-            j = i + 1
-            while j < len(lines):
-                nxt = lines[j]
-                if nxt.startswith("*") or re.match(r"^(At|HAZARD\.\.\.|SOURCE\.\.\.|IMPACT\.\.\.|TORNADO\.|MAX )", nxt, flags=re.IGNORECASE):
-                    break
-                parts.append(nxt.strip(" ."))
-                j += 1
-            out = re.sub(r"\s+", " ", " ".join(p for p in parts if p)).strip(" .")
-            if out:
-                return out
-    return ""
-
-
-def _sf_fmt_issued_until(issued_dt, end_dt, issuer: str) -> str:
-    bits = []
-    if issued_dt is not None:
-        try:
-            bits.append(issued_dt.astimezone().strftime("issued %B %-d at %-I:%M%p %Z"))
-        except Exception:
-            bits.append(f"issued {_sf_iso(issued_dt)}")
-    if end_dt is not None:
-        try:
-            bits.append(end_dt.astimezone().strftime("until %B %-d at %-I:%M%p %Z"))
-        except Exception:
-            bits.append(f"until {_sf_iso(end_dt)}")
-    if issuer:
-        bits.append(f"by {issuer}")
-    return " ".join(bits).strip()
-
-
-def _sf_nwws_make_headline(event_text: str, *, issued_dt=None, end_dt=None, issuer: str = "") -> str:
-    ev = str(event_text or "Alert").strip() or "Alert"
-    suffix = _sf_fmt_issued_until(issued_dt, end_dt, issuer)
-    return f"{ev} {suffix}".strip() if suffix else ev
-
-
-### STATION_FEED_HOUSEKEEPING_PATCH ###
-
-
-# Safe station-feed housekeeping helpers (startup-safe JSON prune)
-def _sf_hk_interval_s() -> int:
-    if _APP_CFG is None:
-        return 60
-    return max(5, _APP_CFG.station_feed.housekeeping.interval_sec)
-
-def _sf_hk_grace_s() -> int:
-    if _APP_CFG is None:
-        return 5
-    return max(0, _APP_CFG.station_feed.housekeeping.grace_sec)
-
-def _sf_hk_keep_unparseable() -> bool:
-    if _APP_CFG is None:
-        return True
-    return _APP_CFG.station_feed.housekeeping.keep_unparseable
-
-def _sf_hk_alert_expiry_ts(alert_obj):
-    """
-    Return the best expiry timestamp for a station-feed alert dict using ends/expires.
-    Uses the latest parseable time so entries don't get pruned too early.
-    """
-    if not isinstance(alert_obj, dict):
-        return None
-
-    candidates = []
-    for k in ("ends", "expires"):
-        raw = alert_obj.get(k)
-        dt_obj = _sf_parse_dt(raw)
-        if dt_obj is None:
-            continue
-        try:
-            candidates.append(float(dt_obj.timestamp()))
-        except Exception:
-            continue
-
-    return max(candidates) if candidates else None
-
-def _sf_hk_prune_json_file(now_ts: float) -> bool:
-    """
-    Prune expired entries directly from handled-alerts.json without rewriting from
-    the in-memory station-feed cache. This avoids startup nukes when memory is empty.
-    Returns True if the file was rewritten.
-    """
-    if not _sf_enabled():
-        return False
-
-    if _APP_CFG is not None and not _APP_CFG.station_feed.housekeeping.enabled:
-        return False
-
-    _station_id, path, _source, _max_items, _ttl_s, _min_write_s = _sf_cfg()
-
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-    except FileNotFoundError:
-        return False
-    except Exception:
-        log.exception("Station feed housekeeping: could not read %s", path)
-        return False
-
-    if not isinstance(payload, dict):
-        return False
-
-    alerts = payload.get("alerts")
-    if not isinstance(alerts, list):
-        return False
-
-    grace_s = float(_sf_hk_grace_s())
-    keep_unparseable = _sf_hk_keep_unparseable()
-
-    kept = []
-    removed = 0
-
-    for item in alerts:
-        if not isinstance(item, dict):
-            removed += 1
-            continue
-
-        exp_ts = _sf_hk_alert_expiry_ts(item)
-
-        if exp_ts is None:
-            if keep_unparseable:
-                kept.append(item)
-            else:
-                removed += 1
-            continue
-
-        # Keep if still valid. Only remove if definitely expired.
-        if (exp_ts + grace_s) >= now_ts:
-            kept.append(item)
-        else:
-            removed += 1
-
-    if removed <= 0:
-        return False
-
-    payload["alerts"] = kept
-    payload["generatedAt"] = _sf_now_iso()
-
-    try:
-        atomic_write_json(path, payload)
-        log.info(
-            "Station feed housekeeping: pruned handled-alerts.json (removed=%s kept=%s path=%s)",
-            removed,
-            len(kept),
-            path,
-        )
-        return True
-    except Exception:
-        log.exception("Station feed housekeeping: failed to rewrite %s after prune", path)
-        return False
-
-
-# Periodic station-feed housekeeping:
-# - one forced startup write (clears stale JSON after restart)
-# - ongoing expiry pruning even when no new alerts arrive
-# - writes only when a prune/max-items trim actually changed the in-memory set
-
-_STATION_FEED_HK_STARTED = False
-_STATION_FEED_HK_FIRST_WRITE_DONE = False
-
-def _sf_station_feed_housekeeping_once():
-    """
-    Startup-safe station-feed housekeeping:
-    - prune in-memory cache (fine)
-    - prune handled-alerts.json directly (safe)
-    - DO NOT write handled-alerts.json from memory here, because memory may be empty on startup
-    """
-    if not _sf_enabled():
-        return
-    if _APP_CFG is not None and not _APP_CFG.station_feed.housekeeping.enabled:
-        return
-
-    try:
-        now_ts = time.time()
-        _station_id, _path, _source, max_items, _ttl_s, _min_write_s = _sf_cfg()
-
-        # Keep the in-memory set and SQLite read model tidy, but don't write
-        # from memory here. The JSON mirror is pruned in place for compatibility.
-        _sf_prune(now_ts, max_items=max_items)
-        _sf_repo_housekeep(now_ts, max_items=max_items)
-
-        # Prune the JSON file itself based on ends/expires so valid alerts survive restarts.
-        _sf_hk_prune_json_file(now_ts)
-    except Exception:
-        log.exception("Station feed housekeeping: tick failed")
-
-def _sf_station_feed_hk_loop():
-    while True:
-        try:
-            _sf_station_feed_housekeeping_once()
-        except Exception:
-            log.exception("Station feed housekeeping: loop error")
-        time.sleep(_sf_hk_interval_s())
-
-def _sf_station_feed_hk_start():
-    global _STATION_FEED_HK_STARTED
-    if _STATION_FEED_HK_STARTED:
-        return
-    if not _sf_enabled():
-        return
-
-    try:
-        import threading
-
-        t = threading.Thread(
-            target=_sf_station_feed_hk_loop,
-            name="station-feed-housekeeping",
-            daemon=True,
-        )
-        t.start()
-        _STATION_FEED_HK_STARTED = True
-
-        try:
-            log.info(
-                "Station feed housekeeping enabled (interval=%ss)",
-                _sf_hk_interval_s(),
-            )
-        except Exception:
-            pass
-    except Exception:
-        try:
-            log.exception("Station feed housekeeping: failed to start")
-        except Exception:
-            pass
-
-# Housekeeping is started by Orchestrator.__init__ after cfg is loaded.
-
-
-def _sf_is_non_alert_station_item(*, alert_id=None, source=None, event=None, headline=None, cycle_only=False) -> bool:
-    """Return True for internal cycle-only items that should not appear in StationFeed."""
-    try:
-        aid = str(alert_id or "").strip()
-        src = str(source or "").strip().upper()
-        ev = str(event or "").strip().lower()
-        hd = str(headline or "").strip().lower()
-        if aid.startswith("PNS_SAFETY:"):
-            return True
-        if src == "PNS_CYCLE":
-            return True
-        if cycle_only and (ev == "severe weather safety rules" or hd == "severe weather safety rules"):
-            return True
-    except Exception:
-        return False
-    return False
-
-
-def _sf_seed_memory_from_payload_file() -> int:
-    """
-    Restore handled-alerts.json into the in-memory station-feed cache without
-    rewriting from an empty cache first. This prevents restart-time wipes when
-    the next alert arrives before StationFeed memory has been repopulated.
-    """
-    if not _sf_enabled() or StationFeedAlert is None:
-        return 0
-
-    try:
-        _station_id, path, _source, max_items, ttl_s, _min_write_s = _sf_cfg()
-        with open(path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-    except FileNotFoundError:
-        return 0
-    except Exception:
-        log.exception("Station feed: failed loading existing handled-alerts.json into memory")
-        return 0
-
-    alerts = payload.get("alerts") if isinstance(payload, dict) else None
-    if not isinstance(alerts, list):
-        return 0
-
-    now_ts = time.time()
-    restored = 0
-    needs_link_repair = any(
-        isinstance(item, dict) and _sf_bad_nws_alert_link_track(((item.get("links") or {}).get("nws")))
-        for item in alerts
-    )
-    active_features = _sf_active_alerts_for_link_repair() if needs_link_repair else []
-
-    for item in alerts:
-        if not isinstance(item, dict):
-            continue
-
-        if _sf_is_non_alert_station_item(
-            alert_id=item.get("id"),
-            source=((item.get("from") or {}).get("name") if isinstance(item.get("from"), dict) else None),
-            event=item.get("event"),
-            headline=item.get("headline"),
-            cycle_only=(str(((item.get("links") or {}).get("mode") or "")).upper() == "VOICE"),
-        ):
-            continue
-
-        exp_ts = _sf_hk_alert_expiry_ts(item)
-        if exp_ts is None:
-            exp_ts = now_ts + ttl_s
-        if exp_ts <= now_ts:
-            continue
-
-        try:
-            sender_raw = item.get("from") or {}
-            sender = None
-            if FeedSender is not None:
-                sender = FeedSender(
-                    name=str((sender_raw.get("name") if isinstance(sender_raw, dict) else "") or "SeasonalWeather"),
-                    kind=str((sender_raw.get("kind") if isinstance(sender_raw, dict) else "") or "unknown"),
-                )
-
-            restored_id = str(item.get("id") or _sf_sha1_12(json.dumps(item, sort_keys=True)))
-            restored_links = _sf_repair_restored_links(
-                restored_id,
-                item,
-                item.get("links") or {},
-                active_features=active_features,
-            )
-
-            alert = StationFeedAlert(
-                id=restored_id,
-                event=str(item.get("event") or "Alert"),
-                headline=str(item.get("headline") or item.get("event") or "Alert"),
-                severity=str(item.get("severity") or "Unknown"),
-                urgency=str(item.get("urgency") or "Unknown"),
-                certainty=str(item.get("certainty") or "Unknown"),
-                area=str(item.get("area") or ""),
-                effective=_sf_iso(item.get("effective")),
-                ends=_sf_iso(item.get("ends")),
-                expires=_sf_iso(item.get("expires")),
-                sent=_sf_iso(item.get("sent")),
-                sameCodes=[str(x) for x in (item.get("sameCodes") or [])],
-                from_=sender,
-                links=restored_links,
-            )
-            _STATION_FEED_STATE[str(alert.id)] = (alert, float(exp_ts))
-            _sf_repo_upsert(alert, expires_at=dt.datetime.fromtimestamp(float(exp_ts), tz=dt.timezone.utc))
-            restored += 1
-        except Exception:
-            log.exception("Station feed: failed restoring one handled-alerts.json entry into memory")
-
-    if restored:
-        _sf_prune(now_ts, max_items=max_items)
-    return restored
-
-def _station_feed_note_cap(ev, *, mode: str, same_locations, out_wav: str, same_code=None, vtec=None) -> None:
-    if not _sf_enabled():
-        return
-    try:
-        vtec_list = list(vtec or [])
-        vtec_tracks = _sf_vtec_track_ids(vtec_list)
-        vtec_actions = {act for (_track, act) in _sf_vtec_tracks(vtec_list)} if vtec_list else set()
-        if vtec_actions & {"CAN", "EXP"}:
-            _sf_remove_by_vtec_tracks(vtec_tracks)
-            _sf_remove_ids(_sf_cap_reference_ids(ev) + [getattr(ev, "alert_id", None)])
-            return
-        cap_alert_ref = getattr(ev, "alert_id", None) or getattr(ev, "id", None)
-        alert_id = (vtec_tracks[0] if vtec_tracks else None) or cap_alert_ref or _sf_sha1_12(str(ev))
-        nws_alert_url = _sf_nws_alert_url(cap_alert_ref)
-        event = getattr(ev, "event", None) or "Alert"
-        headline = getattr(ev, "headline", None) or event
-        severity = getattr(ev, "severity", None) or "Unknown"
-        urgency = getattr(ev, "urgency", None) or "Unknown"
-        certainty = getattr(ev, "certainty", None) or "Unknown"
-        area = getattr(ev, "area_desc", None) or getattr(ev, "area", None) or ""
-        # Times: internal CAP event objects don't always carry these fields.
-        # Prefer explicit ev.* fields; otherwise derive END from VTEC; optionally backfill from api.weather.gov.
-        effective_raw = getattr(ev, "effective", None)
-        ends_raw = getattr(ev, "ends", None)
-        expires_raw = getattr(ev, "expires", None)
-        sent_raw = getattr(ev, "sent", None)
-
-        def _sf_best_end_from_vtec(vtec_list):
-            # Pull the END token after '-' if present: ...-YYYYMMDDThhmmZ/
-            try:
-                ends = []
-                for raw in vtec_list or []:
-                    ss = "".join(str(raw).split()).strip()
-                    if not ss:
-                        continue
-                    m = re.search(r"-((?:\d{8}|\d{6})T\d{4}Z)", ss)
-                    if not m:
-                        continue
-                    txt = m.group(1).upper()
-                    mm = re.fullmatch(r"(\d{8}|\d{6})T(\d{4})Z", txt)
-                    if not mm:
-                        continue
-
-                    d = mm.group(1)
-                    hm = mm.group(2)
-
-                    if len(d) == 8:
-                        year = int(d[0:4])
-                        month = int(d[4:6])
-                        day = int(d[6:8])
-                    else:
-                        year = 2000 + int(d[0:2])
-                        month = int(d[2:4])
-                        day = int(d[4:6])
-
-                    hour = int(hm[0:2])
-                    minute = int(hm[2:4])
-
-                    ends.append(dt.datetime(year, month, day, hour, minute, tzinfo=dt.timezone.utc))
-
-                return max(ends) if ends else None
-            except Exception:
-                return None
-
-        # Try to derive end time from VTEC if missing
-        vtec_list = vtec or getattr(ev, "vtec", None) or getattr(ev, "vtec_list", None)
-        if not isinstance(vtec_list, list):
-            vtec_list = [vtec_list] if vtec_list else []
-        vtec_end = _sf_best_end_from_vtec(vtec_list)
-
-        if vtec_end:
-            ends_raw = ends_raw or vtec_end
-            expires_raw = expires_raw or vtec_end
-            effective_raw = effective_raw or sent_raw  # best-effort
-
-        # Optional: backfill from NWS alert detail endpoint (handles urn:oid IDs)
-        if (_APP_CFG.station_feed.fetch_nws if _APP_CFG else False) and nws_alert_url:
-            try:
-                import requests  # type: ignore
-                r = requests.get(
-                    nws_alert_url,
-                    headers={"User-Agent": "(seasonalnet.org, info@seasonalnet.org)"},
-                    timeout=8,
-                )
-                if r.ok:
-                    props = (r.json() or {}).get("properties", {}) or {}
-                    sent_raw = sent_raw or props.get("sent")
-                    effective_raw = effective_raw or props.get("effective")
-                    ends_raw = ends_raw or props.get("ends") or props.get("eventEndingTime")
-                    expires_raw = expires_raw or props.get("expires")
-            except Exception:
-                pass
-
-
-        # Final safety fallback so station-feed entries don't end up immortal/blank
-        # (some CAP paths, especially SPS-ish cases, may arrive without ends/expires/VTEC end)
-        if not ends_raw and not expires_raw:
-            try:
-                sent_dt = _sf_parse_dt(sent_raw) if sent_raw else None
-            except Exception:
-                sent_dt = None
-            if sent_dt is not None:
-                fallback_end = sent_dt + dt.timedelta(hours=6)
-                ends_raw = ends_raw or fallback_end
-                expires_raw = expires_raw or fallback_end
-                effective_raw = effective_raw or sent_dt
-
-        effective = _sf_iso(effective_raw)
-        ends = _sf_iso(ends_raw)
-        expires = _sf_iso(expires_raw)
-        sent = _sf_iso(sent_raw)
-
-        expires_at = expires_raw or ends_raw
-
-        if (_APP_CFG.station_feed.debug if _APP_CFG else False):
-            try:
-                keys = sorted(getattr(ev, "__dict__", {}).keys())
-            except Exception:
-                keys = []
-            log.info(
-                "Station feed CAP: id=%r sent=%r effective=%r expires=%r ends=%r vtec=%r keys=%s",
-                alert_id, sent, effective, expires, ends, vtec_list, keys
-            )
-
-        wfo = getattr(ev, "wfo", None) or getattr(ev, "office", None)
-        sender_name = f"NWS CAP{f'/{wfo}' if wfo else ''}"
-        sender = FeedSender(name=sender_name, kind="origin") if FeedSender else None
-
-        links = {"mode": mode, "wav": out_wav}
-        if nws_alert_url:
-            links["nws"] = nws_alert_url
-        if same_code:
-            links["same"] = f"same:{same_code}"
-        if vtec:
-            links["vtec"] = vtec
-
-        alert = StationFeedAlert(
-            id=str(alert_id),
-            event=str(event),
-            headline=str(headline),
-            severity=str(severity),
-            urgency=str(urgency),
-            certainty=str(certainty),
-            area=str(area),
-            effective=effective,
-            ends=ends,
-            expires=expires,
-            sent=sent,
-            sameCodes=[str(x) for x in (same_locations or [])],
-            from_=sender,
-            links=links,
-        )
-        _sf_emit(alert, expires_at=expires_at)
-    except Exception:
-        log.exception("Station feed: failed to note CAP alert")
-
-
-def _station_feed_note_ern(ev, *, same_locations, out_wav: str) -> None:
-    if not _sf_enabled():
-        return
-    try:
-        raw_text = getattr(ev, "text", None) or ""
-        parsed = _sf_parse_same_header(raw_text)
-
-        # Sender badge: use header sender if we parsed it; otherwise fall back
-        sender_name = None
-        if parsed:
-            sender_name = parsed.get("sender")
-        sender_name = sender_name or getattr(ev, "sender", None) or "ERN"
-        # Keep this "unknown" so the UI doesn't auto-append "(relay)" if it uses sender.kind in labels
-        sender = FeedSender(name=str(sender_name), kind="relay") if FeedSender else None
-
-        # Event text: prefer ev.event if already human-readable, else map from SAME event code
-        ev_event = (getattr(ev, "event", None) or "").strip()
-        event_text = ev_event
-        if parsed:
-            code = str(parsed.get("event_code") or "").upper()
-            if (not event_text) or (event_text.upper() == code):
-                event_text = _same_label_or_code(code)
-        if not event_text:
-            event_text = "EAS Alert"
-
-        # Area text: prefer any precomputed area string, else join whatever same_locations contains
-        area_text = str(getattr(ev, "area", None) or "").strip()
-        if not area_text:
-            area_text = "; ".join([str(x) for x in (same_locations or []) if str(x).strip()])
-
-        # SAME codes + timestamps from header when available
-        same_codes = [str(x) for x in (same_locations or [])]
-        sent_iso = _sf_iso(getattr(ev, "sent", None))
-        effective_iso = None
-        ends_iso = None
-        expires_iso = None
-        expires_at = None
-
-        if parsed:
-            same_codes = [str(x) for x in (parsed.get("same_codes") or [])] or same_codes
-            start_utc = parsed["start_utc"]
-            end_utc = parsed["end_utc"]
-            sent_iso = sent_iso or _sf_iso(start_utc)
-            effective_iso = _sf_iso(start_utc)
-            ends_iso = _sf_iso(end_utc)
-            expires_iso = _sf_iso(end_utc)
-            expires_at = end_utc
-
-            headline = _sf_make_eas_headline(
-                org=parsed.get("org"),
-                event_text=event_text,
-                area_text=area_text,
-                start_utc=start_utc,
-                end_utc=end_utc,
-                sender=str(sender_name),
-            )
-        else:
-            # Fallback if SAME parse fails: at least don't explode
-            headline = getattr(ev, "headline", None) or raw_text or str(event_text)
-
-        alert_id = getattr(ev, "id", None) or _sf_sha1_12(
-            f"ern:{event_text}:{headline}:{sender_name}:{out_wav}"
-        )
-
-        links = {"mode": "REL", "wav": out_wav, "via": "ERN/GWES"}
-
-        alert = StationFeedAlert(
-            id=str(alert_id),
-            event=str(event_text),
-            headline=str(headline),
-            severity="Unknown",
-            urgency="Unknown",
-            certainty="Unknown",
-            area=str(area_text or "Unknown area"),
-            effective=effective_iso,
-            ends=ends_iso,
-            expires=expires_iso,
-            sent=sent_iso,
-            sameCodes=same_codes,
-            from_=sender,
-            links=links,
-        )
-        _sf_emit(alert, expires_at=expires_at)
-    except Exception:
-        log.exception("Station feed: failed to note ERN relay")
-
-
-def _station_feed_note_nwws(
-    parsed,
-    *,
-    mode: str,
-    same_locations,
-    out_wav: str,
-    product_id=None,
-    expires_at=None,
-    vtec=None,
-    official_text=None,
-    issued_at=None,
-    event_text=None,
-    headline=None,
-    area_text=None,
-) -> None:
-    if not _sf_enabled():
-        return
-    try:
-        awips = getattr(parsed, "awips_id", None) or getattr(parsed, "awips", None) or ""
-        wfo = getattr(parsed, "wfo", None) or ""
-        prod_type = getattr(parsed, "product_type", None) or "NWWS"
-        base_text = str(official_text or getattr(parsed, "raw_text", "") or "")
-        raw_vtec = [str(x) for x in (vtec or []) if str(x).strip()]
-        if not raw_vtec and base_text:
-            raw_vtec = _VTEC_FIND_RE.findall(base_text)
-        vtec_tracks = _sf_vtec_track_ids(raw_vtec)
-        vtec_actions = {act for (_track, act) in _sf_vtec_tracks(raw_vtec)} if raw_vtec else set()
-        if vtec_actions & {"CAN", "EXP"}:
-            _sf_remove_by_vtec_tracks(vtec_tracks)
-            return
-
-        key = f"nwws:{prod_type}:{awips}:{wfo}:{issued_at or getattr(parsed, 'issued', None)}"
-        alert_id = vtec_tracks[0] if vtec_tracks else _sf_sha1_12(key)
-        sender = FeedSender(name="NWWS-OI", kind="origin") if FeedSender else None
-
-        issued_dt = _sf_parse_dt(issued_at) if issued_at is not None else _sf_nwws_best_issued_dt(parsed, base_text)
-        if issued_dt is not None and issued_dt.tzinfo is None:
-            issued_dt = issued_dt.replace(tzinfo=dt.timezone.utc)
-
-        end_raw = (
-            expires_at
-            or getattr(parsed, "expires", None)
-            or getattr(parsed, "expires_at", None)
-            or getattr(parsed, "end", None)
-            or getattr(parsed, "end_time", None)
-            or getattr(parsed, "valid_until", None)
-        )
-        if not end_raw and issued_dt is not None:
-            end_raw = issued_dt + dt.timedelta(hours=6)
-        end_dt = _sf_parse_dt(end_raw)
-
-        event_display = str(event_text or _sf_nwws_event_label(prod_type, vtec_list=raw_vtec, text=base_text)).strip()
-        issuer = _sf_nwws_extract_issuer(base_text, fallback_wfo=wfo)
-        headline_display = str(headline or _sf_nwws_make_headline(event_display, issued_dt=issued_dt, end_dt=end_dt, issuer=issuer)).strip()
-        area_display = str(area_text or "").strip() or _sf_nwws_area_from_text(base_text) or str(wfo)
-
-        links = {"mode": mode, "wav": out_wav}
-        if product_id:
-            links["nws"] = f"https://api.weather.gov/products/{product_id}"
-        if raw_vtec:
-            links["vtec"] = raw_vtec
-
-        alert = StationFeedAlert(
-            id=str(alert_id),
-            event=event_display,
-            headline=headline_display,
-            severity="Unknown",
-            urgency="Unknown",
-            certainty="Unknown",
-            area=str(area_display),
-            effective=_sf_iso(issued_dt),
-            ends=_sf_iso(end_dt or end_raw),
-            expires=_sf_iso(end_dt or end_raw),
-            sent=_sf_iso(issued_dt),
-            sameCodes=[str(x) for x in (same_locations or [])],
-            from_=sender,
-            links=links,
-        )
-        _sf_emit(alert, expires_at=(end_dt or end_raw))
-    except Exception:
-        log.exception("Station feed: failed to note NWWS toneout")
 
 
 # We surgically remove the stale time sentence from the Station ID segment,
@@ -1633,6 +230,7 @@ class Orchestrator:
     def __init__(self, cfg: AppConfig) -> None:
         global _APP_CFG
         _APP_CFG = cfg
+        _sf_set_app_config(cfg)
         self.cfg = cfg
         self.api = NWSApi()
         self.telnet = LiquidsoapTelnet(
@@ -1642,6 +240,12 @@ class Orchestrator:
 
         self._tz = ZoneInfo(cfg.station.timezone)
         self.local_tz = self._tz
+        self.cap_text = CapTextRenderer(
+            local_tz=self._tz,
+            cap_vtec_list=self._cap_vtec_list,
+            vtec_tracks=self._vtec_tracks,
+            best_expiry_from_vtec=self._best_expiry_from_vtec,
+        )
 
         # Isolated policy/state machines. main.py only wires inputs/outputs;
         # classification and health decisions live in their own modules.
@@ -1686,6 +290,11 @@ class Orchestrator:
 
         # Fast membership checks for "in-area" targeting
         self._same_fips_allow_set = _normalize_same_allow_set(cfg.service_area.same_fips_all)
+        self.targeting = SameTargetResolver(
+            cfg=cfg,
+            local_tz=self._tz,
+            same_fips_allow_set=self._same_fips_allow_set,
+        )
 
         # --- NWWS flood-gate controls ---
         self._nwws_logger = logging.getLogger("seasonalweather.nwws")
@@ -1756,8 +365,8 @@ class Orchestrator:
         self.station_feed_repo = StationFeedRepository(self.database) if self.database is not None else None
         _sf_set_repository(self.station_feed_repo)
 
-        # Start station-feed housekeeping after SQLite is ready so the public
-        # /v1/handled-alerts read model and legacy JSON mirror stay in sync.
+        # Start StationFeed housekeeping after SQLite is ready so the public
+        # /v1/handled-alerts read model stays tidy.
         _sf_station_feed_hk_start()
 
         # --- Persistent active alert tracker ---
@@ -1855,7 +464,7 @@ class Orchestrator:
     def _station_feed_seed_from_alert_tracker(self) -> int:
         """
         Restore active alerts from the live AlertTracker state on startup.
-        This works whether the tracker is backed by SQLite or the legacy JSON file.
+        This works whether the tracker is backed by SQLite or the tracker state file.
         """
         if not _sf_enabled() or StationFeedAlert is None:
             return 0
@@ -2403,81 +1012,15 @@ class Orchestrator:
         *,
         allow_statewide_input: bool = True,
     ) -> list[str]:
-        """
-        Keep ONLY SAME FIPS locations that are within our configured service area.
-
-        State-wide 0SS000 inputs match when this service area contains at least
-        one concrete county/city SAME code in that state.  Matching state-wide
-        codes are preserved as 0SS000 for relay/output; they are not expanded
-        into county lists.
-        """
-        return _same_filter_locations_to_service_area(
+        return self.targeting._filter_same_locations_to_service_area(
             locs,
-            self._same_fips_allow_set,
             allow_statewide_input=allow_statewide_input,
         )
 
+
     # ---- Spoken-script post-processing (NWWS path) ----
     def _nws_header_issued_phrase(self, text: str) -> str | None:
-        """
-        Extract a nicer spoken timestamp from an NWS header line like:
-          "310 PM EST Sun Jan 11 2026"
-        Returns e.g. "3:10 PM EST Sunday January 11 2026"
-        """
-        if not text:
-            return None
-
-        dow_map = {
-            "SUN": "Sunday",
-            "MON": "Monday",
-            "TUE": "Tuesday",
-            "WED": "Wednesday",
-            "THU": "Thursday",
-            "FRI": "Friday",
-            "SAT": "Saturday",
-        }
-        mon_map = {
-            "JAN": "January",
-            "FEB": "February",
-            "MAR": "March",
-            "APR": "April",
-            "MAY": "May",
-            "JUN": "June",
-            "JUL": "July",
-            "AUG": "August",
-            "SEP": "September",
-            "OCT": "October",
-            "NOV": "November",
-            "DEC": "December",
-        }
-
-        for ln in (text or "").splitlines()[:80]:
-            s = (ln or "").strip()
-            if not s:
-                continue
-            m = _NWS_HEADER_ISSUED_RE.match(s)
-            if not m:
-                continue
-
-            hhmm = m.group("hhmm")
-            ampm = m.group("ampm").upper()
-            tz = _expand_tz_token(m.group("tz").upper())
-            dow = dow_map.get(m.group("dow").strip().upper(), m.group("dow").strip())
-            mon = mon_map.get(m.group("mon").strip().upper(), m.group("mon").strip())
-            day = str(int(m.group("day")))
-            year = m.group("year")
-
-            # hhmm: "310" or "1234"
-            if len(hhmm) == 3:
-                hour = int(hhmm[0])
-                minute = int(hhmm[1:])
-            else:
-                hour = int(hhmm[:2])
-                minute = int(hhmm[2:])
-
-            return f"{hour}:{minute:02d} {ampm} {tz} {dow} {mon} {day} {year}"
-
-        return None
+        return self.cap_text._nws_header_issued_phrase(text)
 
     def _fix_sps_preamble(self, script: str, official_text: str) -> str:
         """
@@ -2506,17 +1049,7 @@ class Orchestrator:
         return s2.strip()
 
     def _cap_sps_preamble(self, sent_iso: str | None) -> str:
-        """
-        CAP SPS should use the same NWR-style spoken preamble as NWWS SPS.
-        We prefer the CAP sent timestamp and speak it in local station time.
-        """
-        issued = self._fmt_local_from_utc_iso(sent_iso or "")
-        if issued:
-            return (
-                "And now a Special Weather Statement from your National Weather Service, "
-                f"issued at {issued}."
-            )
-        return "And now a Special Weather Statement from your National Weather Service."
+        return self.cap_text._cap_sps_preamble(sent_iso)
 
     def _expiry_summary_script(self, official_text: str) -> str | None:
         """Shim → product_text.expiry_summary_script()."""
@@ -2545,563 +1078,93 @@ class Orchestrator:
         )
 
     def _state_to_fips2(self, st: str) -> str | None:
-        s = (st or "").strip().upper()
-        if not s:
-            return None
-        return _ugc.STATE_ABBR_TO_FIPS.get(s)
+        return self.targeting._state_to_fips2(st)
+
 
     def _same_from_state_county(self, state_abbr: str, county3: str) -> str | None:
-        # Delegates to ugc library; retains signature for existing callers.
-        c3 = "".join(ch for ch in (county3 or "") if ch.isdigit()).zfill(3)
-        if len(c3) != 3:
-            return None
-        return _ugc.same_from_county_zone(
-            f"{(state_abbr or '').strip().upper()}C{c3}"
-        )
+        return self.targeting._same_from_state_county(state_abbr, county3)
+
 
     # ---- Station-feed helpers: SAME(6) -> County names (ERN relays) ----
     def _same6_to_county_zone_id(self, same6: str) -> tuple[str | None, str | None]:
-        """Convert SAME PSSCCC (6 digits) to NWS county-zone ID like 'MDC031'."""
-        s = "".join(ch for ch in str(same6 or "").strip() if ch.isdigit())
-        if len(s) != 6:
-            return (None, None)
-        st_fips2 = s[1:3]  # ignore partition
-        cty3 = s[3:6]
-        st = _ugc.FIPS_TO_STATE_ABBR.get(st_fips2)
-        if not st:
-            return (None, None)
-        return (f"{st}C{cty3}", st)
+        return self.targeting._same6_to_county_zone_id(same6)
+
 
     async def _same6_area_label(self, same6: str) -> str | None:
-        """Best-effort county label for SAME via api.weather.gov/zones/county/<ST>C### (cached)."""
-        code = "".join(ch for ch in str(same6 or "").strip() if ch.isdigit())
-        if len(code) != 6:
-            return None
-        hit = self._same_name_cache.get(code)
-        if hit:
-            return hit
-        now = dt.datetime.now(tz=self._tz)
-        fail_at = self._same_name_fail.get(code)
-        if fail_at and (now - fail_at).total_seconds() < 300:
-            return None
-        zone_id, st = self._same6_to_county_zone_id(code)
-        if not zone_id:
-            return None
-        async with self._same_name_lock:
-            hit2 = self._same_name_cache.get(code)
-            if hit2:
-                return hit2
-            fail_at2 = self._same_name_fail.get(code)
-            if fail_at2 and (now - fail_at2).total_seconds() < 300:
-                return None
-            data = await self._get_zone_json("county", zone_id)
-            if not data:
-                self._same_name_fail[code] = now
-                return None
-            props = data.get("properties") if isinstance(data.get("properties"), dict) else {}
-            name = str(props.get("name") or "").strip()
-            state = str(props.get("state") or st or "").strip().upper()
-            if not name:
-                self._same_name_fail[code] = now
-                return None
-            label = f"{name}, {state}" if state else name
-            self._same_name_cache[code] = label
-            return label
+        return await self.targeting._same6_area_label(same6)
+
 
     async def _sf_area_text_from_same_codes(self, same_codes: list[str]) -> str:
-        """Resolve SAME codes to a '; '-joined area label string for station feed ERN items."""
-        if _APP_CFG is not None and not _APP_CFG.station_feed.ern_area_names:
-            return ""
-        if _APP_CFG is None:
-            return ""
-        codes = [str(x).strip() for x in (same_codes or []) if str(x).strip()]
-        if not codes:
-            return ""
-        results = await asyncio.gather(*(self._same6_area_label(c) for c in codes), return_exceptions=True)
-        out: list[str] = []
-        seen: set[str] = set()
-        for r in results:
-            if isinstance(r, Exception) or not r:
-                continue
-            s = str(r).strip()
-            if not s or s in seen:
-                continue
-            seen.add(s)
-            out.append(s)
-        return "; ".join(out)
+        return await self.targeting._sf_area_text_from_same_codes(same_codes)
+
 
     # ---- ZoneCounty crosswalk (NOAA/NWS recommended: zone -> county FIPS -> SAME) ----
     def _zonecounty_enabled(self) -> bool:
-        return self.cfg.zonecounty.enabled
+        return self.targeting._zonecounty_enabled()
+
 
     def _zonecounty_dbx_url(self) -> str:
-        return self.cfg.zonecounty.dbx_url.strip()
+        return self.targeting._zonecounty_dbx_url()
+
 
     def _zonecounty_cache_days(self) -> int:
-        return self.cfg.zonecounty.cache_days
+        return self.targeting._zonecounty_cache_days()
+
 
     def _zonecounty_dbx_path(self) -> Path:
-        _, _audio, cache_dir, _logs = self._paths()
-        return cache_dir / "zonecounty.dbx"
+        return self.targeting._zonecounty_dbx_path()
+
 
     async def _ensure_zonecounty_loaded(self) -> None:
-        # ZONECOUNTY_DBX_DISCOVERY_PATCH_v1
-        # Hard rule: never delete the last-known-good DBX on a failed refresh.
-        if self._zonecounty_loaded:
-            return
+        await self.targeting._ensure_zonecounty_loaded()
 
-        async with self._zonecounty_lock:
-            if self._zonecounty_loaded:
-                return
-
-            if not self._zonecounty_enabled():
-                self._zonecounty_loaded = True
-                return
-
-            dbx_path = self._zonecounty_dbx_path()
-            dbx_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = dbx_path.with_suffix(".tmp")
-            lastgood_path = dbx_path.with_suffix(".lastgood")
-
-            url = (self._zonecounty_dbx_url() or "").strip()
-            max_age_days = max(1, int(self._zonecounty_cache_days()))
-            now = dt.datetime.now(tz=self._tz)
-
-            def _cache_is_fresh() -> bool:
-                if not dbx_path.exists():
-                    return False
-                try:
-                    mtime = dt.datetime.fromtimestamp(dbx_path.stat().st_mtime, tz=self._tz)
-                    age_s = (now - mtime).total_seconds()
-                    return age_s <= (max_age_days * 86400) and dbx_path.stat().st_size > 1024
-                except Exception:
-                    return False
-
-            async def _try_fetch(candidate_url: str) -> dict[str, list[str]] | None:
-                try:
-                    client = await self._ensure_zone_client()  # reuse UA/timeouts/headers
-                    r = await client.get(candidate_url)
-                    if r.status_code != 200 or not r.content or len(r.content) <= 1024:
-                        log.warning(
-                            "ZoneCounty DBX fetch failed (status=%s url=%s).",
-                            r.status_code,
-                            candidate_url,
-                        )
-                        return None
-
-                    # Write to temp then validate by parsing.
-                    tmp_path.write_bytes(r.content)
-                    parsed = await asyncio.to_thread(_ugc.parse_zonecounty_dbx, tmp_path)
-
-                    if not parsed:
-                        log.warning("ZoneCounty DBX candidate parsed 0 zones (url=%s).", candidate_url)
-                        try:
-                            tmp_path.unlink(missing_ok=True)
-                        except Exception:
-                            pass
-                        return None
-
-                    # Backup lastgood and atomically replace.
-                    if dbx_path.exists():
-                        try:
-                            shutil.copy2(dbx_path, lastgood_path)
-                        except Exception:
-                            log.warning("ZoneCounty lastgood backup failed (file=%s).", dbx_path)
-
-                    os.replace(str(tmp_path), str(dbx_path))
-                    log.info("ZoneCounty DBX refreshed: %s (%d bytes) src=%s", dbx_path, len(r.content), candidate_url)
-                    return parsed
-                except Exception:
-                    log.exception("ZoneCounty DBX download/validate failed (url=%s).", candidate_url)
-                    return None
-
-            # If cache is fresh, just load it and bail early.
-            if _cache_is_fresh():
-                try:
-                    self._zonecounty_map = await asyncio.to_thread(_ugc.parse_zonecounty_dbx, dbx_path)
-                    log.info("ZoneCounty loaded: zones=%d file=%s", len(self._zonecounty_map), dbx_path)
-                except Exception:
-                    log.exception("ZoneCounty parse failed; disabling ZoneCounty mapping for this run")
-                    self._zonecounty_map = {}
-                self._zonecounty_loaded = True
-                return
-
-            # Refresh path: try explicit URL first (unless 'auto'), then discover from index page.
-            updated_map: dict[str, list[str]] | None = None
-
-            if url and url.lower() != "auto":
-                updated_map = await _try_fetch(url)
-
-            if updated_map is None:
-                # Discovery: scrape https://www.weather.gov/gis/ZoneCounty for bp*.dbx tokens.
-                index_url = (self.cfg.zonecounty.index_url or "").strip()
-                base_url = (self.cfg.zonecounty.base_url or "").strip()
-                if base_url and not base_url.endswith("/"):
-                    base_url += "/"
-
-                token_re = re.compile(r"\bbp\d{2}[a-z]{2}\d{2}\.dbx\b", re.IGNORECASE)
-                mon_map = {
-                    "ja": 1, "fe": 2, "mr": 3, "ap": 4, "my": 5, "jn": 6,
-                    "jl": 7, "au": 8, "se": 9, "oc": 10, "no": 11, "de": 12,
-                }
-
-                def tok_key(tok: str) -> tuple[int, int, int]:
-                    # bp18mr25.dbx -> (2025, 3, 18)
-                    try:
-                        t = tok.lower()
-                        dd = int(t[2:4])
-                        mm = mon_map.get(t[4:6], 0)
-                        yy = 2000 + int(t[6:8])
-                        return (yy, mm, dd)
-                    except Exception:
-                        return (0, 0, 0)
-
-                try:
-                    client = await self._ensure_zone_client()
-                    r = await client.get(index_url)
-                    if r.status_code == 200 and r.text:
-                        toks = sorted({m.group(0).lower() for m in token_re.finditer(r.text)}, key=tok_key, reverse=True)
-                        # Try newest-first; cap tries to avoid hammering.
-                        for tok in toks[:20]:
-                            cand = base_url + tok
-                            updated_map = await _try_fetch(cand)
-                            if updated_map is not None:
-                                break
-                    else:
-                        log.warning("ZoneCounty discovery fetch failed (status=%s url=%s).", r.status_code, index_url)
-                except Exception:
-                    log.exception("ZoneCounty discovery failed (index_url=%s).", index_url)
-
-            # Load from updated_map if we refreshed successfully, otherwise fall back to existing cache.
-            if updated_map is not None:
-                self._zonecounty_map = updated_map
-                self._zonecounty_loaded = True
-                return
-
-            if not dbx_path.exists():
-                log.warning("ZoneCounty DBX not available (no cache file). Zone->SAME mapping will be unavailable.")
-                self._zonecounty_loaded = True
-                self._zonecounty_map = {}
-                return
-
-            try:
-                self._zonecounty_map = await asyncio.to_thread(_ugc.parse_zonecounty_dbx, dbx_path)
-                log.info("ZoneCounty loaded: zones=%d file=%s", len(self._zonecounty_map), dbx_path)
-            except Exception:
-                log.exception("ZoneCounty parse failed; disabling ZoneCounty mapping for this run")
-                self._zonecounty_map = {}
-
-            self._zonecounty_loaded = True
 
     def _mareas_enabled(self) -> bool:
-        return self.cfg.mareas.enabled
+        return self.targeting._mareas_enabled()
+
 
     def _mareas_url(self) -> str:
-        """Optional URL for a mareas*.txt style crosswalk."""
-        return self.cfg.mareas.url.strip()
+        return self.targeting._mareas_url()
+
 
     def _mareas_cache_days(self) -> int:
-        return self.cfg.mareas.cache_days
+        return self.targeting._mareas_cache_days()
+
 
     def _mareas_path(self) -> Path:
-        _, _audio, cache_dir, _logs = self._paths()
-        return cache_dir / "mareas.txt"
+        return self.targeting._mareas_path()
+
 
     async def _ensure_mareas_loaded(self) -> None:
-        if self._mareas_loaded:
-            return
+        await self.targeting._ensure_mareas_loaded()
 
-        async with self._mareas_lock:
-            if self._mareas_loaded:
-                return
-
-            if not self._mareas_enabled():
-                self._mareas_loaded = True
-                self._mareas_map = {}
-                return
-
-            path = self._mareas_path()
-            path.parent.mkdir(parents=True, exist_ok=True)
-
-            url = self._mareas_url()
-            max_age_days = max(1, int(self._mareas_cache_days()))
-            now = dt.datetime.now(tz=self._tz)
-
-            need_download = True
-            if path.exists():
-                try:
-                    mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=self._tz)
-                    need_download = (now - mtime).total_seconds() > (max_age_days * 86400)
-                except Exception:
-                    need_download = True
-
-            if url and need_download:
-                try:
-                    client = await self._ensure_zone_client()
-                    r = await client.get(url)
-                    if r.status_code == 200 and r.content and len(r.content) > 256:
-                        tmp = path.with_suffix(".tmp")
-                        tmp.write_bytes(r.content)
-                        tmp.replace(path)
-                        log.info("Marine areas .txt database refreshed: %s (%d bytes)", path, len(r.content))
-                    else:
-                        log.warning("Marine areas .txt database fetch failed (status=%s). Using cache if present.", r.status_code)
-                except Exception:
-                    log.exception("Marine areas .txt database download failed; using cache if present")
-
-            if not path.exists():
-                log.info("Marine areas .txt database not available (no cache file). Marine zone->SAME mapping unavailable.")
-                self._mareas_loaded = True
-                self._mareas_map = {}
-                return
-
-            try:
-                self._mareas_map = await asyncio.to_thread(_ugc.parse_mareas_txt, path)
-                log.info("Marine areas loaded: zones=%d file=%s", len(self._mareas_map), path)
-            except Exception:
-                log.exception("Marine areas parse failed; disabling marine mapping for this run")
-                self._mareas_map = {}
-
-            self._mareas_loaded = True
     async def _ensure_zone_client(self) -> httpx.AsyncClient:
-        if self._zone_client is not None:
-            return self._zone_client
+        return await self.targeting._ensure_zone_client()
 
-        # Use an explicit UA for NWS (required by their policy).
-        ua = (self.cfg.nws.user_agent or "").strip()
-        if not ua:
-            ua = (self.cfg.cap.user_agent or "").strip()
-        if not ua:
-            ua = "SeasonalWeather (NWS zone mapper)"
-
-        self._zone_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(15.0, connect=8.0),
-            headers={
-                "User-Agent": ua,
-                "Accept": "application/geo+json, application/json;q=0.9, */*;q=0.8",
-            },
-        )
-        return self._zone_client
 
     async def _get_zone_json(self, zone_type: str, zone_id: str) -> dict | None:
-        """
-        Fetch https://api.weather.gov/zones/<zone_type>/<zone_id>
-        Returns parsed JSON dict on success, else None.
-        """
-        zt = (zone_type or "").strip().lower()
-        zid = (zone_id or "").strip().upper()
-        if not zt or not zid:
-            return None
+        return await self.targeting._get_zone_json(zone_type, zone_id)
 
-        url = f"https://api.weather.gov/zones/{zt}/{zid}"
-        client = await self._ensure_zone_client()
-
-        try:
-            r = await client.get(url)
-            if r.status_code != 200:
-                return None
-            return r.json()
-        except Exception:
-            return None
 
     def _same_list_from_zone_json(self, data: dict) -> list[str]:
-        """
-        Prefer geocode.SAME if present. Otherwise, fall back to parsing county URLs.
-        """
-        if not isinstance(data, dict):
-            return []
-        props = data.get("properties") if isinstance(data.get("properties"), dict) else {}
-        geo = props.get("geocode") if isinstance(props.get("geocode"), dict) else {}
+        return self.targeting._same_list_from_zone_json(data)
 
-        same_vals = geo.get("SAME") if isinstance(geo.get("SAME"), (list, tuple)) else None
-        out: list[str] = []
-        seen: set[str] = set()
-
-        def add_same(x: str) -> None:
-            s = "".join(ch for ch in str(x).strip() if ch.isdigit())
-            if not s:
-                return
-            # SAME codes are 6 digits; some sources omit leading zero. Pad-left.
-            if len(s) < 6:
-                s = s.zfill(6)
-            if len(s) != 6:
-                return
-            if s in seen:
-                return
-            seen.add(s)
-            out.append(s)
-
-        if same_vals:
-            for x in same_vals:
-                add_same(str(x))
-            return out
-
-        # Fall back: if this forecast zone has "county" URLs, parse their IDs like "MDC031"
-        counties = props.get("county")
-        if isinstance(counties, str):
-            counties = [counties]
-        if isinstance(counties, (list, tuple)):
-            for u in counties:
-                cid = str(u).strip().rstrip("/").split("/")[-1].upper()
-                m = re.fullmatch(r"([A-Z]{2})C(\d{3})", cid)
-                if not m:
-                    continue
-                same = self._same_from_state_county(m.group(1), m.group(2))
-                if same:
-                    add_same(same)
-
-        return out
 
     async def _ugc_zone_to_same(self, zone_id: str) -> list[str]:
-        """
-        Map a UGC zone token (e.g., MDZ008, PAC021, ANZ530) to SAME county/marine codes.
-        Uses:
-          - direct conversion for XXC### when possible
-          - NWS zone endpoints for others, preferring geocode.SAME
-        """
-        zid = (zone_id or "").strip().upper()
-        if not zid:
-            return []
+        return await self.targeting._ugc_zone_to_same(zone_id)
 
-        # Cache
-        if zid in self._zone_cache_same:
-            return list(self._zone_cache_same[zid])
 
-        # short-term backoff for repeated failures (prevents hammering)
-        fail_ts = self._zone_cache_fail.get(zid)
-        if fail_ts and (dt.datetime.now(tz=self._tz) - fail_ts).total_seconds() < 300:
-            return []
+    async def _nwws_same_targets_from_texts(
+        self,
+        primary_text: str,
+        secondary_text: str,
+    ) -> tuple[list[str], list[str], str, bool, "dt.datetime | None"]:
+        return await self.targeting._nwws_same_targets_from_texts(primary_text, secondary_text)
 
-        # Direct county-zone conversion: "PAC021" etc.
-        m_direct = re.fullmatch(r"([A-Z]{2})C(\d{3})", zid)
-        if m_direct:
-            same = self._same_from_state_county(m_direct.group(1), m_direct.group(2))
-            if same:
-                self._zone_cache_same[zid] = [same]
-                return [same]
-
-        # Forecast/public zones: use ZoneCounty DBX crosswalk first (NOAA/NWS recommended).
-        if re.fullmatch(r"[A-Z]{2}Z\d{3}", zid):
-            try:
-                await self._ensure_zonecounty_loaded()
-                lst = self._zonecounty_map.get(zid)
-                if lst:
-                    self._zone_cache_same[zid] = list(lst)
-                    return list(lst)
-            except Exception:
-                pass
-
-        
-
-        # Marine zones: try mareas crosswalk (ANZ/AMZ/GMZ/LMZ/PZZ/etc)
-        if re.fullmatch(r"[A-Z]{3}\d{3}", zid):
-            try:
-                await self._ensure_mareas_loaded()
-                lst2 = self._mareas_map.get(zid)
-                if lst2:
-                    self._zone_cache_same[zid] = list(lst2)
-                    return list(lst2)
-            except Exception:
-                pass
-# Otherwise, ask NWS API. Most UGC tokens are forecast zones; marine ones might be under "marine".
-        # We try a small ordered list.
-        async with self._zone_lock:
-            # Check again after acquiring lock (double-checked caching)
-            if zid in self._zone_cache_same:
-                return list(self._zone_cache_same[zid])
-
-            types_to_try = ["forecast", "public", "marine", "fire", "offshore"]
-            data: dict | None = None
-            for zt in types_to_try:
-                data = await self._get_zone_json(zt, zid)
-                if data:
-                    break
-
-            if not data:
-                self._zone_cache_fail[zid] = dt.datetime.now(tz=self._tz)
-                return []
-
-            same_list = self._same_list_from_zone_json(data)
-            if same_list:
-                self._zone_cache_same[zid] = list(same_list)
-                return list(same_list)
-
-            # If no SAME codes could be derived, treat as failure but don't spam retries.
-            self._zone_cache_fail[zid] = dt.datetime.now(tz=self._tz)
-            return []
-
-    async def _nwws_same_targets_from_texts(self, primary_text: str, secondary_text: str) -> tuple[list[str], list[str], str, bool, "dt.datetime | None"]:
-        """
-        Returns:
-          zones_found, in_area_same, source_label, mapping_success, ugc_expires_utc
-        mapping_success indicates we successfully derived at least one SAME from zones.
-        ugc_expires_utc is the product's UGC expiry as an aware UTC datetime, or None.
-        """
-        zones = _ugc.extract_ugc_zones(primary_text)
-        src = "raw"
-        if not zones:
-            zones = _ugc.extract_ugc_zones(secondary_text)
-            src = "official" if zones else "none"
-
-        # Capture UGC expiry for downstream use (AlertTracker, cycle scheduling).
-        # parse_ugc_block tries primary text first, falls back to secondary.
-        _ugc_blk = _ugc.parse_ugc_block(primary_text or secondary_text or "")
-        ugc_expires_utc: dt.datetime | None = _ugc_blk.expires_utc if _ugc_blk else None
-
-        if not zones:
-            return ([], [], src, False, ugc_expires_utc)
-
-        # Map zones -> SAME
-        all_same: list[str] = []
-        any_mapped = False
-        for z in zones[:250]:  # safety cap
-            sames = await self._ugc_zone_to_same(z)
-            if sames:
-                any_mapped = True
-                all_same.extend(sames)
-
-        # De-dupe while preserving order
-        dedup: list[str] = []
-        seen: set[str] = set()
-        for s in all_same:
-            s2 = str(s).strip()
-            if not s2 or s2 in seen:
-                continue
-            seen.add(s2)
-            dedup.append(s2)
-
-        in_area = self._filter_same_locations_to_service_area(dedup)
-        return (zones, in_area, src, any_mapped, ugc_expires_utc)
 
     async def _nwws_wcn_watch_same_targets_from_area_desc(self, official_text: str) -> list[str]:
-        """
-        Derive in-area SAME codes for WCN watch products that lack a UGC block.
+        return await self.targeting._nwws_wcn_watch_same_targets_from_area_desc(official_text)
 
-        Some NWWS WCN watch county notifications carry clean county/state body
-        text but no UGC county-zone line.  We only need to recover the local
-        service-area intersection for SAME tone generation, so resolve configured
-        SAME codes to county labels and match those labels against the WCN area
-        block.
-        """
-        area_desc = _extract_nwws_wcn_area_desc(official_text or "")
-        if not area_desc:
-            return []
-
-        candidates = [str(x).strip() for x in (self.cfg.service_area.same_fips_all or []) if str(x).strip()]
-        # Statewide/wildcard SAME entries cannot be matched to specific WCN counties.
-        candidates = [c for c in candidates if re.fullmatch(r"\d{6}", c) and not c.endswith("000")]
-        if not candidates:
-            return []
-
-        labels = await asyncio.gather(*(self._same6_area_label(c) for c in candidates), return_exceptions=True)
-        label_by_code: dict[str, str] = {}
-        for code, label in zip(candidates, labels):
-            if isinstance(label, Exception) or not label:
-                continue
-            label_by_code[str(code).strip()] = str(label).strip()
-
-        matched = _match_nwws_wcn_area_same(area_desc, label_by_code)
-        return self._filter_same_locations_to_service_area(matched)
 
 
     # ---- Rebroadcast rotation (no re-tone) ----
@@ -3509,16 +1572,14 @@ class Orchestrator:
             pass
 
         try:
-            _sf_restored_file = _sf_seed_memory_from_payload_file()
             _sf_restored_tracker = self._station_feed_seed_from_alert_tracker()
-            if (_sf_restored_file or _sf_restored_tracker) and _sf_enabled():
-                _sf_try_write(time.time(), context="startup restore")
+            if _sf_restored_tracker and _sf_enabled():
                 log.info(
-                    "Station feed: restored %d alerts from handled-alerts.json and %d from AlertTracker on startup",
-                    _sf_restored_file, _sf_restored_tracker,
+                    "Station feed: restored %d alerts from AlertTracker into SQLite read model on startup",
+                    _sf_restored_tracker,
                 )
         except Exception:
-            log.exception("Station feed: startup restore from disk/tracker failed")
+            log.exception("Station feed: startup restore from tracker failed")
 
         tasks: list[asyncio.Task] = []
 
@@ -4655,278 +2716,25 @@ class Orchestrator:
             raise
 
     def _clean_cap_text(self, s: str, *, limit: int = 900) -> str:
-        """Shim → product_text.clean_cap_text()."""
-        return _pt_clean_cap_text(s, limit=limit)
+        return self.cap_text._clean_cap_text(s, limit=limit)
 
 
     def _build_cap_watch_script(self, ev: "CapAlertEvent", *, mode: str = "full") -> str:  # type: ignore[name-defined]
-        """
-        Build a sane, NWR-style script for CAP Tornado Watch / Severe Thunderstorm Watch.
-        Returns "" if this CAP event is not a watch.
-
-        Why: CAP watch descriptions are often all-caps blobs with little punctuation,
-        which TTS will speed-read. NWR uses a standardized narration instead.
-        """
-        # ---- Determine watch kind (prefer event label, fall back to VTEC) ----
-        kind: str | None = None  # "tornado" or "severe"
-        ev_name = (getattr(ev, "event", "") or "").strip().lower()
-
-        if ev_name == "tornado watch":
-            kind = "tornado"
-        elif ev_name == "severe thunderstorm watch":
-            kind = "severe"
-        else:
-            # Fall back to VTEC phen/sig
-            for v in self._cap_vtec_list(ev):
-                m = _VTEC_PARSE_RE.search(v)
-                if not m:
-                    continue
-                phen = (m.group("phen") or "").upper()
-                sig = (m.group("sig") or "").upper()
-                if sig != "A":
-                    continue
-                if phen == "TO":
-                    kind = "tornado"
-                    break
-                if phen == "SV":
-                    kind = "severe"
-                    break
-
-        if not kind:
-            return ""
-
-        # ---- Helpers ----
-        def _parse_vtec_z(tok: str):
-            # tok like YYYYMMDDT0000Z or YYMMDDT0000Z
-            s = (tok or "").strip().upper()
-            mm = re.fullmatch(r"(\d{8}|\d{6})T(\d{4})Z", s)
-            if not mm:
-                return None
-            d = mm.group(1)
-            hm = mm.group(2)
-            if len(d) == 8:
-                year = int(d[0:4]); month = int(d[4:6]); day = int(d[6:8])
-            else:
-                year = 2000 + int(d[0:2]); month = int(d[2:4]); day = int(d[4:6])
-            hour = int(hm[0:2]); minute = int(hm[2:4])
-            try:
-                return dt.datetime(year, month, day, hour, minute, tzinfo=dt.timezone.utc)
-            except Exception:
-                return None
-
-        def _fmt_time_local(d: dt.datetime) -> str:
-            # "8 PM" or "8:30 PM"
-            hour12 = d.hour % 12
-            if hour12 == 0:
-                hour12 = 12
-            ampm = "AM" if d.hour < 12 else "PM"
-            if d.minute == 0:
-                return f"{hour12} {ampm}"
-            return f"{hour12}:{d.minute:02d} {ampm}"
-
-        def _daypart(d: dt.datetime) -> str:
-            # rough-but-good NWR-ish phrasing
-            if d.hour < 12:
-                return "morning"
-            if d.hour < 17:
-                return "afternoon"
-            if d.hour < 21:
-                return "evening"
-            return "tonight"
-
-        def _until_phrase(end_local: dt.datetime) -> str:
-            now_local = dt.datetime.now(tz=self._tz)
-            t = _fmt_time_local(end_local)
-            dp = _daypart(end_local)
-
-            if end_local.date() == now_local.date():
-                if dp == "tonight":
-                    return f"until {t} tonight"
-                return f"until {t} this {dp}"
-
-            if (end_local.date() - now_local.date()).days == 1:
-                if dp == "tonight":
-                    return f"until {t} tomorrow night"
-                return f"until {t} tomorrow {dp}"
-
-            # fallback: weekday
-            wd = end_local.strftime("%A")
-            return f"until {t} on {wd}"
-
-        def _join_oxford(items: list[str]) -> str:
-            xs = [x.strip() for x in items if x and x.strip()]
-            if not xs:
-                return ""
-            if len(xs) == 1:
-                return xs[0]
-            if len(xs) == 2:
-                return f"{xs[0]} and {xs[1]}"
-            return ", ".join(xs[:-1]) + f", and {xs[-1]}"
-
-        STATE_NAME = {
-            "AL":"Alabama","AK":"Alaska","AZ":"Arizona","AR":"Arkansas","CA":"California","CO":"Colorado","CT":"Connecticut",
-            "DE":"Delaware","DC":"the District of Columbia","FL":"Florida","GA":"Georgia","HI":"Hawaii","ID":"Idaho","IL":"Illinois",
-            "IN":"Indiana","IA":"Iowa","KS":"Kansas","KY":"Kentucky","LA":"Louisiana","ME":"Maine","MD":"Maryland","MA":"Massachusetts",
-            "MI":"Michigan","MN":"Minnesota","MS":"Mississippi","MO":"Missouri","MT":"Montana","NE":"Nebraska","NV":"Nevada","NH":"New Hampshire",
-            "NJ":"New Jersey","NM":"New Mexico","NY":"New York","NC":"North Carolina","ND":"North Dakota","OH":"Ohio","OK":"Oklahoma","OR":"Oregon",
-            "PA":"Pennsylvania","RI":"Rhode Island","SC":"South Carolina","SD":"South Dakota","TN":"Tennessee","TX":"Texas","UT":"Utah","VT":"Vermont",
-            "VA":"Virginia","WA":"Washington","WV":"West Virginia","WI":"Wisconsin","WY":"Wyoming",
-        }
-
-        # ---- Extract watch number + end time from VTEC ----
-        watch_num: int | None = None
-        end_utc: dt.datetime | None = None
-
-        for v in self._cap_vtec_list(ev):
-            m = _VTEC_PARSE_RE.search(v)
-            if not m:
-                continue
-            phen = (m.group("phen") or "").upper()
-            sig = (m.group("sig") or "").upper()
-            if sig != "A":
-                continue
-            if kind == "tornado" and phen != "TO":
-                continue
-            if kind == "severe" and phen != "SV":
-                continue
-
-            try:
-                watch_num = int(m.group("etn"))
-            except Exception:
-                watch_num = None
-
-            end_utc = _parse_vtec_z(m.group("end") or "")
-            break
-
-        end_phrase = ""
-        if end_utc is not None:
-            end_local = end_utc.astimezone(self._tz)
-            end_phrase = _until_phrase(end_local)
-
-        # ---- Parse counties/states from CAP areaDesc ----
-        area_desc = (getattr(ev, "area_desc", "") or "").strip()
-        # CAP areaDesc often: "Cambria, PA; Cameron, PA; ..."
-        groups: dict[str, list[str]] = {}
-        order: list[str] = []
-        misc: list[str] = []
-
-        for raw in re.split(r";\s*", area_desc):
-            s = (raw or "").strip().strip(".")
-            if not s:
-                continue
-            if "," in s:
-                name, st = s.rsplit(",", 1)
-                name = name.strip()
-                st = st.strip().upper()
-                if st not in groups:
-                    groups[st] = []
-                    order.append(st)
-                groups[st].append(name)
-            else:
-                misc.append(s)
-
-        # ---- Boilerplate ----
-        if kind == "tornado":
-            watch_label = "Tornado Watch"
-            remember = (
-                "Remember, a tornado watch means that conditions are favorable for the development of severe weather, "
-                "including tornadoes, large hail, and damaging winds, in and close to the watch area. "
-                "While severe weather may not be imminent, persons should remain alert for rapidly changing weather conditions, "
-                "and listen for later statements and possible warnings."
-            )
-        else:
-            watch_label = "Severe Thunderstorm Watch"
-            remember = (
-                "Remember, a severe thunderstorm watch means that conditions are favorable for the development of severe weather, "
-                "including large hail and damaging winds, in and close to the watch area. "
-                "While severe weather may not be imminent, persons should remain alert for rapidly changing weather conditions, "
-                "and listen for later statements and possible warnings."
-            )
-
-        stay_tuned = (
-            "Stay tuned to NOAA Weather Radio, commercial radio, and television outlets, "
-            "or internet sources for the latest severe weather information."
-        )
-
-        # ---- Build script ----
-        lines: list[str] = []
-
-        if watch_num is not None:
-            lines.append(f"The National Weather Service has issued {watch_label} Number {watch_num}.")
-        else:
-            lines.append(f"The National Weather Service has issued {watch_label}.")
-
-        if end_phrase:
-            lines.append(f"Effective {end_phrase}.")
-
-        if groups:
-            if len(order) == 1:
-                st = order[0]
-                st_full = STATE_NAME.get(st, st)
-                county_list = _join_oxford(groups.get(st, []))
-                if county_list:
-                    lines.append(f"This watch includes the following counties, in {st_full}: {county_list}.")
-            else:
-                segs: list[str] = []
-                for st in order:
-                    st_full = STATE_NAME.get(st, st)
-                    county_list = _join_oxford(groups.get(st, []))
-                    if county_list:
-                        segs.append(f"in {st_full}: {county_list}")
-                if segs:
-                    lines.append("This watch includes the following counties: " + "; ".join(segs) + ".")
-        elif area_desc:
-            # fallback if parsing fails
-            lines.append(f"This watch includes the following areas: {area_desc}.")
-
-        # If CAP areaDesc was empty but we have leftovers
-        if misc and not groups:
-            lines.append("This watch includes: " + _join_oxford(misc) + ".")
-
-        lines.append(remember)
-        lines.append(stay_tuned)
-
-        # Keep SeasonalWeather’s usual closer (optional, but consistent)
-        if mode == "full":
-            lines.append("End of message.")
-
-        # Double-newlines => better pacing
-        return "\n\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
+        return self.cap_text._build_cap_watch_script(ev, mode=mode)
 
 
     # ------------------------------------------------------------------ #
     #  VTEC-action script builders (NWR-style update/cancel narration)    #
     # ------------------------------------------------------------------ #
 
-    # _STATE_NAME_FULL moved to product_text.STATE_NAME_FULL
-    _STATE_NAME_FULL: dict[str, str] = _STATE_NAME_FULL_MAP
-
     def _parse_cap_area_by_state(self, area_desc: str) -> tuple[dict[str, list[str]], list[str], list[str]]:
-        """Shim → product_text.parse_cap_area_by_state()."""
-        return _pt_parse_cap_area_by_state(area_desc)
+        return self.cap_text._parse_cap_area_by_state(area_desc)
 
     def _join_oxford(self, items: list[str]) -> str:
-        """Shim → product_text.join_oxford()."""
-        return _pt_join_oxford(items)
+        return self.cap_text._join_oxford(items)
 
     def _fmt_local_from_utc_iso(self, iso_str: str) -> str:
-        """Parse an ISO-8601 UTC string and return a human-friendly local time phrase."""
-        s = (iso_str or "").strip()
-        if not s:
-            return ""
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        try:
-            utc_dt = dt.datetime.fromisoformat(s)
-            local_dt = utc_dt.astimezone(self._tz)
-            hour12 = local_dt.hour % 12 or 12
-            ampm = "AM" if local_dt.hour < 12 else "PM"
-            tz_name = _expand_tz_token(local_dt.strftime("%Z"))
-            if local_dt.minute == 0:
-                return f"{hour12} {ampm} {tz_name}"
-            return f"{hour12}:{local_dt.minute:02d} {ampm} {tz_name}"
-        except Exception:
-            return ""
+        return self.cap_text._fmt_local_from_utc_iso(iso)
 
     def _alert_tracker_id_for_cap(self, ev: "CapAlertEvent", same_code: str) -> str:  # type: ignore[name-defined]
         """
@@ -4996,12 +2804,10 @@ class Orchestrator:
             return 0
 
     def _cap_prefers_statement_update_script(self, event: str, vtec_actions: set[str]) -> bool:
-        """Shim → product_text.cap_prefers_statement_update_script()."""
-        return _cap_prefers_statement_update_script_fn(event, vtec_actions)
+        return self.cap_text._cap_prefers_statement_update_script(event, vtec_actions)
 
     def _cap_expiry_summary_line(self, text: str) -> str:
-        """Shim → product_text.cap_expiry_summary_line()."""
-        return _cap_expiry_summary_line(text)
+        return self.cap_text._cap_expiry_summary_line(text)
 
     def _build_statement_vtec_action_script(
         self,
@@ -5009,17 +2815,10 @@ class Orchestrator:
         vtec_actions: set[str],
         tracks: list[tuple[str, str]],
     ) -> str:
-        """Shim → product_text.build_statement_vtec_action_script()."""
-        return _build_statement_vtec_action_script_fn(
-            event=getattr(ev, "event", "") or "",
-            area_desc=(getattr(ev, "area_desc", "") or "").strip(),
-            description=str(getattr(ev, "description", "") or "").strip(),
-            headline=str(getattr(ev, "headline", "") or "").strip(),
-            vtec=self._cap_vtec_list(ev),
+        return self.cap_text._build_statement_vtec_action_script(
+            ev,
             vtec_actions=vtec_actions,
-            parameters=getattr(ev, "parameters", {}) or {},
-            sps_preamble=self._cap_sps_preamble,
-            sent_iso=getattr(ev, "sent", None),
+            tracks=tracks,
         )
 
     def _build_warning_vtec_action_script(
@@ -5028,30 +2827,11 @@ class Orchestrator:
         vtec_actions: set[str],
         tracks: list[tuple[str, str]],
     ) -> str:
-        """Shim → product_text.build_warning_vtec_action_script()."""
-        vtec = self._cap_vtec_list(ev)
-        exp_utc = self._best_expiry_from_vtec(vtec)
-        exp_phrase = ""
-        if exp_utc:
-            exp_phrase = self._fmt_local_from_utc_iso(exp_utc.isoformat())
-        if not exp_phrase:
-            raw_exp = getattr(ev, "expires", None)
-            if raw_exp:
-                exp_phrase = self._fmt_local_from_utc_iso(str(raw_exp))
-
-        result = _build_warning_vtec_action_script_fn(
-            event=getattr(ev, "event", "") or "",
-            headline=getattr(ev, "headline", "") or "",
-            description=str(getattr(ev, "description", "") or ""),
-            instruction=str(getattr(ev, "instruction", "") or ""),
-            area_desc=(getattr(ev, "area_desc", "") or "").strip(),
+        return self.cap_text._build_warning_vtec_action_script(
+            ev,
             vtec_actions=vtec_actions,
-            exp_phrase=exp_phrase,
+            tracks=tracks,
         )
-        # If the free function produced nothing, fall through to the full script.
-        if not result or result.strip() == "End of message.":
-            return self._build_cap_full_script(ev)
-        return result
 
     def _build_watch_vtec_action_script(
         self,
@@ -5059,184 +2839,24 @@ class Orchestrator:
         vtec_actions: set[str],
         tracks: list[tuple[str, str]],
         watch_number: int | None,
-        kind: str,  # "tornado" or "severe"
+        kind: str,
     ) -> str:
-        """
-        NWR-style voice script for VTEC update/cancel actions on watches (TOA/SVA).
-
-        CON      → "Watch Number N remains in effect until …"
-        EXA      → "Watch Number N remains in effect until … and now includes …"
-        CAN      → "Watch Number N has been cancelled for … in …"
-        EXP      → "Watch Number N has been allowed to expire for … in …"
-        """
-        watch_label = "Tornado Watch" if kind == "tornado" else "Severe Thunderstorm Watch"
-        num_phrase = f"Number {watch_number}" if watch_number is not None else ""
-        label_with_num = f"{watch_label} {num_phrase}".strip()
-
-        area_desc = (getattr(ev, "area_desc", "") or "").strip()
-        groups, order, misc = self._parse_cap_area_by_state(area_desc)
-
-        vtec = self._cap_vtec_list(ev)
-        exp_utc = self._best_expiry_from_vtec(vtec)
-        exp_phrase = ""
-        if exp_utc:
-            exp_phrase = self._fmt_local_from_utc_iso(exp_utc.isoformat())
-        if not exp_phrase:
-            raw_exp = getattr(ev, "expires", None)
-            if raw_exp:
-                exp_phrase = self._fmt_local_from_utc_iso(str(raw_exp))
-
-        def _county_segs() -> str:
-            """Build 'in Maryland: Allegany, Garrett' style phrase."""
-            if not groups:
-                return area_desc or "the affected areas"
-            parts: list[str] = []
-            for st in order:
-                st_full = self._STATE_NAME_FULL.get(st, st)
-                county_list = self._join_oxford(groups[st])
-                if county_list:
-                    parts.append(f"in {st_full}: {county_list}")
-            if parts:
-                return "; ".join(parts)
-            return area_desc or "the affected areas"
-
-        lines: list[str] = []
-
-        if vtec_actions & {"CAN"}:
-            lines.append(f"{label_with_num} has been cancelled for the following areas.")
-            lines.append(_county_segs() + ".")
-
-        elif vtec_actions & {"EXP"}:
-            lines.append(f"{label_with_num} has been allowed to expire for the following areas.")
-            lines.append(_county_segs() + ".")
-
-        elif vtec_actions & {"EXA", "EXB"}:
-            # Watch expansion — also used when area grows mid-event
-            lines.append(f"{label_with_num} remains in effect" + (f" until {exp_phrase}" if exp_phrase else "") + ".")
-            lines.append("This watch now includes the following additional areas.")
-            lines.append(_county_segs() + ".")
-
-        else:  # CON / EXT
-            lines.append(f"{label_with_num} remains in effect" + (f" until {exp_phrase}" if exp_phrase else "") + ".")
-            lines.append(f"This watch includes the following areas: {_county_segs()}.")
-
-        if not lines:
-            return self._build_cap_watch_script(ev, mode="full")
-
-        lines.append("Stay tuned to NOAA Weather Radio, commercial radio, and television outlets for the latest severe weather information.")
-        lines.append("End of message.")
-        return "\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
-
-    def _build_watch_expansion_script(self, ev: "CapAlertEvent") -> str:  # type: ignore[name-defined]
-        """
-        Full NWR-style script for watch EXA/EXB: new SAME tones, full county listing.
-        Expansion is treated as a new issuance for the added counties.
-        """
-        # Determine kind + watch number from VTEC
-        kind = "tornado"
-        watch_number: int | None = None
-        for v in self._cap_vtec_list(ev):
-            m = _VTEC_PARSE_RE.search(v)
-            if not m:
-                continue
-            phen = (m.group("phen") or "").upper()
-            sig = (m.group("sig") or "").upper()
-            if sig != "A":
-                continue
-            if phen == "TO":
-                kind = "tornado"
-            elif phen == "SV":
-                kind = "severe"
-            else:
-                continue
-            try:
-                watch_number = int(m.group("etn"))
-            except Exception:
-                pass
-            break
-
-        tracks = self._vtec_tracks(self._cap_vtec_list(ev))
-        return self._build_watch_vtec_action_script(
+        return self.cap_text._build_watch_vtec_action_script(
             ev,
-            vtec_actions={"EXA"},
+            vtec_actions=vtec_actions,
             tracks=tracks,
             watch_number=watch_number,
             kind=kind,
         )
 
+    def _build_watch_expansion_script(self, ev: "CapAlertEvent") -> str:  # type: ignore[name-defined]
+        return self.cap_text._build_watch_expansion_script(ev)
+
     def _build_cap_full_script(self, ev: "CapAlertEvent") -> str:  # type: ignore[name-defined]
-        event = self._clean_cap_text(ev.event or "", limit=120)
-        desc = self._clean_cap_text(getattr(ev, "description", "") or "", limit=1200)
-        instr = self._clean_cap_text(getattr(ev, "instruction", "") or "", limit=700)
-
-        # Use NWSheadline when the NWS provides one (e.g. area-extension updates
-        # where NWSheadline says "… EXPANDED TO INCLUDE …").
-        # For new-issuance warnings (NEW/UPG), NWSheadline is absent; the
-        # description already contains the full, well-formatted NWS narrative and
-        # is the correct thing to read.  Never use the raw CAP headline field —
-        # it's always the bland "… issued <date> by NWS <office>" string.
-        params = getattr(ev, "parameters", {}) or {}
-
-        lines: list[str] = []
-        opening = _cap_full_opening_line(
-            event=event,
-            sent_iso=getattr(ev, "sent", None),
-            parameters=params,
-            sps_preamble=self._cap_sps_preamble,
-        )
-        if opening:
-            lines.append(opening)
-
-        if desc:
-            lines.append(desc)
-
-        if instr:
-            lines.append("Instructions.")
-            lines.append(instr)
-
-        lines.append("End of message.")
-        return "\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
+        return self.cap_text._build_cap_full_script(ev)
 
     def _build_cap_voice_script(self, ev: "CapAlertEvent") -> str:  # type: ignore[name-defined]
-        event = self._clean_cap_text(ev.event or "", limit=120)
-        area_desc = self._clean_cap_text(getattr(ev, "area_desc", "") or "", limit=400)
-        desc = self._clean_cap_text(getattr(ev, "description", "") or "", limit=900)
-        instr = self._clean_cap_text(getattr(ev, "instruction", "") or "", limit=500)
-
-        # Prefer NWSheadline — the NWR-friendly "in effect until …" line present
-        # in properties.parameters.NWSheadline — over the bland CAP headline field
-        # ("Dense Fog Advisory issued April 2 at 7:44PM EDT … by NWS Baltimore …").
-        params = getattr(ev, "parameters", {}) or {}
-        nws_hl = _cap_normalize_nws_headline(params)
-
-        is_sps = (event or "").strip().lower() == "special weather statement"
-
-        lines: list[str] = []
-        if event:
-            lines.append(
-                _cap_statement_intro(
-                    event=event,
-                    sent_iso=getattr(ev, "sent", None),
-                    sps_preamble=self._cap_sps_preamble,
-                )
-            )
-
-            if not is_sps:
-                # NWSheadline is the concise, human-readable summary (e.g.
-                # "Dense fog advisory in effect until 5 AM EDT Friday").
-                # If absent, fall back to the event name as a plain header.
-                if nws_hl:
-                    lines.append(nws_hl if nws_hl.endswith((".", "!", "?")) else nws_hl + ".")
-                else:
-                    lines.append(f"{event}.")
-
-        if desc:
-            lines.append(desc)
-        if instr:
-            lines.append("Instructions.")
-            lines.append(instr)
-
-        return "\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
+        return self.cap_text._build_cap_voice_script(ev)
 
     async def _render_voice_only_audio(self, script_text: str, *, prefix: str = "capvoice") -> Path:
         _, audio_dir, _, _ = self._paths()
@@ -5259,68 +2879,7 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def _build_ipaws_script(self, ev: "IpawsCapEvent") -> str:  # type: ignore[name-defined]
-        """
-        Build a NWR-style TTS script for an IPAWS civil alert.
-
-        Format mirrors how real NWR handles NWEMs:
-          "The following message is transmitted at the request of [authority].
-          [headline if useful]
-          [description]
-          [instruction, if distinct]
-          End of message."
-
-        The authority line is omitted only when the cleaned senderName is
-        unusable AND no area description is available to anchor it.
-        """
-        authority = (ev.sender_name_clean or "").strip()
-        event = (ev.event or "").strip()
-        headline = (ev.headline or "").strip()
-        description = (ev.description or "").strip()
-        instruction = (ev.instruction or "").strip()
-
-        # Normalize whitespace/newlines that appear in IPAWS description fields.
-        def _norm(s: str, limit: int = 900) -> str:
-            s2 = re.sub(r"[\r\n]+", " ", s)
-            s2 = re.sub(r"\s{2,}", " ", s2).strip()
-            if len(s2) > limit:
-                s2 = s2[:limit].rstrip() + "..."
-            return s2
-
-        description = _norm(description, 900)
-        instruction = _norm(instruction, 600)
-        headline = _norm(headline, 280)
-
-        lines: list[str] = []
-
-        # Preamble line.
-        if authority:
-            lines.append(
-                f"The following message is transmitted at the request of {authority}."
-            )
-        else:
-            # Fallback when senderName is generic or absent.
-            lines.append("The following message is transmitted at the request of local authorities.")
-
-        # Headline — only include when it adds information beyond the event name.
-        # NWS-style "Civil Emergency Message" headlines are redundant; the real
-        # content is in description.  But some senders write a useful summary
-        # (e.g. "Tornado Watch in effect until 10pm for Worth County").
-        hl_lower = headline.lower()
-        ev_lower = event.lower()
-        if headline and hl_lower != ev_lower and not hl_lower.startswith(ev_lower):
-            lines.append(headline if headline.endswith((".", "!", "?")) else headline + ".")
-
-        # Body.
-        if description:
-            lines.append(description)
-
-        # Instruction — skip if it's a verbatim repeat of the description.
-        if instruction and instruction.lower() != description.lower():
-            lines.append("Instructions.")
-            lines.append(instruction)
-
-        lines.append("End of message.")
-        return "\n".join(ln.strip() for ln in lines if ln.strip()).strip()
+        return build_ipaws_script(ev)
 
     async def _air_ipaws_full(self, ev: "IpawsCapEvent") -> None:  # type: ignore[name-defined]
         """

@@ -526,7 +526,6 @@ class StationFeedHousekeepingConfig:
     enabled: bool
     interval_sec: int
     grace_sec: int
-    keep_unparseable: bool
     housekeep_seconds: int
 
 
@@ -539,12 +538,10 @@ class StationFeedNwwsConfig:
 @dataclass(frozen=True)
 class StationFeedConfig:
     enabled: bool
-    path: str
     station_id: str
     source: str
     max_items: int
     ttl_seconds: int
-    min_write_seconds: float
     fetch_nws: bool
     debug: bool
     ern_area_names: bool
@@ -1385,12 +1382,10 @@ def load_config(path: str) -> AppConfig:
 
     station_feed = StationFeedConfig(
         enabled=bool(sf_raw.get("enabled", False)),
-        path=str(sf_raw.get("path", "/srv/seasonalweather/api/station/handled-alerts.json")),
         station_id=str(sf_raw.get("station_id", "seasonalweather")),
         source=str(sf_raw.get("source", "seasonalweather")),
         max_items=int(sf_raw.get("max_items", 24)),
         ttl_seconds=int(sf_raw.get("ttl_seconds", 7200)),
-        min_write_seconds=float(sf_raw.get("min_write_seconds", 0.5)),
         fetch_nws=bool(sf_raw.get("fetch_nws", False)),
         debug=bool(sf_raw.get("debug", False)),
         ern_area_names=bool(sf_raw.get("ern_area_names", True)),
@@ -1398,7 +1393,6 @@ def load_config(path: str) -> AppConfig:
             enabled=bool(sf_hk_raw.get("enabled", True)),
             interval_sec=int(sf_hk_raw.get("interval_sec", 60)),
             grace_sec=int(sf_hk_raw.get("grace_sec", 5)),
-            keep_unparseable=bool(sf_hk_raw.get("keep_unparseable", True)),
             housekeep_seconds=int(sf_hk_raw.get("housekeep_seconds", 30)),
         ),
         nwws=StationFeedNwwsConfig(

@@ -68,7 +68,7 @@ Freeze products are supported natively. `FZ.W` maps to SAME `FZW` (**Freeze Warn
 - HTTP control API (localhost-only by default) for status, cycle control, bounded broadcast inserts, and audio injection.
 - OpenAPI 3.1 API document at `/openapi.json`; Swagger UI remains available at `/docs`.
 - RFC 9457 Problem Details error responses (`application/problem+json`) with `code`, `details`, and `request_id` extensions for operator/debug use.
-- Public handled-alerts feed API (`/v1/handled-alerts`) for external UI consumption, with `handled-alerts.json` kept as a legacy compatibility mirror.
+- Public handled-alerts feed API (`/v1/handled-alerts`) for external UI consumption, backed by SQLite.
 
 ---
 
@@ -131,7 +131,7 @@ This is the single source of truth for all runtime behaviour. The file is well-c
 | `tests` | RWT/RMT scheduling, gating, and postpone policy |
 | `zonecounty` | NWS UGC → SAME FIPS crosswalk |
 | `mareas` | Marine zone → SAME crosswalk |
-| `station_feed` | Public handled-alerts feed state, SQLite persistence, and legacy JSON mirror output |
+| `station_feed` | Public handled-alerts feed state backed by the SQLite read model |
 | `api` | HTTP control API settings |
 | `dedupe` | Cross-source deduplication window |
 | `tts` | TTS backend selection and VoiceText Paul tuning |

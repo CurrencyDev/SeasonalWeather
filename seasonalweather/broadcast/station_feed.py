@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import json
-import os
-import time
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, Iterable, List, Literal, Optional
 
@@ -53,23 +50,6 @@ def _uniq_strs(values: Any) -> List[str]:
     return out
 
 
-def atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
-    """
-    Writes JSON atomically: write temp file, fsync, rename over target.
-    Safe against partial writes and power loss mid-write.
-    """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-
-    tmp = f"{path}.tmp.{os.getpid()}.{int(time.time()*1000)}"
-    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(data)
-        f.write("\n")
-        f.flush()
-        os.fsync(f.fileno())
-
-    os.replace(tmp, path)
 
 
 def build_station_feed_payload(
