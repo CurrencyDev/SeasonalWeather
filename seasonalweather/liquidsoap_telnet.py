@@ -23,7 +23,8 @@ class LiquidsoapTelnet:
 
     Backwards compatible across Liquidsoap versions:
       - Old: cycle.push, alert.push, cycle.flush, alert.flush, alert.skip
-      - New: request_queue.push, request_queue.1.push, request_queue.flush_and_skip, request_queue.skip, ...
+      - Current: cycle.push, voice_alert.push, full_alert.push, ...
+      - Newer: request_queue.push, request_queue.1.push, request_queue.flush_and_skip, ...
 
     Also avoids telnetlib/telnetlib3: Liquidsoap's control socket isn't real RFC telnet;
     it's a simple line protocol with END terminators.
@@ -37,14 +38,18 @@ class LiquidsoapTelnet:
         self._lock = threading.Lock()
         self._discovered = False
 
-        # Prefixes for the two request queues (cycle and alert)
+        # Prefixes for the request queues.  FULL and VOICE may collapse to the
+        # same legacy alert queue when talking to an older liquidsoap script.
         self._cycle_prefix: Optional[str] = None
-        self._alert_prefix: Optional[str] = None
+        self._voice_alert_prefix: Optional[str] = None
+        self._full_alert_prefix: Optional[str] = None
 
-        # Derived commands for flush/skip
+        # Derived commands for flush/skip.
         self._cycle_flush_cmd: Optional[str] = None
-        self._alert_flush_cmd: Optional[str] = None
-        self._alert_skip_cmd: Optional[str] = None
+        self._voice_alert_flush_cmd: Optional[str] = None
+        self._full_alert_flush_cmd: Optional[str] = None
+        self._voice_alert_skip_cmd: Optional[str] = None
+        self._full_alert_skip_cmd: Optional[str] = None
 
     def _to_uri(self, wav_path: str) -> str:
         s = str(wav_path).strip()
@@ -159,12 +164,26 @@ class LiquidsoapTelnet:
         help_txt = self._send("help", read_deadline=4.0)
         cmds = self._parse_help_commands(help_txt)
 
-        # 1) Prefer legacy explicit queues if present
-        if "cycle.push <uri>" in cmds and "alert.push <uri>" in cmds:
+        # 1) Prefer explicit queue IDs from the repository liquidsoap script.
+        if {
+            "cycle.push <uri>",
+            "voice_alert.push <uri>",
+            "full_alert.push <uri>",
+        }.issubset(cmds):
             self._cycle_prefix = "cycle"
-            self._alert_prefix = "alert"
+            self._voice_alert_prefix = "voice_alert"
+            self._full_alert_prefix = "full_alert"
+
+        # 2) Legacy two-plane script.  Collapse FULL and VOICE to alert so older
+        # deployments still work until liquidsoap/radio.liq is updated/restarted.
+        elif "cycle.push <uri>" in cmds and "alert.push <uri>" in cmds:
+            self._cycle_prefix = "cycle"
+            self._voice_alert_prefix = "alert"
+            self._full_alert_prefix = "alert"
+
         else:
-            # 2) Newer style: request_queue and request_queue.N
+            # 3) Newer style: request_queue and request_queue.N.  The expected
+            # declaration order in radio.liq is cycle, voice_alert, full_alert.
             prefixes: list[tuple[int, str]] = []
             if "request_queue.push <uri>" in cmds:
                 prefixes.append((0, "request_queue"))
@@ -174,47 +193,56 @@ class LiquidsoapTelnet:
                     prefixes.append((int(m.group(2)), m.group(1)))
 
             prefixes.sort(key=lambda t: t[0])
-            if len(prefixes) >= 2:
+            if len(prefixes) >= 3:
                 self._cycle_prefix = prefixes[0][1]
-                self._alert_prefix = prefixes[1][1]
+                self._voice_alert_prefix = prefixes[1][1]
+                self._full_alert_prefix = prefixes[2][1]
+            elif len(prefixes) >= 2:
+                self._cycle_prefix = prefixes[0][1]
+                self._voice_alert_prefix = prefixes[1][1]
+                self._full_alert_prefix = prefixes[1][1]
             elif len(prefixes) == 1:
-                # Degenerate case: one queue exists; use it for both rather than dead air
+                # Degenerate case: one queue exists; use it for everything rather than dead air.
                 self._cycle_prefix = prefixes[0][1]
-                self._alert_prefix = prefixes[0][1]
+                self._voice_alert_prefix = prefixes[0][1]
+                self._full_alert_prefix = prefixes[0][1]
             else:
                 raise RuntimeError("Liquidsoap help did not expose any known push commands")
 
-        assert self._cycle_prefix and self._alert_prefix
+        assert self._cycle_prefix and self._voice_alert_prefix and self._full_alert_prefix
 
-        # Flush commands vary by version
+        # Flush commands vary by version.
         def pick_flush(prefix: str) -> str:
-            # Prefer flush_and_skip, else flush, else skip as last-ditch
+            # Prefer flush_and_skip, else flush, else skip as last-ditch.
             if f"{prefix}.flush_and_skip" in cmds:
                 return f"{prefix}.flush_and_skip"
             if f"{prefix}.flush" in cmds:
                 return f"{prefix}.flush"
             if f"{prefix}.skip" in cmds:
                 return f"{prefix}.skip"
-            # If nothing exists, keep something predictable; sending it will raise
+            # If nothing exists, keep something predictable; sending it will raise.
             return f"{prefix}.flush_and_skip"
 
-        self._cycle_flush_cmd = pick_flush(self._cycle_prefix)
-        self._alert_flush_cmd = pick_flush(self._alert_prefix)
+        def pick_skip(prefix: str, fallback_flush: str) -> str:
+            return f"{prefix}.skip" if f"{prefix}.skip" in cmds else fallback_flush
 
-        # Skip alert: prefer skip if present, else use alert flush behavior
-        if f"{self._alert_prefix}.skip" in cmds:
-            self._alert_skip_cmd = f"{self._alert_prefix}.skip"
-        else:
-            self._alert_skip_cmd = self._alert_flush_cmd
+        self._cycle_flush_cmd = pick_flush(self._cycle_prefix)
+        self._voice_alert_flush_cmd = pick_flush(self._voice_alert_prefix)
+        self._full_alert_flush_cmd = pick_flush(self._full_alert_prefix)
+        self._voice_alert_skip_cmd = pick_skip(self._voice_alert_prefix, self._voice_alert_flush_cmd)
+        self._full_alert_skip_cmd = pick_skip(self._full_alert_prefix, self._full_alert_flush_cmd)
 
         self._discovered = True
         log.info(
-            "Liquidsoap control discovered: cycle=%s alert=%s cycle_flush=%s alert_flush=%s alert_skip=%s",
+            "Liquidsoap control discovered: cycle=%s voice_alert=%s full_alert=%s cycle_flush=%s voice_flush=%s full_flush=%s voice_skip=%s full_skip=%s",
             self._cycle_prefix,
-            self._alert_prefix,
+            self._voice_alert_prefix,
+            self._full_alert_prefix,
             self._cycle_flush_cmd,
-            self._alert_flush_cmd,
-            self._alert_skip_cmd,
+            self._voice_alert_flush_cmd,
+            self._full_alert_flush_cmd,
+            self._voice_alert_skip_cmd,
+            self._full_alert_skip_cmd,
         )
 
     def _ensure_discovered(self) -> None:
@@ -222,37 +250,74 @@ class LiquidsoapTelnet:
             if not self._discovered:
                 self._discover()
 
-    # -------- Public API --------
-
-    def push_alert(self, wav_path: str, *, meta: dict[str, str] | None = None) -> None:
-        self._ensure_discovered()
+    def _push_to_prefix(self, prefix: str, wav_path: str, *, meta: dict[str, str] | None = None) -> None:
         uri = self._to_uri(wav_path)
         uri = self._annotate_uri(uri, meta)
-        self._send(f'{self._alert_prefix}.push {uri}')
+        self._send(f'{prefix}.push {uri}')
+
+    # -------- Public API --------
+
+    def push_full_alert(self, wav_path: str, *, meta: dict[str, str] | None = None) -> None:
+        self._ensure_discovered()
+        assert self._full_alert_prefix is not None
+        self._push_to_prefix(self._full_alert_prefix, wav_path, meta=meta)
+
+    def push_voice_alert(self, wav_path: str, *, meta: dict[str, str] | None = None) -> None:
+        self._ensure_discovered()
+        assert self._voice_alert_prefix is not None
+        self._push_to_prefix(self._voice_alert_prefix, wav_path, meta=meta)
+
+    def push_alert(self, wav_path: str, *, meta: dict[str, str] | None = None) -> None:
+        """Compatibility wrapper for older callers; use the VOICE interrupt plane."""
+        self.push_voice_alert(wav_path, meta=meta)
 
     def push_cycle(self, wav_path: str, *, meta: dict[str, str] | None = None) -> None:
         self._ensure_discovered()
-        uri = self._to_uri(wav_path)
-        uri = self._annotate_uri(uri, meta)
-        self._send(f'{self._cycle_prefix}.push {uri}')
+        assert self._cycle_prefix is not None
+        self._push_to_prefix(self._cycle_prefix, wav_path, meta=meta)
 
     def flush_cycle(self) -> None:
         self._ensure_discovered()
         assert self._cycle_flush_cmd is not None
         self._send(self._cycle_flush_cmd)
 
-    def flush_alert(self) -> None:
+    def flush_voice_alert(self) -> None:
         self._ensure_discovered()
-        assert self._alert_flush_cmd is not None
-        self._send(self._alert_flush_cmd)
+        assert self._voice_alert_flush_cmd is not None
+        self._send(self._voice_alert_flush_cmd)
 
-    def skip_alert(self) -> None:
+    def flush_full_alert(self) -> None:
         self._ensure_discovered()
-        assert self._alert_skip_cmd is not None
+        assert self._full_alert_flush_cmd is not None
+        self._send(self._full_alert_flush_cmd)
+
+    def flush_alert(self) -> None:
+        """Compatibility wrapper: clear both interrupt planes when available."""
+        self.flush_full_alert()
+        if self._voice_alert_prefix != self._full_alert_prefix:
+            self.flush_voice_alert()
+
+    def skip_voice_alert(self) -> None:
+        self._ensure_discovered()
+        assert self._voice_alert_skip_cmd is not None
         try:
-            self._send(self._alert_skip_cmd)
+            self._send(self._voice_alert_skip_cmd)
         except Exception:
             pass
+
+    def skip_full_alert(self) -> None:
+        self._ensure_discovered()
+        assert self._full_alert_skip_cmd is not None
+        try:
+            self._send(self._full_alert_skip_cmd)
+        except Exception:
+            pass
+
+    def skip_alert(self) -> None:
+        """Compatibility wrapper: skip both interrupt planes when available."""
+        self.skip_full_alert()
+        if self._voice_alert_prefix != self._full_alert_prefix:
+            self.skip_voice_alert()
 
     def ping(self) -> bool:
         try:

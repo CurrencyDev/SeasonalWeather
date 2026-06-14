@@ -506,6 +506,48 @@ class Orchestrator:
         return f"FUNC_FULL:{code_u}:{self._sha1_12(blob)}"
 
 
+    async def _push_interrupt_audio(self, wav_path, *, meta: dict[str, str] | None = None, full: bool = False) -> None:
+        """Push rendered interrupt audio to the proper Liquidsoap priority plane.
+
+        FULL alerts preempt both the cycle plane and lower-priority voice updates.
+        VOICE alerts interrupt only the cycle plane and never clear queued/current
+        FULL alerts.
+        """
+        async with self._cycle_lock:
+            try:
+                self.telnet.flush_cycle()
+            except Exception:
+                pass
+
+            if full:
+                # Clear queued/current lower-priority VOICE material before the
+                # FULL alert is pushed.  Some Liquidsoap versions expose only
+                # flush, only skip, or flush_and_skip, so try both safe controls.
+                for method_name in ("flush_voice_alert", "skip_voice_alert"):
+                    method = getattr(self.telnet, method_name, None)
+                    if method is None:
+                        continue
+                    try:
+                        method()
+                    except Exception:
+                        pass
+                if not hasattr(self.telnet, "flush_voice_alert") and not hasattr(self.telnet, "skip_voice_alert"):
+                    try:
+                        self.telnet.skip_alert()
+                    except Exception:
+                        pass
+
+                if hasattr(self.telnet, "push_full_alert"):
+                    self.telnet.push_full_alert(str(wav_path), meta=meta)
+                else:
+                    self.telnet.push_alert(str(wav_path), meta=meta)
+            else:
+                if hasattr(self.telnet, "push_voice_alert"):
+                    self.telnet.push_voice_alert(str(wav_path), meta=meta)
+                else:
+                    self.telnet.push_alert(str(wav_path), meta=meta)
+
+
     def _nwws_api_product_matches_raw(self, parsed: ParsedProduct, api_text: str) -> bool:
         """
         Accept an api.weather.gov product override only when it appears to be the
@@ -552,42 +594,7 @@ class Orchestrator:
         # No VTEC in raw payload: fall back to AWIPS/WFO agreement only.
         return True
 
-    async def _resolve_nwws_official_text(self, parsed: ParsedProduct) -> tuple[str, str | None]:
-        """
-        Prefer the live NWWS payload unless the API product can be validated as the
-        same issuance. This avoids stale-product regressions during active events.
-        """
-        official_text = parsed.raw_text or ""
-        pid: str | None = None
-        try:
-            pid = await self.api.latest_product_id(
-                parsed.product_type,
-                parsed.wfo[1:] if parsed.wfo.startswith("K") else parsed.wfo,
-            )
-            if not pid:
-                pid = await self.api.latest_product_id(parsed.product_type, parsed.wfo.replace("K", "", 1))
-            if pid:
-                prod = await self.api.get_product(pid)
-                if prod and prod.product_text:
-                    if self._nwws_api_product_matches_raw(parsed, prod.product_text):
-                        official_text = prod.product_text
-                    else:
-                        api_vtec = ",".join(self._extract_vtec(prod.product_text)[:2])
-                        raw_vtec = ",".join(self._extract_vtec(parsed.raw_text or "")[:2])
-                        log.warning(
-                            "NWWS API override rejected (stale/mismatched product): type=%s awips=%s wfo=%s pid=%s raw_vtec=%s api_vtec=%s",
-                            parsed.product_type,
-                            parsed.awips_id or "",
-                            parsed.wfo,
-                            pid,
-                            raw_vtec,
-                            api_vtec,
-                        )
-                        pid = None
-        except Exception:
-            log.exception('NWWS official-text resolution failed; falling back to raw payload')
-            pid = None
-        return official_text, pid
+
 
     def _extract_vtec(self, text: str) -> list[str]:
         if not text:

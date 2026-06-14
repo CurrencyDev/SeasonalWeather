@@ -52,26 +52,20 @@ class ManualOriginationRuntime:
             allow_statewide_input=False,
         )
 
-        async with self.orch._cycle_lock:
-            try:
-                self.orch.telnet.flush_cycle()
-            except Exception:
-                pass
-
-            title = (headline or "Manual message").strip() or "Manual message"
-            meta = self.orch._np_meta(
-                title=title,
-                kind="alert",
-                extra={
-                    "sw_alert_source": "api",
-                    "sw_alert_mode": ("full" if mode == "full_eas" else "voice"),
-                    "sw_event_code": _safe_event_code(event_code),
-                    "sw_event": title,
-                    "sw_sender": (sender or "").strip(),
-                    "sw_actor": (actor or "").strip(),
-                },
-            )
-            self.orch.telnet.push_alert(str(wav_path), meta=meta)
+        title = (headline or "Manual message").strip() or "Manual message"
+        meta = self.orch._np_meta(
+            title=title,
+            kind="alert",
+            extra={
+                "sw_alert_source": "api",
+                "sw_alert_mode": ("full" if mode == "full_eas" else "voice"),
+                "sw_event_code": _safe_event_code(event_code),
+                "sw_event": title,
+                "sw_sender": (sender or "").strip(),
+                "sw_actor": (actor or "").strip(),
+            },
+        )
+        await self.orch._push_interrupt_audio(wav_path, meta=meta, full=(mode == "full_eas"))
 
         now = dt.datetime.now(tz=self.orch._tz)
         title = (headline or "Manual message").strip() or "Manual message"

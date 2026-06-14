@@ -33,12 +33,23 @@ class _FakeAudioOriginator:
 class _FakeTelnet:
     def __init__(self) -> None:
         self.pushed = []
+        self.flushed_cycle = 0
+        self.flushed_voice = 0
 
     def flush_cycle(self) -> None:
-        pass
+        self.flushed_cycle += 1
+
+    def flush_voice_alert(self) -> None:
+        self.flushed_voice += 1
+
+    def push_full_alert(self, path: str, *, meta=None) -> None:
+        self.pushed.append(("full", path, meta or {}))
+
+    def push_voice_alert(self, path: str, *, meta=None) -> None:
+        self.pushed.append(("voice", path, meta or {}))
 
     def push_alert(self, path: str, *, meta=None) -> None:
-        self.pushed.append((path, meta or {}))
+        self.push_voice_alert(path, meta=meta)
 
 
 class _FakeDiscord:
@@ -170,6 +181,8 @@ def test_cap_full_runtime_path_smoke(tmp_path, monkeypatch):
     assert parsed.product_type == "SVR"
     assert same_locations == ["024031"]
     assert orch.telnet.pushed
+    assert orch.telnet.pushed[-1][0] == "full"
+    assert orch.telnet.flushed_voice == 1
     assert any(kind == "aired" for kind, _payload in orch.discord.calls)
 
 
@@ -184,16 +197,12 @@ def test_cap_voice_runtime_path_smoke(tmp_path, monkeypatch):
     assert prefix == "capvoice"
     assert "Severe Thunderstorm Warning" in script
     assert orch.telnet.pushed
+    assert orch.telnet.pushed[-1][0] == "voice"
 
 
 def test_nwws_full_runtime_path_smoke(tmp_path, monkeypatch):
     orch = _orchestrator(tmp_path, monkeypatch)
-    parsed, official_text = _nwws_product(product_type="SVR", action="NEW")
-
-    async def _resolve(_parsed):
-        return official_text, "test-product-id"
-
-    orch._resolve_nwws_official_text = _resolve  # type: ignore[method-assign]
+    parsed, _official_text = _nwws_product(product_type="SVR", action="NEW")
 
     asyncio.run(orch.nwws_runtime._handle_toneout(parsed))
 
@@ -202,16 +211,13 @@ def test_nwws_full_runtime_path_smoke(tmp_path, monkeypatch):
     assert render_parsed.product_type == "SVR"
     assert same_locations == ["024031"]
     assert orch.telnet.pushed
+    assert orch.telnet.pushed[-1][0] == "full"
+    assert orch.telnet.flushed_voice == 1
 
 
 def test_nwws_voice_runtime_path_smoke(tmp_path, monkeypatch):
     orch = _orchestrator(tmp_path, monkeypatch)
-    parsed, official_text = _nwws_product(product_type="SVS", action="CON")
-
-    async def _resolve(_parsed):
-        return official_text, "test-product-id"
-
-    orch._resolve_nwws_official_text = _resolve  # type: ignore[method-assign]
+    parsed, _official_text = _nwws_product(product_type="SVS", action="CON")
 
     asyncio.run(orch.nwws_runtime._handle_toneout(parsed))
 
@@ -221,3 +227,4 @@ def test_nwws_voice_runtime_path_smoke(tmp_path, monkeypatch):
     assert prefix == "nwwsvoice"
     assert "severe thunderstorm warning" in script.lower()
     assert orch.telnet.pushed
+    assert orch.telnet.pushed[-1][0] == "voice"

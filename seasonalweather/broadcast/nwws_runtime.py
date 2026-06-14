@@ -206,7 +206,11 @@ class NwwsRuntime:
     async def _handle_toneout(self, parsed: ParsedProduct) -> None:
         log.info("NWWS toneout candidate: type=%s awips=%s wfo=%s", parsed.product_type, parsed.awips_id or "", parsed.wfo)
 
-        official_text, pid = await self._resolve_nwws_official_text(parsed)
+        # NWWS-OI already delivered the authoritative live product text.
+        # Keep api.weather.gov out of the toneout hot path; API backfill remains
+        # a separate recovery path when NWWS-OI misses products.
+        official_text = parsed.raw_text or ""
+        pid = None
 
         # --- NEW: derive SAME targeting from UGC zones (NWWS-only) ---
         zones, in_area_same, src, mapped_ok, ugc_expires_utc = await self.target_resolver._nwws_same_targets_from_texts(parsed.raw_text or "", official_text or "")
@@ -403,32 +407,27 @@ class NwwsRuntime:
                 # Voice-only always has no SAME headers by design.
                 out_wav = await self.audio_originator.render_voice_only_audio(spoken.script, prefix="nwwsvoice")
 
-            async with self._cycle_lock:
-                try:
-                    self.telnet.flush_cycle()
-                except Exception:
-                    pass
-                event_label = sf_event_label
-                if (not should_full) and (("EXP" in vtec_actions) or ("CAN" in vtec_actions)):
-                    tkey = "nwws_end"
-                elif should_full:
-                    tkey = "nwws_full"
-                else:
-                    tkey = "nwws_update"
-                title = self._np_alert_title(tkey, event=event_label)
-                meta = self._np_meta(
-                    title=title,
-                    kind="alert",
-                    extra={
-                        "sw_alert_source": "nwws",
-                        "sw_alert_mode": ("full" if should_full else "voice"),
-                        "sw_event_code": (_nw_policy.same_code or parsed.product_type or "").strip().upper(),
-                        "sw_event": event_label,
-                        "sw_wfo": (parsed.wfo or "").strip(),
-                        "sw_awips": (parsed.awips_id or "").strip(),
-                    },
-                )
-                self.telnet.push_alert(str(out_wav), meta=meta)
+            event_label = sf_event_label
+            if (not should_full) and (("EXP" in vtec_actions) or ("CAN" in vtec_actions)):
+                tkey = "nwws_end"
+            elif should_full:
+                tkey = "nwws_full"
+            else:
+                tkey = "nwws_update"
+            title = self._np_alert_title(tkey, event=event_label)
+            meta = self._np_meta(
+                title=title,
+                kind="alert",
+                extra={
+                    "sw_alert_source": "nwws",
+                    "sw_alert_mode": ("full" if should_full else "voice"),
+                    "sw_event_code": (_nw_policy.same_code or parsed.product_type or "").strip().upper(),
+                    "sw_event": event_label,
+                    "sw_wfo": (parsed.wfo or "").strip(),
+                    "sw_awips": (parsed.awips_id or "").strip(),
+                },
+            )
+            await self._push_interrupt_audio(out_wav, meta=meta, full=should_full)
 
             now = dt.datetime.now(tz=self._tz)
 

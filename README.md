@@ -60,7 +60,8 @@ Freeze products are supported natively. `FZ.W` maps to SAME `FZW` (**Freeze Warn
 ### Output
 
 - Audio is produced for **Liquidsoap**, which feeds **Icecast**.
-- Typical mount: `/seasonalweather.ogg`
+- Liquidsoap uses separate interrupt planes for FULL alerts, VOICE alerts, and routine cycle audio; FULL alerts have the highest priority and can preempt lower-priority VOICE updates.
+- Typical mounts: `/seasonalweather.ogg`, `/seasonalweather.mp3`
 
 ### Ops
 
@@ -330,6 +331,7 @@ Set the per-logger levels back to `INFO` or enable the boolean toggles when you 
 
 ```
 http://<your-ip>:8000/seasonalweather.ogg
+http://<your-ip>:8000/seasonalweather.mp3
 ```
 
 ---

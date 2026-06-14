@@ -143,24 +143,20 @@ class ErnRelayRuntime:
 
             out_wav = await host.audio_originator.render_alert_audio(dummy, script, same_locations=in_area_locs)
 
-            async with host._cycle_lock:
-                try:
-                    host.telnet.flush_cycle()
-                except Exception:
-                    pass
-                event_label = _same_label_or_code(code)
-                title = host._np_alert_title("ern", event=event_label)
-                meta = host._np_meta(
-                    title=title,
-                    kind="alert",
-                    extra={
-                        "sw_alert_source": "ern",
-                        "sw_event_code": code,
-                        "sw_event": event_label,
-                        "sw_sender": (ev.sender or "").strip(),
-                    },
-                )
-                host.telnet.push_alert(str(out_wav), meta=meta)
+            event_label = _same_label_or_code(code)
+            title = host._np_alert_title("ern", event=event_label)
+            meta = host._np_meta(
+                title=title,
+                kind="alert",
+                extra={
+                    "sw_alert_source": "ern",
+                    "sw_alert_mode": "full",
+                    "sw_event_code": code,
+                    "sw_event": event_label,
+                    "sw_sender": (ev.sender or "").strip(),
+                },
+            )
+            await host._push_interrupt_audio(out_wav, meta=meta, full=True)
 
             host._ern_relay_last_any_at = now
             host.last_product_desc = f"ERN {code}".strip()

@@ -203,25 +203,20 @@ class CapRuntime:
             dummy = SimpleNamespace(product_type=same_code, awips_id=None, wfo="CAP", raw_text="")
             out_wav = await o.audio_originator.render_alert_audio(dummy, script, same_locations=same_locs if same_locs else None)
 
-            async with o._cycle_lock:
-                try:
-                    o.telnet.flush_cycle()
-                except Exception:
-                    pass
-                event_label = (ev.event or "").strip() or "Weather alert"
-                title = o._np_alert_title("cap_full", event=event_label)
-                meta = o._np_meta(
-                    title=title,
-                    kind="alert",
-                    extra={
-                        "sw_alert_source": "cap",
-                        "sw_alert_mode": "full",
-                        "sw_event": event_label,
-                        "sw_event_code": (same_code or "").strip().upper(),
-                        "sw_alert_id": str(ev.alert_id or "").strip(),
-                    },
-                )
-                o.telnet.push_alert(str(out_wav), meta=meta)
+            event_label = (ev.event or "").strip() or "Weather alert"
+            title = o._np_alert_title("cap_full", event=event_label)
+            meta = o._np_meta(
+                title=title,
+                kind="alert",
+                extra={
+                    "sw_alert_source": "cap",
+                    "sw_alert_mode": "full",
+                    "sw_event": event_label,
+                    "sw_event_code": (same_code or "").strip().upper(),
+                    "sw_alert_id": str(ev.alert_id or "").strip(),
+                },
+            )
+            await o._push_interrupt_audio(out_wav, meta=meta, full=True)
 
             o._cap_full_last_by_key[key] = now
             o.last_product_desc = f"CAP {ev.event}".strip()
@@ -340,25 +335,20 @@ class CapRuntime:
         try:
             out_wav = await o.audio_originator.render_voice_only_audio(script, prefix="capvoice")
 
-            async with o._cycle_lock:
-                try:
-                    o.telnet.flush_cycle()
-                except Exception:
-                    pass
-                event_label = (ev.event or "").strip() or "Weather alert"
-                title = o._np_alert_title("cap_update", event=event_label)
-                meta = o._np_meta(
-                    title=title,
-                    kind="alert",
-                    extra={
-                        "sw_alert_source": "cap",
-                        "sw_alert_mode": "voice",
-                        "sw_event": event_label,
-                        "sw_event_code": (same_code or "").strip().upper(),
-                        "sw_alert_id": str(ev.alert_id or "").strip(),
-                    },
-                )
-                o.telnet.push_alert(str(out_wav), meta=meta)
+            event_label = (ev.event or "").strip() or "Weather alert"
+            title = o._np_alert_title("cap_update", event=event_label)
+            meta = o._np_meta(
+                title=title,
+                kind="alert",
+                extra={
+                    "sw_alert_source": "cap",
+                    "sw_alert_mode": "voice",
+                    "sw_event": event_label,
+                    "sw_event_code": (same_code or "").strip().upper(),
+                    "sw_alert_id": str(ev.alert_id or "").strip(),
+                },
+            )
+            await o._push_interrupt_audio(out_wav, meta=meta, full=False)
 
             o._cap_voice_last_by_key[key] = now
             o.last_product_desc = f"CAP {ev.event}".strip()
@@ -478,25 +468,20 @@ class CapRuntime:
 
         try:
             out_wav = await o.audio_originator.render_voice_only_audio(script, prefix="capupdate")
-            async with o._cycle_lock:
-                try:
-                    o.telnet.flush_cycle()
-                except Exception:
-                    pass
-                event_label = ev_event or "Weather alert"
-                title = o._np_alert_title("cap_update", event=event_label)
-                meta = o._np_meta(
-                    title=title,
-                    kind="alert",
-                    extra={
-                        "sw_alert_source": "cap",
-                        "sw_alert_mode": "update",
-                        "sw_event": event_label,
-                        "sw_event_code": (same_code or "").strip().upper(),
-                        "sw_alert_id": str(ev.alert_id or "").strip(),
-                    },
-                )
-                o.telnet.push_alert(str(out_wav), meta=meta)
+            event_label = ev_event or "Weather alert"
+            title = o._np_alert_title("cap_update", event=event_label)
+            meta = o._np_meta(
+                title=title,
+                kind="alert",
+                extra={
+                    "sw_alert_source": "cap",
+                    "sw_alert_mode": "update",
+                    "sw_event": event_label,
+                    "sw_event_code": (same_code or "").strip().upper(),
+                    "sw_alert_id": str(ev.alert_id or "").strip(),
+                },
+            )
+            await o._push_interrupt_audio(out_wav, meta=meta, full=False)
 
             o.last_product_desc = f"CAP {ev_event}".strip()
             o._schedule_cycle_refill("post-cap-update")

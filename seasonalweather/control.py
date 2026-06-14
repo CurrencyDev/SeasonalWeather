@@ -610,25 +610,31 @@ class OrchestratorControl:
         self._validate_interrupt_policy(interrupt_policy)
         self._ensure_backend_ready()
 
-        async with self.orch._cycle_lock:
-            if interrupt_policy == InterruptPolicy.INTERRUPT_THEN_REFILL.value:
-                try:
-                    self.orch.telnet.flush_cycle()
-                except Exception:
-                    pass
-
-            meta = self.orch._np_meta(
-                title=headline,
-                kind="alert",
-                extra={
-                    "sw_alert_source": "api",
-                    "sw_alert_mode": voice_mode,
-                    "sw_event_code": event_code,
-                    "sw_sender": sender or "",
-                    "sw_actor": actor,
-                },
+        meta = self.orch._np_meta(
+            title=headline,
+            kind="alert",
+            extra={
+                "sw_alert_source": "api",
+                "sw_alert_mode": voice_mode,
+                "sw_event_code": event_code,
+                "sw_sender": sender or "",
+                "sw_actor": actor,
+            },
+        )
+        if interrupt_policy == InterruptPolicy.INTERRUPT_THEN_REFILL.value:
+            await self.orch._push_interrupt_audio(
+                wav_path,
+                meta=meta,
+                full=(voice_mode == VoiceMode.FULL_EAS.value),
             )
-            self.orch.telnet.push_alert(str(wav_path), meta=meta)
+        else:
+            async with self.orch._cycle_lock:
+                if voice_mode == VoiceMode.FULL_EAS.value and hasattr(self.orch.telnet, "push_full_alert"):
+                    self.orch.telnet.push_full_alert(str(wav_path), meta=meta)
+                elif hasattr(self.orch.telnet, "push_voice_alert"):
+                    self.orch.telnet.push_voice_alert(str(wav_path), meta=meta)
+                else:
+                    self.orch.telnet.push_alert(str(wav_path), meta=meta)
 
         now = self._now_local()
         self.orch.last_product_desc = headline[:200]

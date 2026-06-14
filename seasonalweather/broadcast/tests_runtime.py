@@ -170,15 +170,10 @@ class RequiredTestRuntime:
         dummy = SimpleNamespace(product_type=code, awips_id=None, wfo="KLWX", raw_text="")
         out_wav = await orch.audio_originator.render_alert_audio(dummy, spoken)
 
-        async with orch._cycle_lock:
-            try:
-                orch.telnet.flush_cycle()
-            except Exception:
-                pass
-            tkey = "rwt" if code == "RWT" else "rmt"
-            title = orch._np_alert_title(tkey, event="")
-            meta = orch._np_meta(title=title, kind="test", extra={"sw_alert_source": "local", "sw_event_code": code})
-            orch.telnet.push_alert(str(out_wav), meta=meta)
+        tkey = "rwt" if code == "RWT" else "rmt"
+        title = orch._np_alert_title(tkey, event="")
+        meta = orch._np_meta(title=title, kind="test", extra={"sw_alert_source": "local", "sw_event_code": code})
+        await orch._push_interrupt_audio(out_wav, meta=meta, full=True)
 
         # --- Station feed note (radio UI/API handled-alerts feed) ---
         local_test_same_codes = self.same_codes_for_presentation()

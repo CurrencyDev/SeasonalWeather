@@ -175,24 +175,19 @@ class IpawsRuntime:
                 same_locations=same_locs if same_locs else None,
             )
 
-            async with host._cycle_lock:
-                try:
-                    host.telnet.flush_cycle()
-                except Exception:
-                    pass
-                title = host._np_alert_title("cap_full", event=event_label)
-                meta = host._np_meta(
-                    title=title,
-                    kind="alert",
-                    extra={
-                        "sw_alert_source": "ipaws",
-                        "sw_alert_mode": "full",
-                        "sw_event": event_label,
-                        "sw_event_code": event_code,
-                        "sw_alert_id": str(ev.identifier or "").strip(),
-                    },
-                )
-                host.telnet.push_alert(str(out_wav), meta=meta)
+            title = host._np_alert_title("cap_full", event=event_label)
+            meta = host._np_meta(
+                title=title,
+                kind="alert",
+                extra={
+                    "sw_alert_source": "ipaws",
+                    "sw_alert_mode": "full",
+                    "sw_event": event_label,
+                    "sw_event_code": event_code,
+                    "sw_alert_id": str(ev.identifier or "").strip(),
+                },
+            )
+            await host._push_interrupt_audio(out_wav, meta=meta, full=True)
 
             self._full_last_by_key[key] = now
             host.last_product_desc = f"IPAWS {event_label}".strip()
@@ -306,24 +301,19 @@ class IpawsRuntime:
         try:
             out_wav = await host.audio_originator.render_voice_only_audio(script, prefix="ipawsvoice")
 
-            async with host._cycle_lock:
-                try:
-                    host.telnet.flush_cycle()
-                except Exception:
-                    pass
-                title = host._np_alert_title("cap_full", event=event_label)
-                meta = host._np_meta(
-                    title=title,
-                    kind="alert",
-                    extra={
-                        "sw_alert_source": "ipaws",
-                        "sw_alert_mode": "voice",
-                        "sw_event": event_label,
-                        "sw_event_code": event_code,
-                        "sw_alert_id": str(ev.identifier or "").strip(),
-                    },
-                )
-                host.telnet.push_alert(str(out_wav), meta=meta)
+            title = host._np_alert_title("cap_full", event=event_label)
+            meta = host._np_meta(
+                title=title,
+                kind="alert",
+                extra={
+                    "sw_alert_source": "ipaws",
+                    "sw_alert_mode": "voice",
+                    "sw_event": event_label,
+                    "sw_event_code": event_code,
+                    "sw_alert_id": str(ev.identifier or "").strip(),
+                },
+            )
+            await host._push_interrupt_audio(out_wav, meta=meta, full=False)
 
             host.last_product_desc = f"IPAWS {event_label}".strip()
             host._schedule_cycle_refill("post-ipaws-voice")
