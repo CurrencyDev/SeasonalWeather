@@ -184,13 +184,13 @@ class NwwsRuntime:
                     except Exception:
                         log.exception("PNS official-text resolution failed; falling back to raw NWWS payload")
 
-                    decision = self.pns_state.evaluate(
+                    decision = self.pns_runtime.evaluate(
                         official_pns,
                         wfo=parsed.wfo or "",
                         awips_id=parsed.awips_id or "",
                         issued=getattr(parsed, "issued", None),
                     )
-                    queued = await self._queue_pns_decision(
+                    queued = await self.pns_runtime.queue_decision(
                         decision,
                         wfo=parsed.wfo or "",
                         awips_id=parsed.awips_id or "",
