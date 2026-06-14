@@ -19,12 +19,9 @@ import logging
 import time
 
 import re
-import wave
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
-
-import httpx
 
 from .config import load_config, AppConfig
 from .logging_config import setup_logging
@@ -36,7 +33,6 @@ from .nwws.client import NWWSClient
 from .alerts.product import parse_product_text, ParsedProduct
 from .alerts.builder import build_spoken_alert
 from .tts.tts import TTS
-from .tts.audio import write_sine_wav, write_silence_wav, concat_wavs
 from .liquidsoap_telnet import LiquidsoapTelnet
 from .broadcast.cycle import CycleBuilder, CycleContext
 from .broadcast.segment_store import SegmentStore
@@ -45,6 +41,7 @@ from .broadcast.segment_refresher import SegmentRefresher
 from .broadcast.cap_text import CapTextRenderer
 from .broadcast.ipaws_text import build_ipaws_script
 from .broadcast.product_text import render_nwws_product_script
+from .broadcast.audio_origination import AudioOriginator, safe_event_code as _safe_event_code
 
 # Active alert tracker (persistent cycle state across restarts)
 from .alerts.active import ActiveAlert, AlertTracker, _vtec_track_id
@@ -76,15 +73,6 @@ from .same.locations import normalize_same_allow_set as _normalize_same_allow_se
 # RWT/RMT scheduler
 from .broadcast.rwt_rmt import RwtRmtSchedule, RwtRmtScheduler
 from .broadcast.tests import default_test_script_lines, format_test_presentation_template
-
-# Optional SAME
-try:
-    from .same.same import SameHeader, chunk_locations, render_same_bursts_wav, render_same_eom_wav
-except Exception:  # pragma: no cover
-    SameHeader = None  # type: ignore
-    chunk_locations = None  # type: ignore
-    render_same_bursts_wav = None  # type: ignore
-    render_same_eom_wav = None  # type: ignore
 
 # Optional CAP (api.weather.gov/alerts/active)
 try:
@@ -150,13 +138,6 @@ def _setup_logging(cfg: AppConfig | None = None) -> None:
 
 # _env_* helpers removed — all configuration now flows through AppConfig.
 # Credentials are accessed via cfg.secrets.* (set once in load_config()).
-
-
-def _safe_event_code(raw: str | None) -> str:
-    if not raw:
-        return "SPS"
-    s = "".join(ch for ch in str(raw).upper() if ch.isalnum())
-    return s[:3] if len(s) >= 3 else "SPS"
 
 
 class Orchestrator:
@@ -269,27 +250,6 @@ class Orchestrator:
         self._nwws_seen = 0
         self._nwws_acted = 0
 
-        # --- NWS zone lookup (for NWWS UGC->SAME targeting) ---
-        self._zone_client: httpx.AsyncClient | None = None
-        self._zone_cache_same: dict[str, list[str]] = {}
-        self._zone_cache_fail: dict[str, dt.datetime] = {}  # short-term backoff for bad zones
-        self._zone_lock = asyncio.Lock()
-
-        # --- ZoneCounty DBX crosswalk (forecast zone -> county FIPS -> SAME) ---
-        self._zonecounty_lock = asyncio.Lock()
-        self._zonecounty_loaded = False
-        self._zonecounty_map: dict[str, list[str]] = {}
-
-
-        # --- Marine areas .txt crosswalk (marine zone -> coastal county FIPS -> SAME) ---
-        self._mareas_lock = asyncio.Lock()
-        self._mareas_loaded = False
-        self._mareas_map: dict[str, list[str]] = {}
-
-        # --- SAME county name cache (for station feed ERN area display) ---
-        self._same_name_cache: dict[str, str] = {}
-        self._same_name_fail: dict[str, dt.datetime] = {}
-        self._same_name_lock = asyncio.Lock()
 
         # --- Embedded SQLite runtime state ---
         self.database = bootstrap_database_from_config(cfg) if getattr(cfg.database, "enabled", True) else None
@@ -309,6 +269,16 @@ class Orchestrator:
 
         # Discord webhook logger (fire-and-forget; starts its drain task in run())
         self.discord = DiscordLogger.from_config(cfg.logs.discord)
+
+        # AudioOriginator owns TTS/WAV/SAME assembly. The orchestrator only
+        # decides what alert/message should be aired.
+        self.audio_originator = AudioOriginator(
+            cfg=cfg,
+            tts=self.tts,
+            local_tz=self._tz,
+            paths=self._paths,
+            discord=self.discord,
+        )
 
         # SegmentStore: persistent per-segment audio cache.
         # Placed last so alert_tracker and all other attributes are available.
@@ -938,7 +908,7 @@ class Orchestrator:
             out.append(x2)
         return out[:12]
 
-    # ---- SAME location filtering (critical for ERN relay targeting) ----
+    # ---- SAME location filtering / area display ----
     def _filter_same_locations_to_service_area(
         self,
         locs: list[str] | tuple[str, ...] | None,
@@ -950,84 +920,8 @@ class Orchestrator:
             allow_statewide_input=allow_statewide_input,
         )
 
-
-    # ---- NWWS UGC -> SAME targeting helpers ----
-    def _state_to_fips2(self, st: str) -> str | None:
-        return self.targeting._state_to_fips2(st)
-
-
-    def _same_from_state_county(self, state_abbr: str, county3: str) -> str | None:
-        return self.targeting._same_from_state_county(state_abbr, county3)
-
-
-    # ---- Station-feed helpers: SAME(6) -> County names (ERN relays) ----
-    def _same6_to_county_zone_id(self, same6: str) -> tuple[str | None, str | None]:
-        return self.targeting._same6_to_county_zone_id(same6)
-
-
-    async def _same6_area_label(self, same6: str) -> str | None:
-        return await self.targeting._same6_area_label(same6)
-
-
     async def _sf_area_text_from_same_codes(self, same_codes: list[str]) -> str:
         return await self.targeting._sf_area_text_from_same_codes(same_codes)
-
-
-    # ---- ZoneCounty crosswalk (NOAA/NWS recommended: zone -> county FIPS -> SAME) ----
-    def _zonecounty_enabled(self) -> bool:
-        return self.targeting._zonecounty_enabled()
-
-
-    def _zonecounty_dbx_url(self) -> str:
-        return self.targeting._zonecounty_dbx_url()
-
-
-    def _zonecounty_cache_days(self) -> int:
-        return self.targeting._zonecounty_cache_days()
-
-
-    def _zonecounty_dbx_path(self) -> Path:
-        return self.targeting._zonecounty_dbx_path()
-
-
-    async def _ensure_zonecounty_loaded(self) -> None:
-        await self.targeting._ensure_zonecounty_loaded()
-
-
-    def _mareas_enabled(self) -> bool:
-        return self.targeting._mareas_enabled()
-
-
-    def _mareas_url(self) -> str:
-        return self.targeting._mareas_url()
-
-
-    def _mareas_cache_days(self) -> int:
-        return self.targeting._mareas_cache_days()
-
-
-    def _mareas_path(self) -> Path:
-        return self.targeting._mareas_path()
-
-
-    async def _ensure_mareas_loaded(self) -> None:
-        await self.targeting._ensure_mareas_loaded()
-
-    async def _ensure_zone_client(self) -> httpx.AsyncClient:
-        return await self.targeting._ensure_zone_client()
-
-
-    async def _get_zone_json(self, zone_type: str, zone_id: str) -> dict | None:
-        return await self.targeting._get_zone_json(zone_type, zone_id)
-
-
-    def _same_list_from_zone_json(self, data: dict) -> list[str]:
-        return self.targeting._same_list_from_zone_json(data)
-
-
-    async def _ugc_zone_to_same(self, zone_id: str) -> list[str]:
-        return await self.targeting._ugc_zone_to_same(zone_id)
-
 
     async def _nwws_same_targets_from_texts(
         self,
@@ -1036,10 +930,8 @@ class Orchestrator:
     ) -> tuple[list[str], list[str], str, bool, "dt.datetime | None"]:
         return await self.targeting._nwws_same_targets_from_texts(primary_text, secondary_text)
 
-
     async def _nwws_wcn_watch_same_targets_from_area_desc(self, official_text: str) -> list[str]:
         return await self.targeting._nwws_wcn_watch_same_targets_from_area_desc(official_text)
-
 
 
     # ---- Rebroadcast rotation (no re-tone) ----
@@ -1221,18 +1113,6 @@ class Orchestrator:
         return set(senders)
 
     # ---- SAME toggles ----
-    def _same_enabled(self) -> bool:
-        return self.cfg.same.enabled
-
-    def _same_sender(self) -> str:
-        return self.cfg.same.sender
-
-    def _same_duration_minutes(self) -> int:
-        return self.cfg.same.duration_minutes
-
-    def _same_amplitude(self) -> float:
-        return self.cfg.same.amplitude
-
     # ---- RWT/RMT scheduler toggles ----
     def _tests_enabled(self) -> bool:
         return self.cfg.tests.enabled
@@ -1341,7 +1221,7 @@ class Orchestrator:
         spoken = "\n".join(lines).strip()
 
         dummy = SimpleNamespace(product_type=code, awips_id=None, wfo="KLWX", raw_text="")
-        out_wav = await self._render_alert_audio(dummy, spoken)
+        out_wav = await self.audio_originator.render_alert_audio(dummy, spoken)
 
         async with self._cycle_lock:
             try:
@@ -2232,7 +2112,7 @@ class Orchestrator:
 
         try:
             dummy = SimpleNamespace(product_type=same_code, awips_id=None, wfo="CAP", raw_text="")
-            out_wav = await self._render_alert_audio(dummy, script, same_locations=same_locs if same_locs else None)
+            out_wav = await self.audio_originator.render_alert_audio(dummy, script, same_locations=same_locs if same_locs else None)
 
             async with self._cycle_lock:
                 try:
@@ -2368,7 +2248,7 @@ class Orchestrator:
             return
 
         try:
-            out_wav = await self._render_voice_only_audio(script, prefix="capvoice")
+            out_wav = await self.audio_originator.render_voice_only_audio(script, prefix="capvoice")
 
             async with self._cycle_lock:
                 try:
@@ -2506,7 +2386,7 @@ class Orchestrator:
             return
 
         try:
-            out_wav = await self._render_voice_only_audio(script, prefix="capupdate")
+            out_wav = await self.audio_originator.render_voice_only_audio(script, prefix="capupdate")
             async with self._cycle_lock:
                 try:
                     self.telnet.flush_cycle()
@@ -2733,22 +2613,6 @@ class Orchestrator:
     def _build_cap_voice_script(self, ev: "CapAlertEvent") -> str:  # type: ignore[name-defined]
         return self.cap_text._build_cap_voice_script(ev)
 
-    async def _render_voice_only_audio(self, script_text: str, *, prefix: str = "capvoice") -> Path:
-        _, audio_dir, _, _ = self._paths()
-        ts = dt.datetime.now(tz=self._tz).strftime("%Y%m%d-%H%M%S")
-        safe_prefix = "".join(ch for ch in prefix if ch.isalnum() or ch in {"_", "-"}).strip() or "voice"
-
-        tts_wav = audio_dir / f"{safe_prefix}_{ts}_tts.wav"
-        pre = audio_dir / f"{safe_prefix}_{ts}_pre.wav"
-        post = audio_dir / f"{safe_prefix}_{ts}_post.wav"
-        out = audio_dir / f"{safe_prefix}_{ts}.wav"
-
-        write_silence_wav(pre, 0.35, self.cfg.audio.sample_rate)
-        self.tts.synth_to_wav(script_text, tts_wav)
-        write_silence_wav(post, 1.2, self.cfg.audio.sample_rate)
-        concat_wavs(out, [pre, tts_wav, post])
-        return out
-
     # ------------------------------------------------------------------
     # IPAWS CAP ingest
     # ------------------------------------------------------------------
@@ -2814,7 +2678,7 @@ class Orchestrator:
             dummy = SimpleNamespace(
                 product_type=event_code, awips_id=None, wfo="IPAWS", raw_text=""
             )
-            out_wav = await self._render_alert_audio(
+            out_wav = await self.audio_originator.render_alert_audio(
                 dummy,
                 script,
                 same_locations=same_locs if same_locs else None,
@@ -2948,7 +2812,7 @@ class Orchestrator:
             return
 
         try:
-            out_wav = await self._render_voice_only_audio(script, prefix="ipawsvoice")
+            out_wav = await self.audio_originator.render_voice_only_audio(script, prefix="ipawsvoice")
 
             async with self._cycle_lock:
                 try:
@@ -3232,7 +3096,7 @@ class Orchestrator:
             )
             dummy = SimpleNamespace(product_type=code, awips_id=None, wfo="ERN", raw_text="")
 
-            out_wav = await self._render_alert_audio(dummy, script, same_locations=in_area_locs)
+            out_wav = await self.audio_originator.render_alert_audio(dummy, script, same_locations=in_area_locs)
 
             async with self._cycle_lock:
                 try:
@@ -3505,10 +3369,10 @@ class Orchestrator:
                         vtec=parsed.vtec,
                         raw_text=parsed.raw_text,
                     )
-                out_wav = await self._render_alert_audio(render_parsed, spoken.script, same_locations=same_for_render)
+                out_wav = await self.audio_originator.render_alert_audio(render_parsed, spoken.script, same_locations=same_for_render)
             else:
                 # Voice-only always has no SAME headers by design.
-                out_wav = await self._render_voice_only_audio(spoken.script, prefix="nwwsvoice")
+                out_wav = await self.audio_originator.render_voice_only_audio(spoken.script, prefix="nwwsvoice")
 
             async with self._cycle_lock:
                 try:
@@ -3731,248 +3595,6 @@ class Orchestrator:
             await self._dedupe_release(keys)
             raise
 
-    async def _render_alert_audio(
-        self,
-        parsed: ParsedProduct,
-        script_text: str,
-        *,
-        same_locations: list[str] | None = None,
-    ) -> Path:
-        _, audio_dir, _, _ = self._paths()
-        ts = dt.datetime.now(tz=self._tz).strftime("%Y%m%d-%H%M%S")
-
-        tone = audio_dir / f"alert_{ts}_tone.wav"
-        tts_wav = audio_dir / f"alert_{ts}_tts.wav"
-        gap = audio_dir / f"alert_{ts}_gap.wav"
-        eom = audio_dir / f"alert_{ts}_eom.wav"
-        post = audio_dir / f"alert_{ts}_post.wav"
-        out = audio_dir / f"alert_{ts}.wav"
-
-        same_hdr_all: Path | None = None
-        same_eom_wav: Path | None = None
-
-        if self._same_enabled() and SameHeader is not None:
-            try:
-                # NEW semantics:
-                # - same_locations is None => default to full service area (legacy behavior)
-                # - same_locations is []   => explicitly DISABLE SAME for this alert
-                if same_locations is not None and len(same_locations) == 0:
-                    log.info("SAME targeting disabled for this alert (no locations computed)")
-                else:
-                    if same_locations is not None:
-                        locs = list(same_locations)
-                    else:
-                        locs = list(self.cfg.service_area.same_fips_all)
-
-                    if not locs:
-                        locs = ["000000"]
-
-                    chunks = chunk_locations(locs) if chunk_locations is not None else [[]]
-
-                    event_code = _safe_event_code(parsed.product_type)
-                    issued = dt.datetime.now(tz=dt.timezone.utc)
-
-                    hdr_wavs: list[Path] = []
-                    for i, loc_chunk in enumerate(chunks):
-                        hdr_msg = SameHeader(
-                            org="WXR",
-                            event=event_code,
-                            locations=tuple(loc_chunk) if loc_chunk else tuple(["000000"]),
-                            duration_minutes=self._same_duration_minutes(),
-                            sender=self._same_sender(),
-                            issued_utc=issued,
-                        ).as_ascii()
-
-                        hw = audio_dir / f"alert_{ts}_samehdr_{i}.wav"
-                        render_same_bursts_wav(  # type: ignore[misc]
-                            hw,
-                            hdr_msg,
-                            sample_rate=self.cfg.audio.sample_rate,
-                            amplitude=self._same_amplitude(),
-                            native_encoder=self.cfg.same.native_encoder,
-                        )
-                        hdr_wavs.append(hw)
-
-                    if len(hdr_wavs) == 1:
-                        same_hdr_all = hdr_wavs[0]
-                    elif len(hdr_wavs) > 1:
-                        msg_gap = audio_dir / f"alert_{ts}_samehdr_msg_gap.wav"
-                        write_silence_wav(msg_gap, 1.0, self.cfg.audio.sample_rate)
-
-                        same_hdr_all = audio_dir / f"alert_{ts}_samehdr_all.wav"
-                        parts2: list[Path] = []
-                        for i, hw in enumerate(hdr_wavs):
-                            parts2.append(hw)
-                            if i != len(hdr_wavs) - 1:
-                                parts2.append(msg_gap)
-                        concat_wavs(same_hdr_all, parts2)
-
-                    same_eom_wav = audio_dir / f"alert_{ts}_sameeom.wav"
-                    render_same_eom_wav(  # type: ignore[misc]
-                        same_eom_wav,
-                        sample_rate=self.cfg.audio.sample_rate,
-                        amplitude=self._same_amplitude(),
-                        native_encoder=self.cfg.same.native_encoder,
-                    )
-
-                    log.info(
-                        "SAME enabled: event=%s sender=%s locs=%d chunks=%d",
-                        event_code,
-                        self._same_sender(),
-                        len(locs),
-                        len(chunks),
-                    )
-            except Exception:
-                same_hdr_all = None
-                same_eom_wav = None
-                log.exception("SAME generation failed; continuing without SAME for this alert")
-                # _SAME_FAIL_DL_
-                self.discord.error(
-                    title="SAME generation failed",
-                    module="same.py",
-                    exception_type="Exception",
-                    message="SAME burst rendering raised an exception. Alert aired without SAME headers.",
-                    context={"alert_type": parsed.product_type, "wfo": parsed.wfo},
-                    fallback="Aired voice-only (no SAME)",
-                )
-
-        write_sine_wav(tone, self.cfg.audio.attention_tone_hz, self.cfg.audio.attention_tone_seconds, self.cfg.audio.sample_rate)
-        self.tts.synth_to_wav(script_text, tts_wav)
-        write_silence_wav(gap, self.cfg.audio.inter_segment_silence_seconds, self.cfg.audio.sample_rate)
-        write_silence_wav(post, self.cfg.audio.post_alert_silence_seconds, self.cfg.audio.sample_rate)
-
-        parts: list[Path] = []
-        if same_hdr_all:
-            parts.extend([same_hdr_all, gap])
-
-        parts.extend([tone, gap, tts_wav])
-
-        if same_eom_wav:
-            parts.extend([gap, same_eom_wav])
-        else:
-            write_sine_wav(eom, self.cfg.audio.eom_beep_hz, self.cfg.audio.eom_beep_seconds, self.cfg.audio.sample_rate, amplitude=0.18)
-            parts.extend([gap, eom])
-
-        parts.append(post)
-
-        concat_wavs(out, parts)
-        return out
-
-    def _assert_station_wav_format(self, wav_path: Path) -> None:
-        try:
-            with wave.open(str(wav_path), "rb") as wf:
-                channels = int(wf.getnchannels())
-                sample_width = int(wf.getsampwidth())
-                sample_rate = int(wf.getframerate())
-        except wave.Error as exc:
-            raise ValueError(f"Input WAV is not readable: {exc}") from exc
-
-        expected_rate = int(self.cfg.audio.sample_rate)
-        if channels != 2 or sample_width != 2 or sample_rate != expected_rate:
-            raise ValueError(
-                f"Input WAV must be stereo 16-bit PCM at {expected_rate} Hz; got channels={channels}, sample_width={sample_width}, sample_rate={sample_rate}"
-            )
-
-    async def _render_pre_recorded_alert_audio(
-        self,
-        *,
-        event_code: str,
-        source_wav: Path,
-        same_locations: list[str] | None = None,
-    ) -> Path:
-        self._assert_station_wav_format(source_wav)
-        _, audio_dir, _, _ = self._paths()
-        ts = dt.datetime.now(tz=self._tz).strftime("%Y%m%d-%H%M%S")
-
-        tone = audio_dir / f"api_audio_alert_{ts}_tone.wav"
-        gap = audio_dir / f"api_audio_alert_{ts}_gap.wav"
-        eom = audio_dir / f"api_audio_alert_{ts}_eom.wav"
-        post = audio_dir / f"api_audio_alert_{ts}_post.wav"
-        out = audio_dir / f"api_audio_alert_{ts}.wav"
-
-        same_hdr_all: Path | None = None
-        same_eom_wav: Path | None = None
-
-        if self._same_enabled() and SameHeader is not None:
-            try:
-                if same_locations is not None and len(same_locations) == 0:
-                    log.info("SAME targeting disabled for this prerecorded alert (no locations computed)")
-                else:
-                    if same_locations is not None:
-                        locs = list(same_locations)
-                    else:
-                        locs = list(self.cfg.service_area.same_fips_all)
-
-                    if not locs:
-                        locs = ["000000"]
-
-                    chunks = chunk_locations(locs) if chunk_locations is not None else [[]]
-                    issued = dt.datetime.now(tz=dt.timezone.utc)
-
-                    hdr_wavs: list[Path] = []
-                    for i, loc_chunk in enumerate(chunks):
-                        hdr_msg = SameHeader(
-                            org="WXR",
-                            event=_safe_event_code(event_code),
-                            locations=tuple(loc_chunk) if loc_chunk else tuple(["000000"]),
-                            duration_minutes=self._same_duration_minutes(),
-                            sender=self._same_sender(),
-                            issued_utc=issued,
-                        ).as_ascii()
-
-                        hw = audio_dir / f"api_audio_alert_{ts}_samehdr_{i}.wav"
-                        render_same_bursts_wav(
-                            hw,
-                            hdr_msg,
-                            sample_rate=self.cfg.audio.sample_rate,
-                            amplitude=self._same_amplitude(),
-                            native_encoder=self.cfg.same.native_encoder,
-                        )
-                        hdr_wavs.append(hw)
-
-                    if len(hdr_wavs) == 1:
-                        same_hdr_all = hdr_wavs[0]
-                    elif len(hdr_wavs) > 1:
-                        msg_gap = audio_dir / f"api_audio_alert_{ts}_samehdr_msg_gap.wav"
-                        write_silence_wav(msg_gap, 1.0, self.cfg.audio.sample_rate)
-                        same_hdr_all = audio_dir / f"api_audio_alert_{ts}_samehdr_all.wav"
-                        parts2: list[Path] = []
-                        for i, hw in enumerate(hdr_wavs):
-                            parts2.append(hw)
-                            if i != len(hdr_wavs) - 1:
-                                parts2.append(msg_gap)
-                        concat_wavs(same_hdr_all, parts2)
-
-                    same_eom_wav = audio_dir / f"api_audio_alert_{ts}_sameeom.wav"
-                    render_same_eom_wav(
-                        same_eom_wav,
-                        sample_rate=self.cfg.audio.sample_rate,
-                        amplitude=self._same_amplitude(),
-                        native_encoder=self.cfg.same.native_encoder,
-                    )
-            except Exception:
-                same_hdr_all = None
-                same_eom_wav = None
-                log.exception("SAME generation failed; continuing without SAME for prerecorded manual alert")
-
-        write_sine_wav(tone, self.cfg.audio.attention_tone_hz, self.cfg.audio.attention_tone_seconds, self.cfg.audio.sample_rate)
-        write_silence_wav(gap, self.cfg.audio.inter_segment_silence_seconds, self.cfg.audio.sample_rate)
-        write_silence_wav(post, self.cfg.audio.post_alert_silence_seconds, self.cfg.audio.sample_rate)
-
-        parts: list[Path] = []
-        if same_hdr_all:
-            parts.extend([same_hdr_all, gap])
-        parts.extend([tone, gap, source_wav])
-        if same_eom_wav:
-            parts.extend([gap, same_eom_wav])
-        else:
-            write_sine_wav(eom, self.cfg.audio.eom_beep_hz, self.cfg.audio.eom_beep_seconds, self.cfg.audio.sample_rate, amplitude=0.18)
-            parts.extend([gap, eom])
-        parts.append(post)
-
-        concat_wavs(out, parts)
-        return out
-
     def _manual_full_eas_should_heighten(self) -> bool:
         return self.cfg.api.manual_full_eas_heightens
 
@@ -4150,10 +3772,10 @@ class Orchestrator:
         if mode == "full_eas":
             filtered_same = self._filter_same_locations_to_service_area(same_locations, allow_statewide_input=False)
             dummy = SimpleNamespace(product_type=code, awips_id=None, wfo="LOCAL", raw_text="")
-            wav_path = await self._render_alert_audio(dummy, script_text, same_locations=filtered_same)
+            wav_path = await self.audio_originator.render_alert_audio(dummy, script_text, same_locations=filtered_same)
         else:
             filtered_same = []
-            wav_path = await self._render_voice_only_audio(script_text, prefix="api_text")
+            wav_path = await self.audio_originator.render_voice_only_audio(script_text, prefix="api_text")
 
         result = await self._push_manual_originated_audio(
             wav_path=wav_path,
@@ -4190,11 +3812,11 @@ class Orchestrator:
         path = Path(str(wav_path))
         if not path.exists():
             raise FileNotFoundError(str(path))
-        self._assert_station_wav_format(path)
+        self.audio_originator.assert_station_wav_format(path)
 
         if mode == "full_eas":
             filtered_same = self._filter_same_locations_to_service_area(same_locations, allow_statewide_input=False)
-            out_wav = await self._render_pre_recorded_alert_audio(
+            out_wav = await self.audio_originator.render_pre_recorded_alert_audio(
                 event_code=code,
                 source_wav=path,
                 same_locations=filtered_same,
