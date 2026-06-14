@@ -58,9 +58,9 @@ class SeasonalWeatherServiceRuntime:
 
         await o._wait_for_liquidsoap()
         o.discord.service_started(
-            cap_enabled=o._cap_enabled(),
-            ern_enabled=o._ern_enabled(),
-            tests_enabled=o._tests_enabled(),
+            cap_enabled=o.cfg.cap.enabled,
+            ern_enabled=o.cfg.ern.enabled,
+            tests_enabled=o.cfg.tests.enabled,
             mode=o.mode,
         )
 
@@ -109,7 +109,7 @@ class SeasonalWeatherServiceRuntime:
 
         if o.cfg.nwws.credentials_defaulted or not o.cfg.nwws.enabled:
             o.health_state.mark_disabled("nwws_oi", "nwws_disabled")
-        if not o._cap_enabled():
+        if not o.cfg.cap.enabled:
             o.health_state.mark_disabled("cap_api", "cap_disabled")
 
         def _health_changed(_ctx) -> None:
@@ -152,40 +152,40 @@ class SeasonalWeatherServiceRuntime:
                 tasks.append(asyncio.create_task(o.nwws_runtime.run(), name="nwws_consumer"))
         # CycleConductor runs the cycle continuously.
 
-        if o._cap_enabled():
+        if o.cfg.cap.enabled:
             if NwsCapPoller is None or CapAlertEvent is None:
                 log.warning("CAP enabled but cap_nws.py import failed; CAP is disabled.")
             else:
                 kwargs = dict(
                     out_queue=o.cap_queue,
                     same_fips_allow=o.cfg.service_area.same_fips_all,
-                    poll_seconds=o._cap_poll_seconds(),
-                    user_agent=o._cap_user_agent(),
+                    poll_seconds=o.cfg.cap.poll_seconds,
+                    user_agent=o.cfg.cap.user_agent,
                     ledger_path=o.cfg.cap.ledger_path,
                     ledger_max_age_days=o.cfg.cap.ledger_max_age_days,
                     database=o.database,
                 )
-                url = o._cap_url().strip()
+                url = o.cfg.cap.url.strip()
                 if url:
                     kwargs["url"] = url  # type: ignore[assignment]
 
                 cap = NwsCapPoller(**kwargs)  # type: ignore[arg-type]
                 tasks.append(asyncio.create_task(cap.run_forever(), name="cap_poller"))
                 tasks.append(asyncio.create_task(o.cap_runtime.run(), name="cap_consumer"))
-                log.info("CAP ingest enabled (dryrun=%s full=%s voice=%s)", o._cap_dryrun(), o._cap_full_enabled(), o._cap_voice_enabled())
+                log.info("CAP ingest enabled (dryrun=%s full=%s voice=%s)", o.cfg.cap.dryrun, o.cfg.cap.full.enabled, o.cfg.cap.voice.enabled)
         else:
             log.info("CAP ingest disabled (set cap.enabled: true in config.yaml to enable)")
 
-        if o._ipaws_enabled():
+        if o.cfg.ipaws.enabled:
             if IpawsCapPoller is None or IpawsCapEvent is None:
                 log.warning("IPAWS enabled but ipaws_cap.py import failed; IPAWS is disabled.")
             else:
                 ipaws_poller = IpawsCapPoller(
                     out_queue=o.ipaws_queue,
                     same_fips_allow=o.cfg.service_area.same_fips_all,
-                    poll_seconds=o._ipaws_poll_seconds(),
-                    user_agent=o._ipaws_user_agent(),
-                    url=o._ipaws_url(),
+                    poll_seconds=o.cfg.ipaws.poll_seconds,
+                    user_agent=o.cfg.ipaws.user_agent,
+                    url=o.cfg.ipaws.url,
                     ledger_path=o.cfg.ipaws.ledger_path,
                     ledger_max_age_days=o.cfg.ipaws.ledger_max_age_days,
                     database=o.database,
@@ -194,17 +194,17 @@ class SeasonalWeatherServiceRuntime:
                 tasks.append(asyncio.create_task(o.ipaws_runtime.run(), name="ipaws_consumer"))
                 log.info(
                     "IPAWS ingest enabled (dryrun=%s full_events=%s)",
-                    o._ipaws_dryrun(),
-                    ",".join(sorted(o._ipaws_full_events())),
+                    o.cfg.ipaws.dryrun,
+                    ",".join(sorted(set(o.cfg.ipaws.full_events))),
                 )
         else:
             log.info("IPAWS ingest disabled (set ipaws.enabled: true in config.yaml to enable)")
 
-        if o._ern_enabled():
+        if o.cfg.ern.enabled:
             if ErnGwesMonitor is None or ErnSameEvent is None:
                 log.warning("ERN enabled but ern_gwes.py import failed; ERN is disabled.")
             else:
-                url = o._ern_url()
+                url = o.cfg.ern.url.strip()
                 if not url:
                     log.warning("ERN enabled but SEASONAL_ERN_URL is empty; ERN is disabled.")
                 else:
@@ -225,9 +225,9 @@ class SeasonalWeatherServiceRuntime:
                     tasks.append(asyncio.create_task(o.ern_relay_runtime.run(), name="ern_consumer"))
                     log.info(
                         "ERN monitor enabled (dryrun=%s url=%s relay=%s decoder=%s)",
-                        o._ern_dryrun(),
+                        o.cfg.ern.dryrun,
                         url,
-                        o._ern_relay_enabled(),
+                        o.cfg.ern.relay.enabled,
                         ern_cfg.decoder_backend,
                     )
         else:

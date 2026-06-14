@@ -27,7 +27,7 @@ class RequiredTestRuntime:
 
     def start_scheduler(self, tasks: list[asyncio.Task[object]]) -> None:
         orch = self.orch
-        if not orch._tests_enabled():
+        if not orch.cfg.tests.enabled:
             log.info("RWT/RMT scheduler disabled (set tests.enabled: true in config.yaml to enable)")
             return
 
@@ -49,9 +49,9 @@ class RequiredTestRuntime:
                 rmt_hour=orch.cfg.tests.rmt.hour,
                 rmt_minute=orch.cfg.tests.rmt.minute,
 
-                jitter_seconds=orch._tests_jitter_seconds(),
-                postpone_minutes=orch._tests_postpone_minutes(),
-                max_postpone_hours=orch._tests_max_postpone_hours(),
+                jitter_seconds=orch.cfg.tests.jitter_seconds,
+                postpone_minutes=orch.cfg.tests.postpone_minutes,
+                max_postpone_hours=orch.cfg.tests.max_postpone_hours,
                 state_path=state_path,
                 state_key="rwt_rmt",
                 rwt_postpone_policy=orch.cfg.tests.rwt.postpone_policy,
@@ -133,15 +133,15 @@ class RequiredTestRuntime:
         if gate.block_heightened and orch.heightened_until and now < orch.heightened_until:
             return (False, "heightened mode active")
         if gate.block_recent_toneout and orch.last_toneout_at:
-            if (now - orch.last_toneout_at).total_seconds() < orch._tests_toneout_cooldown_seconds():
+            if (now - orch.last_toneout_at).total_seconds() < orch.cfg.tests.toneout_cooldown_seconds:
                 return (False, "recent tone-out cooldown")
 
         if gate.block_recent_severe_cap and orch.cap_last_severe_at:
-            if (now - orch.cap_last_severe_at).total_seconds() < orch._tests_cap_block_seconds():
+            if (now - orch.cap_last_severe_at).total_seconds() < orch.cfg.tests.cap_block_seconds:
                 return (False, "recent severe CAP match")
 
         if gate.block_recent_ern and orch.ern_last_tone_at:
-            if (now - orch.ern_last_tone_at).total_seconds() < orch._tests_ern_block_seconds():
+            if (now - orch.ern_last_tone_at).total_seconds() < orch.cfg.tests.ern_block_seconds:
                 return (False, "recent ERN SAME activity")
 
         return (True, "ok")

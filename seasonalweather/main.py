@@ -47,7 +47,6 @@ from .broadcast.service_runtime import SeasonalWeatherServiceRuntime
 
 # Active alert tracker (persistent cycle state across restarts)
 from .alerts.active import AlertTracker, _vtec_track_id
-from .alerts.focus import alert_holds_focus
 from .database.bootstrap import bootstrap_database_from_config
 from .database.housekeeping import DatabaseHousekeeper
 from .database.inserts import CycleInsertRepository
@@ -378,10 +377,6 @@ class Orchestrator:
                     m[str(k)] = s
         return m
 
-    def _np_cycle_title(self, key: str) -> str:
-        k = (key or "").strip()
-        return self._NP_CYCLE_TITLES.get(k, self._NP_CYCLE_TITLES["default"])
-
     def _np_alert_title(self, template_key: str, *, event: str) -> str:
         tpl = self._NP_ALERT_TEMPLATES.get(template_key, self._NP_ALERT_TEMPLATES["default"])
         return tpl.format(event=(event or "Alert").strip())
@@ -466,20 +461,6 @@ class Orchestrator:
         hrs = mins // 60
         rem = mins % 60
         return f"{hrs} hours" if rem == 0 else f"{hrs} hours and {rem} minutes"
-
-    def _has_focus_holding_alerts(self) -> bool:
-        try:
-            return any(
-                alert_holds_focus(a, self.cfg.cycle.alert_focus)
-                for a in self.alert_tracker.get_cycle_alerts()
-            )
-        except Exception:
-            return False
-
-    def _cycle_interval_seconds(self) -> int:
-        if self.mode == "heightened" or self._has_focus_holding_alerts():
-            return self.cfg.cycle.heightened_interval_seconds
-        return self.cfg.cycle.normal_interval_seconds
 
     def _schedule_cycle_refill(self, reason: str) -> None:
         """Reset continuous-cycle buffer/order after an external state change."""
@@ -801,151 +782,7 @@ class Orchestrator:
             return None
         return max(ends)
 
-    # ---- CAP toggles ----
-    def _cap_enabled(self) -> bool:
-        return self.cfg.cap.enabled
-
-    def _cap_dryrun(self) -> bool:
-        return self.cfg.cap.dryrun
-
-    def _cap_poll_seconds(self) -> int:
-        return self.cfg.cap.poll_seconds
-
-    def _cap_user_agent(self) -> str:
-        return self.cfg.cap.user_agent
-
-    def _cap_url(self) -> str:
-        return self.cfg.cap.url
-
-    def _cap_full_enabled(self) -> bool:
-        return self.cfg.cap.full.enabled
-
-    def _cap_full_severities(self) -> set[str]:
-        return {s.strip().lower() for s in self.cfg.cap.full.severities if s.strip()}
-
-    def _cap_full_events(self) -> set[str]:
-        events = [e.strip() for e in self.cfg.cap.full.events if e.strip()]
-        if events:
-            return set(events)
-        # Empty list in yaml means "match all qualifying severities" — use the canonical default set
-        return {
-            "Tornado Warning",
-            "Severe Thunderstorm Warning",
-            "Flash Flood Warning",
-            "Flood Warning",
-            "Hurricane Warning",
-            "Tropical Storm Warning",
-            "Storm Surge Warning",
-            "Extreme Wind Warning",
-            "Blizzard Warning",
-            "Winter Storm Warning",
-            "Ice Storm Warning",
-            "High Wind Warning",
-            "Wind Chill Warning",
-            "Tornado Watch",
-            "Severe Thunderstorm Watch",
-            "Flash Flood Watch",
-            "Flood Watch",
-            "Hurricane Watch",
-            "Tropical Storm Watch",
-            "Storm Surge Watch",
-            "Blizzard Watch",
-            "Winter Storm Watch",
-            "Ice Storm Watch",
-            "High Wind Watch",
-            "Wind Chill Watch",
-            "Winter Weather Advisory",
-            "Snow Squall Warning",
-            # Marine
-            "Special Marine Warning",
-        }
-
-    def _cap_full_cooldown_seconds(self) -> int:
-        return self.cfg.cap.full.cooldown_seconds
-
-    def _cap_voice_enabled(self) -> bool:
-        return self.cfg.cap.voice.enabled
-
-    def _cap_voice_events(self) -> set[str]:
-        return {e.strip() for e in self.cfg.cap.voice.events if e.strip()}
-
-    def _cap_voice_cooldown_seconds(self) -> int:
-        return self.cfg.cap.voice.cooldown_seconds
-
-    # ---- IPAWS CAP feed toggles ----
-    def _ipaws_enabled(self) -> bool:
-        return self.cfg.ipaws.enabled
-
-    def _ipaws_dryrun(self) -> bool:
-        return self.cfg.ipaws.dryrun
-
-    def _ipaws_poll_seconds(self) -> int:
-        return self.cfg.ipaws.poll_seconds
-
-    def _ipaws_user_agent(self) -> str:
-        return self.cfg.ipaws.user_agent
-
-    def _ipaws_url(self) -> str:
-        return self.cfg.ipaws.url
-
-    def _ipaws_full_events(self) -> set[str]:
-        return set(self.cfg.ipaws.full_events)
-
-    def _ipaws_voice_events(self) -> set[str]:
-        return set(self.cfg.ipaws.voice_events)
-
-    def _ipaws_ern_dedup_ttl(self) -> int:
-        return self.cfg.ipaws.ern_dedup_ttl_seconds
-
-    # ---- ERN/GWES SAME monitor toggles ----
-    def _ern_enabled(self) -> bool:
-        return self.cfg.ern.enabled
-
-    def _ern_dryrun(self) -> bool:
-        return self.cfg.ern.dryrun
-
-    def _ern_url(self) -> str:
-        return self.cfg.ern.url.strip()
-
-    def _ern_relay_enabled(self) -> bool:
-        return self.cfg.ern.relay.enabled
-
-    def _ern_relay_events(self) -> set[str]:
-        return {e.strip().upper() for e in self.cfg.ern.relay.events if e.strip()}
-
-    def _ern_relay_min_confidence(self) -> float:
-        return self.cfg.ern.relay.min_confidence
-
-    def _ern_relay_cooldown_seconds(self) -> int:
-        return self.cfg.ern.relay.cooldown_seconds
-
-    def _ern_relay_senders(self) -> set[str]:
-        senders = [s.strip().upper() for s in self.cfg.ern.relay.senders if s.strip()]
-        return set(senders)
-
-    # ---- SAME toggles ----
-    # ---- RWT/RMT scheduler toggles ----
-    def _tests_enabled(self) -> bool:
-        return self.cfg.tests.enabled
-
-    def _tests_postpone_minutes(self) -> int:
-        return self.cfg.tests.postpone_minutes
-
-    def _tests_max_postpone_hours(self) -> int:
-        return self.cfg.tests.max_postpone_hours
-
-    def _tests_jitter_seconds(self) -> int:
-        return self.cfg.tests.jitter_seconds
-
-    def _tests_toneout_cooldown_seconds(self) -> int:
-        return self.cfg.tests.toneout_cooldown_seconds
-
-    def _tests_cap_block_seconds(self) -> int:
-        return self.cfg.tests.cap_block_seconds
-
-    def _tests_ern_block_seconds(self) -> int:
-        return self.cfg.tests.ern_block_seconds
-
+    # ---- RWT/RMT control API compatibility ----
     async def _local_test_presentation(self, code: str, same_codes: list[str] | None = None) -> tuple[str, str, str]:
         return await self.tests_runtime.local_test_presentation(code, same_codes)
 
@@ -1045,7 +882,7 @@ class Orchestrator:
         return bool(set(_vtec_same_codes_for_vtec(vtec)) & allowed_codes)
 
     def _cap_should_full(self, ev: "CapAlertEvent") -> bool:  # type: ignore[name-defined]
-        if not self._cap_full_enabled():
+        if not self.cfg.cap.full.enabled:
             return False
         if not self._cap_is_actionable(ev):
             return False
@@ -1078,7 +915,7 @@ class Orchestrator:
         return False
 
     def _cap_should_voice(self, ev: "CapAlertEvent") -> bool:  # type: ignore[name-defined]
-        if not self._cap_voice_enabled():
+        if not self.cfg.cap.voice.enabled:
             return False
         if not self._cap_is_actionable(ev):
             return False
@@ -1092,7 +929,7 @@ class Orchestrator:
         True for CAP messageType=Update with CON/EXT/CAN/EXP actions on events we
         already watch-and-warn on.  These get voice-only narration (no SAME tones).
         """
-        if not self._cap_full_enabled():
+        if not self.cfg.cap.full.enabled:
             return False
         if not self._cap_is_actionable(ev):
             return False

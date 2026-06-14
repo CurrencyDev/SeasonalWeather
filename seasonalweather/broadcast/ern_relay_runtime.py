@@ -48,36 +48,36 @@ class ErnRelayRuntime:
             else:
                 log.info("ERN SAME EOM: conf=%.3f text=%s", ev.confidence, ev.text)
 
-            if host._ern_dryrun():
+            if host.cfg.ern.dryrun:
                 continue
-            if not host._ern_relay_enabled():
+            if not host.cfg.ern.relay.enabled:
                 continue
             if ev.kind != "header":
                 continue
 
             code = (ev.event or "").strip().upper()
-            if code not in host._ern_relay_events():
+            if code not in {e.strip().upper() for e in host.cfg.ern.relay.events if e.strip()}:
                 continue
 
             conf = float(getattr(ev, "confidence", 0.0) or 0.0)
-            if conf < host._ern_relay_min_confidence():
+            if conf < host.cfg.ern.relay.min_confidence:
                 log.info(
                     "ERN relay: confidence too low (%.3f < %.3f) event=%s sender=%s",
                     conf,
-                    host._ern_relay_min_confidence(),
+                    host.cfg.ern.relay.min_confidence,
                     code,
                     ev.sender,
                 )
                 continue
 
-            senders = host._ern_relay_senders()
+            senders = {s.strip().upper() for s in host.cfg.ern.relay.senders if s.strip()}
             sender_u = (ev.sender or "").strip().upper()
             if senders and sender_u not in senders:
                 log.info("ERN relay: sender not allowed (sender=%s allowed=%s)", ev.sender, ",".join(sorted(senders)))
                 continue
 
             now = dt.datetime.now(tz=host._tz)
-            if host._ern_relay_last_any_at and (now - host._ern_relay_last_any_at).total_seconds() < host._ern_relay_cooldown_seconds():
+            if host._ern_relay_last_any_at and (now - host._ern_relay_last_any_at).total_seconds() < host.cfg.ern.relay.cooldown_seconds:
                 log.info("ERN relay: cooldown active; skipping event=%s sender=%s", code, ev.sender)
                 continue
 

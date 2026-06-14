@@ -77,7 +77,7 @@ class CapRuntime:
             except Exception:
                 pass
 
-            if o._cap_dryrun():
+            if o.cfg.cap.dryrun:
                 continue
 
             if o._cap_should_full(ev):
@@ -98,7 +98,7 @@ class CapRuntime:
 
         key = (str(ev.alert_id or "").strip(), str(ev.sent or "").strip())
         last = o._cap_full_last_by_key.get(key)
-        if last and (now - last).total_seconds() < o._cap_full_cooldown_seconds():
+        if last and (now - last).total_seconds() < o.cfg.cap.full.cooldown_seconds:
             log.info("CAP full: cooldown active; skipping id=%s sent=%s event=%s", ev.alert_id, ev.sent, ev.event)
             return
 
@@ -293,7 +293,7 @@ class CapRuntime:
 
         key = (str(ev.alert_id or "").strip(), str(ev.sent or "").strip())
         last = o._cap_voice_last_by_key.get(key)
-        if last and (now - last).total_seconds() < o._cap_voice_cooldown_seconds():
+        if last and (now - last).total_seconds() < o.cfg.cap.voice.cooldown_seconds:
             log.info("CAP voice: cooldown active; skipping id=%s sent=%s event=%s", ev.alert_id, ev.sent, ev.event)
             return
 

@@ -74,8 +74,8 @@ class IpawsRuntime:
                 host._schedule_cycle_refill("post-ipaws-cancel")
                 continue
 
-            full_events = host._ipaws_full_events()
-            voice_events = host._ipaws_voice_events()
+            full_events = set(host.cfg.ipaws.full_events)
+            voice_events = set(host.cfg.ipaws.voice_events)
 
             should_full = event_code in full_events
             should_voice = (not should_full) and (event_code in voice_events)
@@ -87,7 +87,7 @@ class IpawsRuntime:
                 )
                 continue
 
-            if host._ipaws_dryrun():
+            if host.cfg.ipaws.dryrun:
                 log.info(
                     "IPAWS DRYRUN: would have aired %s code=%s id=%s",
                     "FULL" if should_full else "VOICE",
