@@ -38,10 +38,10 @@ from .broadcast.segment_store import SegmentStore
 from .broadcast.conductor import CycleConductor
 from .broadcast.segment_refresher import SegmentRefresher
 from .broadcast.cap_text import CapTextRenderer
-from .broadcast.ipaws_text import build_ipaws_script
 from .broadcast.product_text import render_nwws_product_script
 from .broadcast.audio_origination import AudioOriginator, safe_event_code as _safe_event_code
 from .broadcast.ern_relay_runtime import ErnRelayRuntime
+from .broadcast.ipaws_runtime import IpawsRuntime
 
 # Active alert tracker (persistent cycle state across restarts)
 from .alerts.active import ActiveAlert, AlertTracker, _vtec_track_id
@@ -218,7 +218,6 @@ class Orchestrator:
 
         # IPAWS queue (only used if IPAWS enabled and import succeeded)
         self.ipaws_queue: asyncio.Queue["IpawsCapEvent"] = asyncio.Queue(maxsize=200)  # type: ignore[name-defined]
-        self._ipaws_full_last_by_key: dict[tuple[str, str], dt.datetime] = {}
 
         # ERN queue (only used if ERN enabled and import succeeded)
         self.ern_queue: asyncio.Queue["ErnSameEvent"] = asyncio.Queue(maxsize=200)  # type: ignore[name-defined]
@@ -271,6 +270,7 @@ class Orchestrator:
             discord=self.discord,
         )
         self.ern_relay_runtime = ErnRelayRuntime(self)
+        self.ipaws_runtime = IpawsRuntime(self)
 
 
         # SegmentStore: persistent per-segment audio cache.
@@ -1249,7 +1249,7 @@ class Orchestrator:
                     database=self.database,
                 )
                 tasks.append(asyncio.create_task(ipaws_poller.run_forever(), name="ipaws_poller"))
-                tasks.append(asyncio.create_task(self._consume_ipaws(), name="ipaws_consumer"))
+                tasks.append(asyncio.create_task(self.ipaws_runtime.run(), name="ipaws_consumer"))
                 log.info(
                     "IPAWS ingest enabled (dryrun=%s full_events=%s)",
                     self._ipaws_dryrun(),
@@ -2432,370 +2432,6 @@ class Orchestrator:
 
     def _build_cap_voice_script(self, ev: "CapAlertEvent") -> str:  # type: ignore[name-defined]
         return self.cap_text._build_cap_voice_script(ev)
-
-    # ------------------------------------------------------------------
-    # IPAWS CAP ingest
-    # ------------------------------------------------------------------
-
-    def _build_ipaws_script(self, ev: "IpawsCapEvent") -> str:  # type: ignore[name-defined]
-        return build_ipaws_script(ev)
-
-    async def _air_ipaws_full(self, ev: "IpawsCapEvent") -> None:  # type: ignore[name-defined]
-        """
-        Air an IPAWS civil alert with full SAME tones.
-
-        Dedupe strategy (two keys):
-          1. IPAWSFULL:{identifier}|{sent}  — source-unique, prevents double-air
-             on repeated polls before the ledger clears.
-          2. _dedupe_func_full_key(event_code, same_locs)  — cross-source
-             functional key shared with ERN airing path, prevents WJON/CAP +
-             SeasonalWeather IPAWS double-air of the same civil alert.
-        """
-        now = dt.datetime.now(tz=self._tz)
-
-        key = (str(ev.identifier or "").strip(), str(ev.sent or "").strip())
-        last = self._ipaws_full_last_by_key.get(key)
-        if last and (now - last).total_seconds() < 180:
-            log.info(
-                "IPAWS full: cooldown active; skipping id=%s code=%s",
-                ev.identifier,
-                ev.event_code,
-            )
-            return
-
-        event_code = (ev.event_code or "").strip().upper()
-        event_label = (ev.event or event_code or "Alert").strip()
-
-        script = self._build_ipaws_script(ev)
-        if not script.strip():
-            return
-
-        same_locs_raw = list(ev.same_fips) if ev.same_fips else []
-        same_locs = self._filter_same_locations_to_service_area(same_locs_raw)
-
-        keys: list[str] = []
-
-        # Source-unique key.
-        id_part = self._sha1_12((ev.identifier or "") + "|" + (ev.sent or ""))
-        keys.append(f"IPAWSFULL:{id_part}")
-
-        # Cross-source functional key (shared with ERN path for this event+FIPS).
-        fkey = self._dedupe_func_full_key(event_code, same_locs or same_locs_raw)
-        if fkey:
-            keys.append(fkey)
-
-        ok, hit = await self._dedupe_reserve(keys)
-        if not ok:
-            log.info(
-                "IPAWS full skipped (dedupe hit=%s) id=%s code=%s",
-                hit,
-                ev.identifier,
-                event_code,
-            )
-            return
-
-        try:
-            dummy = SimpleNamespace(
-                product_type=event_code, awips_id=None, wfo="IPAWS", raw_text=""
-            )
-            out_wav = await self.audio_originator.render_alert_audio(
-                dummy,
-                script,
-                same_locations=same_locs if same_locs else None,
-            )
-
-            async with self._cycle_lock:
-                try:
-                    self.telnet.flush_cycle()
-                except Exception:
-                    pass
-                title = self._np_alert_title("cap_full", event=event_label)
-                meta = self._np_meta(
-                    title=title,
-                    kind="alert",
-                    extra={
-                        "sw_alert_source": "ipaws",
-                        "sw_alert_mode": "full",
-                        "sw_event": event_label,
-                        "sw_event_code": event_code,
-                        "sw_alert_id": str(ev.identifier or "").strip(),
-                    },
-                )
-                self.telnet.push_alert(str(out_wav), meta=meta)
-
-            self._ipaws_full_last_by_key[key] = now
-            self.last_product_desc = f"IPAWS {event_label}".strip()
-
-            # Heightened mode if this code is a toneout type.
-            try:
-                if event_code and event_code in self.cfg.policy.toneout_product_types:
-                    self.last_toneout_at = now
-                    self.last_heightened_at = now
-                    self.heightened_until = now + dt.timedelta(
-                        seconds=self.cfg.cycle.min_heightened_seconds
-                    )
-                    self._update_mode()
-            except Exception:
-                pass
-
-            self._schedule_cycle_refill("post-ipaws-full")
-
-            # AlertTracker — expire based on CAP expires field (no VTEC on civil alerts).
-            try:
-                tracker_id = f"IPAWS:{(ev.identifier or '').strip()}"
-                expires_iso = (ev.expires or "").strip() or (
-                    dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=2)
-                ).isoformat()
-                alert_entry = ActiveAlert(
-                    id=tracker_id,
-                    source="IPAWS",
-                    event=event_label,
-                    code=event_code,
-                    vtec=[],
-                    headline=str(ev.headline or event_label),
-                    script_text=script,
-                    audio_path=str(out_wav),
-                    expires=expires_iso,
-                    issued=str(ev.sent or dt.datetime.now(dt.timezone.utc).isoformat()),
-                    same_locs=same_locs or same_locs_raw,
-                    cycle_only=False,
-                    watch_number=None,
-                )
-                self.alert_tracker.add_or_update(alert_entry)
-                self.alert_tracker.mark_aired(tracker_id)
-                self._remove_shadowed_ern_state(
-                    code=event_code,
-                    same_locs=same_locs or same_locs_raw,
-                    reason=f"ipaws-full:{tracker_id}",
-                )
-                log.info(
-                    "AlertTracker: registered IPAWS FULL id=%s code=%s expires=%s",
-                    tracker_id,
-                    event_code,
-                    expires_iso,
-                )
-            except Exception:
-                log.exception(
-                    "AlertTracker: failed to register IPAWS FULL code=%s", event_code
-                )
-
-            log.info(
-                "IPAWS ACTION: aired FULL code=%s event=%s id=%s sender=%s audio=%s",
-                event_code,
-                event_label,
-                ev.identifier,
-                ev.sender_name_clean or ev.sender_name_raw or "",
-                out_wav,
-            )
-            self.discord.alert_aired(
-                code=event_code,
-                event=event_label,
-                source="IPAWS",
-                mode="full",
-                area=",".join(same_locs or same_locs_raw)[:160],
-                vtec=[],
-                expires=self._fmt_local_from_utc_iso(ev.expires or ""),
-            )
-
-        except Exception:
-            await self._dedupe_release(keys)
-            raise
-
-    async def _air_ipaws_voice(self, ev: "IpawsCapEvent") -> None:  # type: ignore[name-defined]
-        """
-        Air an IPAWS civil alert voice-only (no SAME tones).
-        Used for event codes in ipaws.voice_events.
-        """
-        event_code = (ev.event_code or "").strip().upper()
-        event_label = (ev.event or event_code or "Alert").strip()
-
-        script = self._build_ipaws_script(ev)
-        if not script.strip():
-            return
-
-        same_locs_raw = list(ev.same_fips) if ev.same_fips else []
-        same_locs = self._filter_same_locations_to_service_area(same_locs_raw)
-
-        id_part = self._sha1_12((ev.identifier or "") + "|" + (ev.sent or ""))
-        key_str = f"IPAWSVOICE:{id_part}"
-        fkey = self._dedupe_func_full_key(event_code, same_locs or same_locs_raw)
-        keys = [key_str] + ([fkey] if fkey else [])
-
-        ok, hit = await self._dedupe_reserve(keys)
-        if not ok:
-            log.info(
-                "IPAWS voice skipped (dedupe hit=%s) id=%s code=%s",
-                hit,
-                ev.identifier,
-                event_code,
-            )
-            return
-
-        try:
-            out_wav = await self.audio_originator.render_voice_only_audio(script, prefix="ipawsvoice")
-
-            async with self._cycle_lock:
-                try:
-                    self.telnet.flush_cycle()
-                except Exception:
-                    pass
-                title = self._np_alert_title("cap_full", event=event_label)
-                meta = self._np_meta(
-                    title=title,
-                    kind="alert",
-                    extra={
-                        "sw_alert_source": "ipaws",
-                        "sw_alert_mode": "voice",
-                        "sw_event": event_label,
-                        "sw_event_code": event_code,
-                        "sw_alert_id": str(ev.identifier or "").strip(),
-                    },
-                )
-                self.telnet.push_alert(str(out_wav), meta=meta)
-
-            self.last_product_desc = f"IPAWS {event_label}".strip()
-            self._schedule_cycle_refill("post-ipaws-voice")
-
-            try:
-                tracker_id = f"IPAWS:{(ev.identifier or '').strip()}"
-                expires_iso = (ev.expires or "").strip() or (
-                    dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=2)
-                ).isoformat()
-                alert_entry = ActiveAlert(
-                    id=tracker_id,
-                    source="IPAWS",
-                    event=event_label,
-                    code=event_code,
-                    vtec=[],
-                    headline=str(ev.headline or event_label),
-                    script_text=script,
-                    audio_path=str(out_wav),
-                    expires=expires_iso,
-                    issued=str(ev.sent or dt.datetime.now(dt.timezone.utc).isoformat()),
-                    same_locs=same_locs or same_locs_raw,
-                    cycle_only=True,
-                    watch_number=None,
-                )
-                self.alert_tracker.add_or_update(alert_entry)
-                self.alert_tracker.mark_aired(tracker_id)
-                self._remove_shadowed_ern_state(
-                    code=event_code,
-                    same_locs=same_locs or same_locs_raw,
-                    reason=f"ipaws-voice:{tracker_id}",
-                )
-                log.info(
-                    "AlertTracker: registered IPAWS VOICE id=%s code=%s expires=%s",
-                    tracker_id,
-                    event_code,
-                    expires_iso,
-                )
-            except Exception:
-                log.exception("AlertTracker: failed to register IPAWS VOICE code=%s", event_code)
-
-            log.info(
-                "IPAWS ACTION: aired VOICE code=%s event=%s id=%s audio=%s",
-                event_code,
-                event_label,
-                ev.identifier,
-                out_wav,
-            )
-            self.discord.alert_aired(
-                code=event_code,
-                event=event_label,
-                source="IPAWS",
-                mode="voice",
-                area=",".join(same_locs or same_locs_raw)[:160],
-                vtec=[],
-                expires=self._fmt_local_from_utc_iso(ev.expires or ""),
-            )
-
-        except Exception:
-            await self._dedupe_release(keys)
-            raise
-
-    async def _consume_ipaws(self) -> None:
-        """
-        Dispatch loop for IPAWS CAP events.
-
-        Routing:
-          event_code in ipaws.full_events  → _air_ipaws_full  (SAME tones)
-          event_code in ipaws.voice_events → _air_ipaws_voice (no tones)
-          anything else                    → silently logged and dropped
-
-        A dryrun=true config suppresses airing but logs what would have aired,
-        which is the right mode for initial deployment.
-        """
-        while True:
-            ev = await self.ipaws_queue.get()
-
-            event_code = (ev.event_code or "").strip().upper()
-            event_label = (ev.event or event_code or "").strip()
-            message_type = str(getattr(ev, "message_type", None) or "").strip().lower()
-
-            log.info(
-                "IPAWS event: code=%s event=%s id=%s sender=%s fips=%s",
-                event_code,
-                event_label,
-                ev.identifier,
-                ev.sender_name_clean or ev.sender_name_raw or "",
-                ",".join(ev.same_fips[:6]) + ("..." if len(ev.same_fips) > 6 else ""),
-            )
-
-            if message_type == "cancel":
-                same_locs = self._filter_same_locations_to_service_area(
-                    list(getattr(ev, "same_fips", None) or [])
-                )
-                removed_direct = self.alert_tracker.remove(f"IPAWS:{(ev.identifier or '').strip()}")
-                removed_matching = self._remove_matching_ipaws_state(
-                    code=event_code,
-                    same_locs=same_locs,
-                    reason=f"ipaws-cancel:{ev.identifier}",
-                )
-                log.info(
-                    "IPAWS cancel: removed active state direct=%s matching=%d code=%s id=%s",
-                    removed_direct,
-                    removed_matching,
-                    event_code,
-                    ev.identifier,
-                )
-                self._schedule_cycle_refill("post-ipaws-cancel")
-                continue
-
-            full_events = self._ipaws_full_events()
-            voice_events = self._ipaws_voice_events()
-
-            should_full = event_code in full_events
-            should_voice = (not should_full) and (event_code in voice_events)
-
-            if not should_full and not should_voice:
-                log.debug(
-                    "IPAWS: code=%s not in full_events or voice_events; dropping",
-                    event_code,
-                )
-                continue
-
-            if self._ipaws_dryrun():
-                log.info(
-                    "IPAWS DRYRUN: would have aired %s code=%s id=%s",
-                    "FULL" if should_full else "VOICE",
-                    event_code,
-                    ev.identifier,
-                )
-                continue
-
-            try:
-                if should_full:
-                    await self._air_ipaws_full(ev)
-                else:
-                    await self._air_ipaws_voice(ev)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception(
-                    "IPAWS: unhandled error airing code=%s id=%s",
-                    event_code,
-                    ev.identifier,
-                )
 
     async def _handle_toneout(self, parsed: ParsedProduct) -> None:
         log.info("NWWS toneout candidate: type=%s awips=%s wfo=%s", parsed.product_type, parsed.awips_id or "", parsed.wfo)
