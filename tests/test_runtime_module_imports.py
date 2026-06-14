@@ -3,6 +3,7 @@ from seasonalweather.broadcast.ipaws_runtime import IpawsRuntime
 from seasonalweather.broadcast.nwws_runtime import NwwsRuntime
 from seasonalweather.broadcast.pns_runtime import PnsRuntime
 from seasonalweather.broadcast.tests_runtime import RequiredTestRuntime
+from seasonalweather.broadcast.manual_runtime import ManualOriginationRuntime
 
 
 def test_source_runtime_modules_importable() -> None:
@@ -11,3 +12,4 @@ def test_source_runtime_modules_importable() -> None:
     assert NwwsRuntime is not None
     assert PnsRuntime is not None
     assert RequiredTestRuntime is not None
+    assert ManualOriginationRuntime is not None
