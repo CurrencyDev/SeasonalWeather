@@ -169,11 +169,6 @@ class IpawsRuntime:
             dummy = SimpleNamespace(
                 product_type=event_code, awips_id=None, wfo="IPAWS", raw_text=""
             )
-            out_wav = await host.audio_originator.render_alert_audio(
-                dummy,
-                script,
-                same_locations=same_locs if same_locs else None,
-            )
 
             title = host._np_alert_title("cap_full", event=event_label)
             meta = host._np_meta(
@@ -187,7 +182,19 @@ class IpawsRuntime:
                     "sw_alert_id": str(ev.identifier or "").strip(),
                 },
             )
-            await host._push_interrupt_audio(out_wav, meta=meta, full=True)
+            async def _render_ipaws_full():
+                return await host.audio_originator.render_alert_audio(
+                    dummy,
+                    script,
+                    same_locations=same_locs if same_locs else None,
+                )
+
+            out_wav = await host._render_and_push_interrupt_audio(
+                source="ipaws-full",
+                full=True,
+                render=_render_ipaws_full,
+                meta=meta,
+            )
 
             self._full_last_by_key[key] = now
             host.last_product_desc = f"IPAWS {event_label}".strip()
@@ -299,8 +306,6 @@ class IpawsRuntime:
             return
 
         try:
-            out_wav = await host.audio_originator.render_voice_only_audio(script, prefix="ipawsvoice")
-
             title = host._np_alert_title("cap_full", event=event_label)
             meta = host._np_meta(
                 title=title,
@@ -313,7 +318,15 @@ class IpawsRuntime:
                     "sw_alert_id": str(ev.identifier or "").strip(),
                 },
             )
-            await host._push_interrupt_audio(out_wav, meta=meta, full=False)
+            async def _render_ipaws_voice():
+                return await host.audio_originator.render_voice_only_audio(script, prefix="ipawsvoice")
+
+            out_wav = await host._render_and_push_interrupt_audio(
+                source="ipaws-voice",
+                full=False,
+                render=_render_ipaws_voice,
+                meta=meta,
+            )
 
             host.last_product_desc = f"IPAWS {event_label}".strip()
             host._schedule_cycle_refill("post-ipaws-voice")

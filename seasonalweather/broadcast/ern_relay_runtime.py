@@ -141,8 +141,6 @@ class ErnRelayRuntime:
             )
             dummy = SimpleNamespace(product_type=code, awips_id=None, wfo="ERN", raw_text="")
 
-            out_wav = await host.audio_originator.render_alert_audio(dummy, script, same_locations=in_area_locs)
-
             event_label = _same_label_or_code(code)
             title = host._np_alert_title("ern", event=event_label)
             meta = host._np_meta(
@@ -156,7 +154,19 @@ class ErnRelayRuntime:
                     "sw_sender": (ev.sender or "").strip(),
                 },
             )
-            await host._push_interrupt_audio(out_wav, meta=meta, full=True)
+            async def _render_ern_full():
+                return await host.audio_originator.render_alert_audio(
+                    dummy,
+                    script,
+                    same_locations=in_area_locs,
+                )
+
+            out_wav = await host._render_and_push_interrupt_audio(
+                source="ern-full",
+                full=True,
+                render=_render_ern_full,
+                meta=meta,
+            )
 
             host._ern_relay_last_any_at = now
             host.last_product_desc = f"ERN {code}".strip()

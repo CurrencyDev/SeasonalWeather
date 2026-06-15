@@ -36,6 +36,7 @@ from .broadcast.conductor import CycleConductor
 from .broadcast.segment_refresher import SegmentRefresher
 from .broadcast.cap_text import CapTextRenderer
 from .broadcast.audio_origination import AudioOriginator, safe_event_code as _safe_event_code
+from .broadcast.alert_audio_jobs import AlertAudioDispatcher
 from .broadcast.ern_relay_runtime import ErnRelayRuntime
 from .broadcast.ipaws_runtime import IpawsRuntime
 from .broadcast.cap_runtime import CapRuntime
@@ -228,6 +229,7 @@ class Orchestrator:
             paths=self._paths,
             discord=self.discord,
         )
+        self.alert_audio = AlertAudioDispatcher()
         self.ern_relay_runtime = ErnRelayRuntime(self)
         self.ipaws_runtime = IpawsRuntime(self)
         self.cap_runtime = CapRuntime(self)
@@ -511,41 +513,81 @@ class Orchestrator:
 
         FULL alerts preempt both the cycle plane and lower-priority voice updates.
         VOICE alerts interrupt only the cycle plane and never clear queued/current
-        FULL alerts.
+        FULL alerts.  Push the replacement interrupt before cutting the cycle so a
+        transient VOICE/FULL queue failure cannot create a false cut to dead air.
         """
-        async with self._cycle_lock:
-            try:
-                self.telnet.flush_cycle()
-            except Exception:
-                pass
 
+        def _try_telnet(method_name: str) -> bool:
+            method = getattr(self.telnet, method_name, None)
+            if method is None:
+                return False
+            try:
+                method()
+                return True
+            except Exception:
+                log.debug("Liquidsoap interrupt control failed: %s", method_name, exc_info=True)
+                return False
+
+        async with self._cycle_lock:
             if full:
-                # Clear queued/current lower-priority VOICE material before the
-                # FULL alert is pushed.  Some Liquidsoap versions expose only
-                # flush, only skip, or flush_and_skip, so try both safe controls.
+                # Clear stale/current material on the destination plane first,
+                # then clear lower-priority VOICE material.  Some Liquidsoap
+                # versions expose only flush, only skip, or flush_and_skip, so
+                # try both safe controls.
+                _try_telnet("flush_full_alert")
+                _try_telnet("skip_full_alert")
+                cleared_voice = False
                 for method_name in ("flush_voice_alert", "skip_voice_alert"):
-                    method = getattr(self.telnet, method_name, None)
-                    if method is None:
-                        continue
-                    try:
-                        method()
-                    except Exception:
-                        pass
-                if not hasattr(self.telnet, "flush_voice_alert") and not hasattr(self.telnet, "skip_voice_alert"):
-                    try:
-                        self.telnet.skip_alert()
-                    except Exception:
-                        pass
+                    cleared_voice = _try_telnet(method_name) or cleared_voice
+                if not cleared_voice:
+                    _try_telnet("skip_alert")
 
                 if hasattr(self.telnet, "push_full_alert"):
                     self.telnet.push_full_alert(str(wav_path), meta=meta)
                 else:
                     self.telnet.push_alert(str(wav_path), meta=meta)
+
+                _try_telnet("flush_cycle")
             else:
+                # A VOICE update should replace stale VOICE-plane material, but
+                # it must not disturb a queued/current FULL alert.  Admit the
+                # VOICE request before cutting the cycle; otherwise listeners can
+                # hear a false interrupt if the VOICE push fails or is delayed.
+                _try_telnet("flush_voice_alert")
+                _try_telnet("skip_voice_alert")
+
                 if hasattr(self.telnet, "push_voice_alert"):
                     self.telnet.push_voice_alert(str(wav_path), meta=meta)
                 else:
                     self.telnet.push_alert(str(wav_path), meta=meta)
+
+                _try_telnet("flush_cycle")
+
+
+    async def _render_and_push_interrupt_audio(
+        self,
+        *,
+        source: str,
+        full: bool,
+        render,
+        meta: dict[str, str] | None = None,
+    ):
+        """Render alert audio through the priority dispatcher, then push it."""
+
+        async def _push(path):
+            await self._push_interrupt_audio(path, meta=meta, full=full)
+
+        if full:
+            return await self.alert_audio.render_and_push_full(
+                source=source,
+                render=render,
+                push=_push,
+            )
+        return await self.alert_audio.render_and_push_voice(
+            source=source,
+            render=render,
+            push=_push,
+        )
 
 
     def _nwws_api_product_matches_raw(self, parsed: ParsedProduct, api_text: str) -> bool:

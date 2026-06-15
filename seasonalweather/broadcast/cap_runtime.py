@@ -201,7 +201,6 @@ class CapRuntime:
 
         try:
             dummy = SimpleNamespace(product_type=same_code, awips_id=None, wfo="CAP", raw_text="")
-            out_wav = await o.audio_originator.render_alert_audio(dummy, script, same_locations=same_locs if same_locs else None)
 
             event_label = (ev.event or "").strip() or "Weather alert"
             title = o._np_alert_title("cap_full", event=event_label)
@@ -216,7 +215,19 @@ class CapRuntime:
                     "sw_alert_id": str(ev.alert_id or "").strip(),
                 },
             )
-            await o._push_interrupt_audio(out_wav, meta=meta, full=True)
+            async def _render_cap_full():
+                return await o.audio_originator.render_alert_audio(
+                    dummy,
+                    script,
+                    same_locations=same_locs if same_locs else None,
+                )
+
+            out_wav = await o._render_and_push_interrupt_audio(
+                source="cap-full",
+                full=True,
+                render=_render_cap_full,
+                meta=meta,
+            )
 
             o._cap_full_last_by_key[key] = now
             o.last_product_desc = f"CAP {ev.event}".strip()
@@ -333,8 +344,6 @@ class CapRuntime:
             return
 
         try:
-            out_wav = await o.audio_originator.render_voice_only_audio(script, prefix="capvoice")
-
             event_label = (ev.event or "").strip() or "Weather alert"
             title = o._np_alert_title("cap_update", event=event_label)
             meta = o._np_meta(
@@ -348,7 +357,15 @@ class CapRuntime:
                     "sw_alert_id": str(ev.alert_id or "").strip(),
                 },
             )
-            await o._push_interrupt_audio(out_wav, meta=meta, full=False)
+            async def _render_cap_voice():
+                return await o.audio_originator.render_voice_only_audio(script, prefix="capvoice")
+
+            out_wav = await o._render_and_push_interrupt_audio(
+                source="cap-voice",
+                full=False,
+                render=_render_cap_voice,
+                meta=meta,
+            )
 
             o._cap_voice_last_by_key[key] = now
             o.last_product_desc = f"CAP {ev.event}".strip()
@@ -467,7 +484,6 @@ class CapRuntime:
             return
 
         try:
-            out_wav = await o.audio_originator.render_voice_only_audio(script, prefix="capupdate")
             event_label = ev_event or "Weather alert"
             title = o._np_alert_title("cap_update", event=event_label)
             meta = o._np_meta(
@@ -481,7 +497,15 @@ class CapRuntime:
                     "sw_alert_id": str(ev.alert_id or "").strip(),
                 },
             )
-            await o._push_interrupt_audio(out_wav, meta=meta, full=False)
+            async def _render_cap_update():
+                return await o.audio_originator.render_voice_only_audio(script, prefix="capupdate")
+
+            out_wav = await o._render_and_push_interrupt_audio(
+                source="cap-update",
+                full=False,
+                render=_render_cap_update,
+                meta=meta,
+            )
 
             o.last_product_desc = f"CAP {ev_event}".strip()
             o._schedule_cycle_refill("post-cap-update")

@@ -11,10 +11,10 @@ from .product_text import (
     build_warning_vtec_action_script as _build_warning_vtec_action_script_fn,
     cap_expiry_summary_line as _cap_expiry_summary_line,
     fmt_local_from_utc_iso as _fmt_local_from_utc_iso,
-    cap_full_opening_line as _cap_full_opening_line,
-    cap_normalize_nws_headline as _cap_normalize_nws_headline,
     cap_prefers_statement_update_script as _cap_prefers_statement_update_script_fn,
-    cap_statement_intro as _cap_statement_intro,
+    build_nws_full_alert_script as _build_nws_full_alert_script,
+    build_nws_voice_alert_script as _build_nws_voice_alert_script,
+    NwsAlertTextInput,
     clean_cap_text as _pt_clean_cap_text,
     join_oxford as _pt_join_oxford,
     parse_cap_area_by_state as _pt_parse_cap_area_by_state,
@@ -465,75 +465,35 @@ class CapTextRenderer:
         )
 
     def _build_cap_full_script(self, ev: "CapAlertEvent") -> str:  # type: ignore[name-defined]
-        event = self._clean_cap_text(ev.event or "", limit=120)
-        desc = self._clean_cap_text(getattr(ev, "description", "") or "", limit=1200)
-        instr = self._clean_cap_text(getattr(ev, "instruction", "") or "", limit=700)
-
-        # Use NWSheadline when the NWS provides one (e.g. area-extension updates
-        # where NWSheadline says "… EXPANDED TO INCLUDE …").
-        # For new-issuance warnings (NEW/UPG), NWSheadline is absent; the
-        # description already contains the full, well-formatted NWS narrative and
-        # is the correct thing to read.  Never use the raw CAP headline field —
-        # it's always the bland "… issued <date> by NWS <office>" string.
-        params = getattr(ev, "parameters", {}) or {}
-
-        lines: list[str] = []
-        opening = _cap_full_opening_line(
-            event=event,
-            sent_iso=getattr(ev, "sent", None),
-            parameters=params,
+        """CAP adapter → central NWS full-alert formatter."""
+        return _build_nws_full_alert_script(
+            NwsAlertTextInput(
+                event=str(getattr(ev, "event", "") or ""),
+                headline=str(getattr(ev, "headline", "") or ""),
+                description=str(getattr(ev, "description", "") or ""),
+                instruction=str(getattr(ev, "instruction", "") or ""),
+                area_desc=str(getattr(ev, "area_desc", "") or ""),
+                sent_iso=getattr(ev, "sent", None),
+                expires_iso=getattr(ev, "expires", None),
+                parameters=getattr(ev, "parameters", {}) or {},
+                vtec=self._cap_vtec_list(ev),
+            ),
             sps_preamble=self._cap_sps_preamble,
         )
-        if opening:
-            lines.append(opening)
-
-        if desc:
-            lines.append(desc)
-
-        if instr:
-            lines.append("Instructions.")
-            lines.append(instr)
-
-        lines.append("End of message.")
-        return "\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
 
     def _build_cap_voice_script(self, ev: "CapAlertEvent") -> str:  # type: ignore[name-defined]
-        event = self._clean_cap_text(ev.event or "", limit=120)
-        area_desc = self._clean_cap_text(getattr(ev, "area_desc", "") or "", limit=400)
-        desc = self._clean_cap_text(getattr(ev, "description", "") or "", limit=900)
-        instr = self._clean_cap_text(getattr(ev, "instruction", "") or "", limit=500)
-
-        # Prefer NWSheadline — the NWR-friendly "in effect until …" line present
-        # in properties.parameters.NWSheadline — over the bland CAP headline field
-        # ("Dense Fog Advisory issued April 2 at 7:44PM EDT … by NWS Baltimore …").
-        params = getattr(ev, "parameters", {}) or {}
-        nws_hl = _cap_normalize_nws_headline(params)
-
-        is_sps = (event or "").strip().lower() == "special weather statement"
-
-        lines: list[str] = []
-        if event:
-            lines.append(
-                _cap_statement_intro(
-                    event=event,
-                    sent_iso=getattr(ev, "sent", None),
-                    sps_preamble=self._cap_sps_preamble,
-                )
-            )
-
-            if not is_sps:
-                # NWSheadline is the concise, human-readable summary (e.g.
-                # "Dense fog advisory in effect until 5 AM EDT Friday").
-                # If absent, fall back to the event name as a plain header.
-                if nws_hl:
-                    lines.append(nws_hl if nws_hl.endswith((".", "!", "?")) else nws_hl + ".")
-                else:
-                    lines.append(f"{event}.")
-
-        if desc:
-            lines.append(desc)
-        if instr:
-            lines.append("Instructions.")
-            lines.append(instr)
-
-        return "\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
+        """CAP adapter → central NWS voice/update formatter."""
+        return _build_nws_voice_alert_script(
+            NwsAlertTextInput(
+                event=str(getattr(ev, "event", "") or ""),
+                headline=str(getattr(ev, "headline", "") or ""),
+                description=str(getattr(ev, "description", "") or ""),
+                instruction=str(getattr(ev, "instruction", "") or ""),
+                area_desc=str(getattr(ev, "area_desc", "") or ""),
+                sent_iso=getattr(ev, "sent", None),
+                expires_iso=getattr(ev, "expires", None),
+                parameters=getattr(ev, "parameters", {}) or {},
+                vtec=self._cap_vtec_list(ev),
+            ),
+            sps_preamble=self._cap_sps_preamble,
+        )

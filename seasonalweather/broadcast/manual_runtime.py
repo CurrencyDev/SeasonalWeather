@@ -65,7 +65,17 @@ class ManualOriginationRuntime:
                 "sw_actor": (actor or "").strip(),
             },
         )
-        await self.orch._push_interrupt_audio(wav_path, meta=meta, full=(mode == "full_eas"))
+        full = mode == "full_eas"
+
+        async def _use_existing_audio():
+            return wav_path
+
+        wav_path = await self.orch._render_and_push_interrupt_audio(
+            source="manual-full" if full else "manual-voice",
+            full=full,
+            render=_use_existing_audio,
+            meta=meta,
+        )
 
         now = dt.datetime.now(tz=self.orch._tz)
         title = (headline or "Manual message").strip() or "Manual message"

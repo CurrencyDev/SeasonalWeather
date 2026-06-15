@@ -120,6 +120,7 @@ class SeasonalWeatherServiceRuntime:
                 log.exception("Health state change refresh failed")
 
         tasks.append(asyncio.create_task(o.health_state.run_forever(on_change=_health_changed), name="health_state"))
+        o.alert_audio.start(tasks)
 
         # CycleConductor + SegmentRefresher own routine cycle scheduling.
         tasks.append(asyncio.create_task(o.conductor.run(), name="conductor"))

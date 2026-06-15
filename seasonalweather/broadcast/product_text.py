@@ -403,6 +403,99 @@ def cap_full_opening_line(
     return f"{str(event).strip()}."
 
 
+
+
+@dataclass(frozen=True)
+class NwsAlertTextInput:
+    """Canonical NWS alert text input, independent of transport.
+
+    CAP/JSON-LD, IPAWS CAP, NWWS-OI raw products, and API backfill should
+    adapt into this shape before final spoken prose is built.  Transport
+    parsers may still differ; final NWS prose should live here.
+    """
+
+    event: str = ""
+    headline: str = ""
+    description: str = ""
+    instruction: str = ""
+    area_desc: str = ""
+    sent_iso: str | None = None
+    expires_iso: str | None = None
+    parameters: dict | None = None
+    vtec: list[str] | None = None
+    vtec_actions: set[str] | None = None
+
+
+def build_nws_full_alert_script(
+    text: NwsAlertTextInput,
+    *,
+    sps_preamble: Callable[[str | None], str],
+) -> str:
+    """Build central full-read NWS alert prose from canonical fields."""
+    event = clean_cap_text(text.event or "", limit=120)
+    desc = clean_cap_text(text.description or "", limit=1200)
+    instr = clean_cap_text(text.instruction or "", limit=700)
+    params = text.parameters or {}
+
+    lines: list[str] = []
+    opening = cap_full_opening_line(
+        event=event,
+        sent_iso=text.sent_iso,
+        parameters=params,
+        sps_preamble=sps_preamble,
+    )
+    if opening:
+        lines.append(opening)
+
+    if desc:
+        lines.append(desc)
+
+    if instr:
+        lines.append("Instructions.")
+        lines.append(instr)
+
+    lines.append("End of message.")
+    return "\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
+
+
+def build_nws_voice_alert_script(
+    text: NwsAlertTextInput,
+    *,
+    sps_preamble: Callable[[str | None], str],
+) -> str:
+    """Build central voice-only NWS alert/update prose from canonical fields."""
+    event = clean_cap_text(text.event or "", limit=120)
+    desc = clean_cap_text(text.description or "", limit=900)
+    instr = clean_cap_text(text.instruction or "", limit=500)
+    params = text.parameters or {}
+    nws_hl = cap_normalize_nws_headline(params)
+    is_sps = cap_is_special_weather_statement(event)
+
+    lines: list[str] = []
+    if event:
+        lines.append(
+            cap_statement_intro(
+                event=event,
+                sent_iso=text.sent_iso,
+                sps_preamble=sps_preamble,
+            )
+        )
+
+        if not is_sps:
+            if nws_hl:
+                lines.append(nws_hl if nws_hl.endswith((".", "!", "?")) else nws_hl + ".")
+            else:
+                lines.append(f"{event}.")
+
+    if desc:
+        lines.append(desc)
+    if instr:
+        lines.append("Instructions.")
+        lines.append(instr)
+
+    return "\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
+
+
 # ---------------------------------------------------------------------------
 # Expiry / cancellation helpers
 # ---------------------------------------------------------------------------
@@ -1581,7 +1674,7 @@ def build_nwws_statement_vtec_action_script(
     )
 
 
-def render_nwws_product_script(
+def render_nws_product_script(
     *,
     product_type: str,
     base_script: str,
@@ -1596,11 +1689,12 @@ def render_nwws_product_script(
     local_tz: dt.tzinfo | None = None,
 ) -> NwwsScriptRenderResult:
     """
-    Normalize NWWS spoken scripts after the generic alert builder.
+    Normalize NWS spoken scripts after the generic alert builder.
 
-    This function owns the product-specific narration overrides that used to live
-    in main.py: WCN watch wording, SPS preambles, partial cancels, terminal
-    cancels/expirations, and statement-style CAN/EXP narration.
+    This central formatter owns product-specific narration overrides for NWS
+    products regardless of transport: WCN watch wording, SPS preambles, partial
+    cancels, terminal cancels/expirations, and statement-style CAN/EXP narration.
+    The historical NWWS name remains as a compatibility alias below.
     """
     ptype = (product_type or "").strip().upper()
     script = base_script or ""
@@ -1721,6 +1815,11 @@ def render_nwws_product_script(
     )
 
 
+def render_nwws_product_script(**kwargs) -> NwwsScriptRenderResult:
+    """Compatibility wrapper for the central NWS product formatter."""
+    return render_nws_product_script(**kwargs)
+
+
 __all__ = [
     # Constants
     "STATE_NAME_FULL",
@@ -1733,6 +1832,10 @@ __all__ = [
     "nws_header_issued_phrase",
     "parse_cap_area_by_state",
     "sps_preamble",
+    # Central NWS alert text model
+    "NwsAlertTextInput",
+    "build_nws_full_alert_script",
+    "build_nws_voice_alert_script",
     # CAP helpers (pre-existing)
     "cap_area_label",
     "cap_expiry_summary_line",
@@ -1759,5 +1862,6 @@ __all__ = [
     "build_nwws_watch_vtec_script",
     "build_nwws_watch_partial_cancel_script",
     "NwwsScriptRenderResult",
+    "render_nws_product_script",
     "render_nwws_product_script",
 ]

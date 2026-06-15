@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+import time
 from typing import Any
 
 from ..alerts.active import ActiveAlert
@@ -24,16 +25,54 @@ class PnsRuntime:
     def __init__(self, host: Any) -> None:
         self.host = host
         self.state = PnsStateMachine(host.cfg.pns, tz=host._tz)
+        self._recent_log_keys: dict[str, tuple[float, int]] = {}
+        self._log_repeat_window_s = 1800.0
 
     def evaluate(self, *args: Any, **kwargs: Any) -> PnsDecision:
         return self.state.evaluate(*args, **kwargs)
+
+    def _should_log_repeatable(self, key: str, *, now: float | None = None) -> tuple[bool, int]:
+        """Return whether an INFO line should be emitted for a repeatable PNS result.
+
+        API backfill polls the same latest PNS products repeatedly. Suppressed and
+        deduped decisions are expected to repeat until the upstream latest-product
+        pointer advances, so keep the first occurrence visible and collapse
+        subsequent repeats into DEBUG noise until the repeat window expires.
+        """
+        ts = time.monotonic() if now is None else now
+        last = self._recent_log_keys.get(key)
+        if last is None:
+            self._recent_log_keys[key] = (ts, 0)
+            return True, 0
+
+        last_ts, suppressed = last
+        if ts - last_ts >= self._log_repeat_window_s:
+            self._recent_log_keys[key] = (ts, 0)
+            return True, suppressed
+
+        self._recent_log_keys[key] = (last_ts, suppressed + 1)
+        return False, suppressed + 1
 
     async def queue_decision(self, decision: PnsDecision, *, wfo: str, awips_id: str, context: str) -> bool:
         """Queue an accepted PNS decision as cycle-only active-alert state."""
         host = self.host
         if not decision.is_audio:
-            log.info(
-                "PNS audio suppressed; source=%s wfo=%s awips=%s action=%s subtype=%s reason=%s signals=%s",
+            repeat_key = ":".join(
+                [
+                    "suppressed",
+                    context,
+                    wfo,
+                    awips_id or "",
+                    decision.action,
+                    decision.subtype,
+                    decision.reason,
+                    ",".join(decision.signals),
+                ]
+            )
+            should_log, repeats = self._should_log_repeatable(repeat_key)
+            log_method = log.info if should_log else log.debug
+            log_method(
+                "PNS audio suppressed; source=%s wfo=%s awips=%s action=%s subtype=%s reason=%s signals=%s%s",
                 context,
                 wfo,
                 awips_id or "",
@@ -41,12 +80,23 @@ class PnsRuntime:
                 decision.subtype,
                 decision.reason,
                 ",".join(decision.signals) or "-",
+                f" suppressed_repeats={repeats}" if should_log and repeats else "",
             )
             return False
 
         ok_pns, _ = await host._dedupe_reserve([decision.key])
         if not ok_pns:
-            log.info("PNS skipped (dedupe); source=%s id=%s subtype=%s wfo=%s", context, decision.key, decision.subtype, wfo)
+            repeat_key = ":".join(["dedupe", context, decision.key, decision.subtype, wfo])
+            should_log, repeats = self._should_log_repeatable(repeat_key)
+            log_method = log.info if should_log else log.debug
+            log_method(
+                "PNS skipped (dedupe); source=%s id=%s subtype=%s wfo=%s%s",
+                context,
+                decision.key,
+                decision.subtype,
+                wfo,
+                f" suppressed_repeats={repeats}" if should_log and repeats else "",
+            )
             return False
 
         pns_exp_utc = decision.expires_utc or (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=4))

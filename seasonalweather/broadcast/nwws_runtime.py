@@ -10,7 +10,7 @@ from ..alerts.vtec import toneout_policy as _vtec_toneout_policy
 from .audio_origination import safe_event_code as _safe_event_code
 from .cap_policy import best_expiry_from_vtec, vtec_matches_configured_toneout_code
 from .pns import parse_nws_header_issued_dt, pns_text_same_issuance
-from .product_text import render_nwws_product_script
+from .product_text import render_nws_product_script
 from .station_feed_runtime import (
     nwws_area_from_text as _sf_nwws_area_from_text,
     nwws_best_issued_dt as _sf_nwws_best_issued_dt,
@@ -353,7 +353,7 @@ class NwwsRuntime:
             )
 
             try:
-                rendered_script = render_nwws_product_script(
+                rendered_script = render_nws_product_script(
                     product_type=parsed.product_type,
                     base_script=spoken.script,
                     official_text=official_text,
@@ -384,16 +384,17 @@ class NwwsRuntime:
             except Exception:
                 log.exception("NWWS script normalization failed; continuing with original script")
 
+            same_for_render: list[str] = []
+            render_parsed = parsed
             if should_full:
                 # If we have in-area SAME targets, use them. Otherwise, AIR WITHOUT SAME (no 67 fallback).
-                same_for_render: list[str] = list(in_area_same) if in_area_same else []
+                same_for_render = list(in_area_same) if in_area_same else []
                 if zones and not mapped_ok:
                     log.warning(
                         "NWWS SAME targeting unavailable (zone map failed); airing without SAME headers type=%s wfo=%s",
                         parsed.product_type,
                         parsed.wfo,
                     )
-                render_parsed = parsed
                 if _nw_policy.same_code and _nw_policy.same_code != (parsed.product_type or "").strip().upper():
                     render_parsed = ParsedProduct(
                         product_type=_nw_policy.same_code,
@@ -402,10 +403,6 @@ class NwwsRuntime:
                         vtec=parsed.vtec,
                         raw_text=parsed.raw_text,
                     )
-                out_wav = await self.audio_originator.render_alert_audio(render_parsed, spoken.script, same_locations=same_for_render)
-            else:
-                # Voice-only always has no SAME headers by design.
-                out_wav = await self.audio_originator.render_voice_only_audio(spoken.script, prefix="nwwsvoice")
 
             event_label = sf_event_label
             if (not should_full) and (("EXP" in vtec_actions) or ("CAN" in vtec_actions)):
@@ -427,7 +424,33 @@ class NwwsRuntime:
                     "sw_awips": (parsed.awips_id or "").strip(),
                 },
             )
-            await self._push_interrupt_audio(out_wav, meta=meta, full=should_full)
+            if should_full:
+                async def _render_nwws_full():
+                    return await self.audio_originator.render_alert_audio(
+                        render_parsed,
+                        spoken.script,
+                        same_locations=same_for_render,
+                    )
+
+                out_wav = await self._render_and_push_interrupt_audio(
+                    source="nwws-full",
+                    full=True,
+                    render=_render_nwws_full,
+                    meta=meta,
+                )
+            else:
+                async def _render_nwws_voice():
+                    return await self.audio_originator.render_voice_only_audio(
+                        spoken.script,
+                        prefix="nwwsvoice",
+                    )
+
+                out_wav = await self._render_and_push_interrupt_audio(
+                    source="nwws-voice",
+                    full=False,
+                    render=_render_nwws_voice,
+                    meta=meta,
+                )
 
             now = dt.datetime.now(tz=self._tz)
 

@@ -622,10 +622,16 @@ class OrchestratorControl:
             },
         )
         if interrupt_policy == InterruptPolicy.INTERRUPT_THEN_REFILL.value:
-            await self.orch._push_interrupt_audio(
-                wav_path,
+            full = voice_mode == VoiceMode.FULL_EAS.value
+
+            async def _use_existing_audio():
+                return wav_path
+
+            await self.orch._render_and_push_interrupt_audio(
+                source="api-full" if full else "api-voice",
+                full=full,
+                render=_use_existing_audio,
                 meta=meta,
-                full=(voice_mode == VoiceMode.FULL_EAS.value),
             )
         else:
             async with self.orch._cycle_lock:

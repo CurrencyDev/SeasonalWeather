@@ -35,18 +35,38 @@ class _FakeTelnet:
         self.pushed = []
         self.flushed_cycle = 0
         self.flushed_voice = 0
+        self.flushed_full = 0
+        self.skipped_voice = 0
+        self.skipped_full = 0
+        self.ops = []
 
     def flush_cycle(self) -> None:
         self.flushed_cycle += 1
+        self.ops.append("flush_cycle")
 
     def flush_voice_alert(self) -> None:
         self.flushed_voice += 1
+        self.ops.append("flush_voice")
+
+    def flush_full_alert(self) -> None:
+        self.flushed_full += 1
+        self.ops.append("flush_full")
+
+    def skip_voice_alert(self) -> None:
+        self.skipped_voice += 1
+        self.ops.append("skip_voice")
+
+    def skip_full_alert(self) -> None:
+        self.skipped_full += 1
+        self.ops.append("skip_full")
 
     def push_full_alert(self, path: str, *, meta=None) -> None:
         self.pushed.append(("full", path, meta or {}))
+        self.ops.append("push_full")
 
     def push_voice_alert(self, path: str, *, meta=None) -> None:
         self.pushed.append(("voice", path, meta or {}))
+        self.ops.append("push_voice")
 
     def push_alert(self, path: str, *, meta=None) -> None:
         self.push_voice_alert(path, meta=meta)
@@ -183,6 +203,7 @@ def test_cap_full_runtime_path_smoke(tmp_path, monkeypatch):
     assert orch.telnet.pushed
     assert orch.telnet.pushed[-1][0] == "full"
     assert orch.telnet.flushed_voice == 1
+    assert orch.telnet.ops.index("push_full") < orch.telnet.ops.index("flush_cycle")
     assert any(kind == "aired" for kind, _payload in orch.discord.calls)
 
 
@@ -198,6 +219,8 @@ def test_cap_voice_runtime_path_smoke(tmp_path, monkeypatch):
     assert "Severe Thunderstorm Warning" in script
     assert orch.telnet.pushed
     assert orch.telnet.pushed[-1][0] == "voice"
+    assert orch.telnet.flushed_voice == 1
+    assert orch.telnet.ops.index("push_voice") < orch.telnet.ops.index("flush_cycle")
 
 
 def test_nwws_full_runtime_path_smoke(tmp_path, monkeypatch):
@@ -213,6 +236,7 @@ def test_nwws_full_runtime_path_smoke(tmp_path, monkeypatch):
     assert orch.telnet.pushed
     assert orch.telnet.pushed[-1][0] == "full"
     assert orch.telnet.flushed_voice == 1
+    assert orch.telnet.ops.index("push_full") < orch.telnet.ops.index("flush_cycle")
 
 
 def test_nwws_voice_runtime_path_smoke(tmp_path, monkeypatch):
@@ -228,3 +252,5 @@ def test_nwws_voice_runtime_path_smoke(tmp_path, monkeypatch):
     assert "severe thunderstorm warning" in script.lower()
     assert orch.telnet.pushed
     assert orch.telnet.pushed[-1][0] == "voice"
+    assert orch.telnet.flushed_voice == 1
+    assert orch.telnet.ops.index("push_voice") < orch.telnet.ops.index("flush_cycle")

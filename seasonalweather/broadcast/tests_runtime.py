@@ -168,12 +168,19 @@ class RequiredTestRuntime:
         spoken = "\n".join(lines).strip()
 
         dummy = SimpleNamespace(product_type=code, awips_id=None, wfo="KLWX", raw_text="")
-        out_wav = await orch.audio_originator.render_alert_audio(dummy, spoken)
 
         tkey = "rwt" if code == "RWT" else "rmt"
         title = orch._np_alert_title(tkey, event="")
         meta = orch._np_meta(title=title, kind="test", extra={"sw_alert_source": "local", "sw_event_code": code})
-        await orch._push_interrupt_audio(out_wav, meta=meta, full=True)
+        async def _render_required_test():
+            return await orch.audio_originator.render_alert_audio(dummy, spoken)
+
+        out_wav = await orch._render_and_push_interrupt_audio(
+            source=f"local-{code.lower()}",
+            full=True,
+            render=_render_required_test,
+            meta=meta,
+        )
 
         # --- Station feed note (radio UI/API handled-alerts feed) ---
         local_test_same_codes = self.same_codes_for_presentation()
