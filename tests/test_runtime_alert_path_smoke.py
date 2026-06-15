@@ -2,7 +2,6 @@ import asyncio
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-
 from seasonalweather.alerts.cap_nws import CapAlertEvent
 from seasonalweather.alerts.product import ParsedProduct
 from seasonalweather.config import load_config
@@ -105,8 +104,23 @@ class _FakeTargetResolver:
 
 
 class _FakeRefresher:
+    def __init__(self) -> None:
+        self.calls = []
+
     def trigger_immediate(self, *_args, **_kwargs) -> None:
-        pass
+        self.calls.append(("trigger", _args))
+
+    def notify_alerts_changed(self) -> None:
+        self.calls.append(("alerts", ()))
+
+
+class _FakeConductor:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def notify_flush(self, *, reset_rotation=True, reason="") -> None:
+        self.calls.append((reset_rotation, reason))
+
 
 
 def _minimal_config(tmp_path, monkeypatch):
@@ -137,6 +151,7 @@ def _orchestrator(tmp_path, monkeypatch) -> Orchestrator:
     orch.target_resolver = _FakeTargetResolver(["024031"])
     orch.targeting = orch.target_resolver
     orch.refresher = _FakeRefresher()
+    orch.conductor = _FakeConductor()
     return orch
 
 
@@ -202,8 +217,12 @@ def test_cap_full_runtime_path_smoke(tmp_path, monkeypatch):
     assert same_locations == ["024031"]
     assert orch.telnet.pushed
     assert orch.telnet.pushed[-1][0] == "full"
-    assert orch.telnet.flushed_voice == 1
-    assert orch.telnet.ops.index("push_full") < orch.telnet.ops.index("flush_cycle")
+    assert orch.telnet.flushed_voice == 0
+    assert orch.telnet.skipped_voice == 0
+    assert orch.telnet.flushed_full == 0
+    assert orch.telnet.skipped_full == 0
+    assert orch.telnet.flushed_cycle == 0
+    assert orch.telnet.ops == ["push_full"]
     assert any(kind == "aired" for kind, _payload in orch.discord.calls)
 
 
@@ -219,8 +238,10 @@ def test_cap_voice_runtime_path_smoke(tmp_path, monkeypatch):
     assert "Severe Thunderstorm Warning" in script
     assert orch.telnet.pushed
     assert orch.telnet.pushed[-1][0] == "voice"
-    assert orch.telnet.flushed_voice == 1
-    assert orch.telnet.ops.index("push_voice") < orch.telnet.ops.index("flush_cycle")
+    assert orch.telnet.flushed_voice == 0
+    assert orch.telnet.skipped_voice == 0
+    assert orch.telnet.flushed_cycle == 0
+    assert orch.telnet.ops == ["push_voice"]
 
 
 def test_nwws_full_runtime_path_smoke(tmp_path, monkeypatch):
@@ -235,8 +256,12 @@ def test_nwws_full_runtime_path_smoke(tmp_path, monkeypatch):
     assert same_locations == ["024031"]
     assert orch.telnet.pushed
     assert orch.telnet.pushed[-1][0] == "full"
-    assert orch.telnet.flushed_voice == 1
-    assert orch.telnet.ops.index("push_full") < orch.telnet.ops.index("flush_cycle")
+    assert orch.telnet.flushed_voice == 0
+    assert orch.telnet.skipped_voice == 0
+    assert orch.telnet.flushed_full == 0
+    assert orch.telnet.skipped_full == 0
+    assert orch.telnet.flushed_cycle == 0
+    assert orch.telnet.ops == ["push_full"]
 
 
 def test_nwws_voice_runtime_path_smoke(tmp_path, monkeypatch):
@@ -252,5 +277,61 @@ def test_nwws_voice_runtime_path_smoke(tmp_path, monkeypatch):
     assert "severe thunderstorm warning" in script.lower()
     assert orch.telnet.pushed
     assert orch.telnet.pushed[-1][0] == "voice"
-    assert orch.telnet.flushed_voice == 1
-    assert orch.telnet.ops.index("push_voice") < orch.telnet.ops.index("flush_cycle")
+    assert orch.telnet.flushed_voice == 0
+    assert orch.telnet.skipped_voice == 0
+    assert orch.telnet.flushed_cycle == 0
+    assert orch.telnet.ops == ["push_voice"]
+
+
+def test_interrupt_push_preserves_cycle_fallback_full(tmp_path, monkeypatch):
+    orch = _orchestrator(tmp_path, monkeypatch)
+    wav = tmp_path / "full.wav"
+    wav.write_bytes(b"RIFFfakeWAVE")
+
+    asyncio.run(orch._push_interrupt_audio(wav, full=True))
+
+    assert orch.telnet.ops == ["push_full"]
+
+
+def test_interrupt_push_preserves_cycle_fallback_voice(tmp_path, monkeypatch):
+    orch = _orchestrator(tmp_path, monkeypatch)
+    wav = tmp_path / "voice.wav"
+    wav.write_bytes(b"RIFFfakeWAVE")
+
+    asyncio.run(orch._push_interrupt_audio(wav, full=False))
+
+    assert orch.telnet.ops == ["push_voice"]
+
+
+def test_cycle_refill_wakes_conductor(tmp_path, monkeypatch):
+    orch = _orchestrator(tmp_path, monkeypatch)
+
+    orch._schedule_cycle_refill("post-alert")
+
+    assert orch.conductor.calls == [(True, "post-alert")]
+    assert ("trigger", ("id", "status")) in orch.refresher.calls
+    assert ("alerts", ()) in orch.refresher.calls
+
+
+def test_interrupt_push_does_not_hold_or_cut_cycle(tmp_path, monkeypatch):
+    orch = _orchestrator(tmp_path, monkeypatch)
+    wav = tmp_path / "voice.wav"
+    wav.write_bytes(b"RIFFfakeWAVE")
+
+    asyncio.run(orch._push_interrupt_audio(wav, full=False))
+
+    assert "flush_cycle" not in orch.telnet.ops
+    assert orch.conductor.calls == []
+
+
+def test_startup_queue_reset_does_not_poison_liquidsoap_planes(tmp_path, monkeypatch):
+    orch = _orchestrator(tmp_path, monkeypatch)
+
+    orch._clear_liquidsoap_queues_on_startup()
+
+    assert orch.telnet.flushed_full == 0
+    assert orch.telnet.skipped_full == 0
+    assert orch.telnet.flushed_voice == 0
+    assert orch.telnet.skipped_voice == 0
+    assert orch.telnet.flushed_cycle == 0
+    assert orch.telnet.ops == []

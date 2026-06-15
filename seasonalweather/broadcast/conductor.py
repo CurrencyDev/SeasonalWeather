@@ -233,9 +233,9 @@ class CycleConductor:
 
     def notify_flush(self, *, reset_rotation: bool = True, reason: str = "") -> None:
         """
-        Call this immediately after ``telnet.flush_cycle()`` in any alert
-        handler.  Resets buffer tracking so the conductor refills the
-        (now-empty) cycle queue as fast as possible.  By default, also resets
+        Call this after any explicit cycle queue reset.  Resets buffer tracking
+        so the conductor refills the cycle queue as fast as possible.  By
+        default, also resets
         rotation order so newly active alerts are heard by priority instead of
         inheriting an old chronological slot.
         """
@@ -279,7 +279,7 @@ class CycleConductor:
                     pushed = await self._push_next_segment()
                     pushes += 1
                     if not pushed:
-                        # Nothing was ready — don't busy-spin
+                        # Nothing was ready — don't busy-spin.
                         await asyncio.sleep(1.0)
                         break
                     if pushes >= _MAX_PUSHES_PER_TICK:
@@ -287,7 +287,8 @@ class CycleConductor:
             except Exception:
                 log.exception("CycleConductor: unhandled error in push loop")
 
-            # Sleep until next tick, or wake early on a flush notification
+            # Sleep until next tick or any flush/state notification wakes the
+            # conductor early.
             self._flush_event.clear()
             try:
                 await asyncio.wait_for(self._flush_event.wait(), timeout=self._tick_s)

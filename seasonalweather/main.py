@@ -185,7 +185,7 @@ class Orchestrator:
         # ERN relay cooldown (on-air)
         self._ern_relay_last_any_at: dt.datetime | None = None
 
-        # Prevent concurrent cycle flush/push from overlapping
+        # Prevent concurrent cycle flush/push from overlapping.
         self._cycle_lock = asyncio.Lock()
 
         # CycleConductor handles continuous buffering and live time synthesis.
@@ -479,6 +479,22 @@ class Orchestrator:
         except AttributeError:
             pass  # conductor not yet initialised (startup edge case)
 
+    def _clear_liquidsoap_queues_on_startup(self) -> None:
+        """Do not clear Liquidsoap request queues with telnet skip/flush commands.
+
+        On Liquidsoap 2.3.x, both request_queue.flush_and_skip and source.skip()
+        can leave a pending skip on an empty request source.  The next pushed
+        request is then accepted and prepared, but falls off after the first
+        audio frame and the fallback graph returns to the next source/blank.
+        This poisoned the first FULL/VOICE alert after every orchestrator
+        restart.
+
+        A Liquidsoap service restart is the safe way to clear stale request
+        state.  The Python orchestrator must not issue destructive queue
+        controls automatically at startup.
+        """
+        log.info("Liquidsoap startup queue reset skipped; restart Liquidsoap to clear stale request queues")
+
     # ---- dedupe helpers ----
     def _sha1_12(self, s: str) -> str:
         h = hashlib.sha1((s or "").encode("utf-8", errors="ignore")).hexdigest()
@@ -513,55 +529,51 @@ class Orchestrator:
 
         FULL alerts preempt both the cycle plane and lower-priority voice updates.
         VOICE alerts interrupt only the cycle plane and never clear queued/current
-        FULL alerts.  Push the replacement interrupt before cutting the cycle so a
-        transient VOICE/FULL queue failure cannot create a false cut to dead air.
+        FULL alerts.  Do not cut the cycle plane during admission: cycle must stay
+        available as the fallback if Liquidsoap briefly resolves or rejects the
+        interrupt request after accepting the telnet push.
         """
 
-        def _try_telnet(method_name: str) -> bool:
-            method = getattr(self.telnet, method_name, None)
-            if method is None:
-                return False
+        def _notify_refill_after_failed_push() -> None:
+            # If an interrupt push fails, wake the conductor so cycle generation
+            # continues promptly.  Cycle is not cut for alert admission, but this
+            # keeps fallback material fresh after unexpected Liquidsoap errors.
             try:
-                method()
-                return True
+                self.conductor.notify_flush(reset_rotation=False, reason="interrupt-push-failed")
+            except AttributeError:
+                pass
             except Exception:
-                log.debug("Liquidsoap interrupt control failed: %s", method_name, exc_info=True)
-                return False
+                log.debug("Cycle refill notification after failed interrupt push failed", exc_info=True)
 
         async with self._cycle_lock:
             if full:
-                # Clear stale/current material on the destination plane first,
-                # then clear lower-priority VOICE material.  Some Liquidsoap
-                # versions expose only flush, only skip, or flush_and_skip, so
-                # try both safe controls.
-                _try_telnet("flush_full_alert")
-                _try_telnet("skip_full_alert")
-                cleared_voice = False
-                for method_name in ("flush_voice_alert", "skip_voice_alert"):
-                    cleared_voice = _try_telnet(method_name) or cleared_voice
-                if not cleared_voice:
-                    _try_telnet("skip_alert")
-
-                if hasattr(self.telnet, "push_full_alert"):
-                    self.telnet.push_full_alert(str(wav_path), meta=meta)
-                else:
-                    self.telnet.push_alert(str(wav_path), meta=meta)
-
-                _try_telnet("flush_cycle")
+                # Do not pre-flush or pre-skip the FULL/VOICE request queues here.
+                # On the Liquidsoap 2.3.x build seen in production, queue control
+                # discovery maps flush to flush_and_skip and exposes skip controls.
+                # Issuing those commands immediately before push can leave a
+                # pending skip on the source and make the replacement alert fall
+                # off after a tiny burst.  Keep cycle alive and rely on fallback
+                # priority (FULL > VOICE > cycle) for the actual interrupt.
+                try:
+                    if hasattr(self.telnet, "push_full_alert"):
+                        self.telnet.push_full_alert(str(wav_path), meta=meta)
+                    else:
+                        self.telnet.push_alert(str(wav_path), meta=meta)
+                except Exception:
+                    _notify_refill_after_failed_push()
+                    raise
             else:
-                # A VOICE update should replace stale VOICE-plane material, but
-                # it must not disturb a queued/current FULL alert.  Admit the
-                # VOICE request before cutting the cycle; otherwise listeners can
-                # hear a false interrupt if the VOICE push fails or is delayed.
-                _try_telnet("flush_voice_alert")
-                _try_telnet("skip_voice_alert")
-
-                if hasattr(self.telnet, "push_voice_alert"):
-                    self.telnet.push_voice_alert(str(wav_path), meta=meta)
-                else:
-                    self.telnet.push_alert(str(wav_path), meta=meta)
-
-                _try_telnet("flush_cycle")
+                # Same rule for VOICE updates: avoid same-plane skip/flush before
+                # push.  Stale queued VOICE material is less dangerous than
+                # dropping the live update after SAME/first audio frames.
+                try:
+                    if hasattr(self.telnet, "push_voice_alert"):
+                        self.telnet.push_voice_alert(str(wav_path), meta=meta)
+                    else:
+                        self.telnet.push_alert(str(wav_path), meta=meta)
+                except Exception:
+                    _notify_refill_after_failed_push()
+                    raise
 
 
     async def _render_and_push_interrupt_audio(

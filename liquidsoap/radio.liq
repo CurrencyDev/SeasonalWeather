@@ -2,6 +2,7 @@
 # - cycle plane: request.queue(id="cycle")
 # - voice interrupt plane: request.queue(id="voice_alert")
 # - full interrupt plane: request.queue(id="full_alert") (highest priority)
+# - alert bus: FULL > VOICE, then routine cycle, with non-track-sensitive fallback
 # - output mounts: Ogg/Vorbis and MP3 Icecast streams
 
 set("log.stdout", false)
@@ -12,20 +13,59 @@ set("server.telnet", true)
 set("server.telnet.bind_addr", "127.0.0.1")
 set("server.telnet.port", 1234)
 
-# Queues are controlled by the Python orchestrator via telnet:
-#   full_alert.push /path/to/file.wav
-#   voice_alert.push /path/to/file.wav
-#   cycle.push /path/to/file.wav
-#   cycle.flush
-#   voice_alert.flush / voice_alert.skip
-#   full_alert.flush / full_alert.skip
+# Internal request queues.  Liquidsoap 2.3.x may expose these built-in
+# request.queue controls as anonymous request_queue* telnet commands instead of
+# the requested ids below.  Do not depend on those generated names for runtime
+# queue routing; explicit SeasonalWeather aliases are registered below.
 cycle = request.queue(id="cycle")
 voice_alert = request.queue(id="voice_alert")
 full_alert = request.queue(id="full_alert")
 
-# Always have something to output (silence) so the mount stays up
+# Explicit, stable command aliases for the Python orchestrator.  These avoid the
+# request_queue/request_queue.N ambiguity seen on Liquidsoap 2.3.x builds.
+def sw_cycle_push(uri) =
+  cycle.push(request.create(uri))
+  "OK"
+end
+
+def sw_voice_alert_push(uri) =
+  voice_alert.push(request.create(uri))
+  "OK"
+end
+
+def sw_full_alert_push(uri) =
+  full_alert.push(request.create(uri))
+  "OK"
+end
+
+def sw_cycle_skip(_) =
+  source.skip(cycle)
+  "OK"
+end
+
+def sw_voice_alert_skip(_) =
+  source.skip(voice_alert)
+  "OK"
+end
+
+def sw_full_alert_skip(_) =
+  source.skip(full_alert)
+  "OK"
+end
+
+server.register(namespace="sw.cycle", usage="push <uri>", description="Push routine cycle audio.", "push", sw_cycle_push)
+server.register(namespace="sw.voice_alert", usage="push <uri>", description="Push voice alert audio.", "push", sw_voice_alert_push)
+server.register(namespace="sw.full_alert", usage="push <uri>", description="Push full alert audio.", "push", sw_full_alert_push)
+server.register(namespace="sw.cycle", usage="skip", description="Skip current cycle audio.", "skip", sw_cycle_skip)
+server.register(namespace="sw.voice_alert", usage="skip", description="Skip current voice alert audio.", "skip", sw_voice_alert_skip)
+server.register(namespace="sw.full_alert", usage="skip", description="Skip current full alert audio.", "skip", sw_full_alert_skip)
+
+# Always have something to output (silence) so the mount stays up.
 silence = blank()
 
+# Keep the runtime graph deliberately flat for Liquidsoap 2.3.x compatibility.
+# Priority remains explicit: FULL beats VOICE, VOICE beats cycle, and silence
+# keeps Icecast mounted if every request queue is momentarily empty.
 radio = fallback(track_sensitive=false, [full_alert, voice_alert, cycle, silence])
 
 # Primary low-bandwidth web stream.

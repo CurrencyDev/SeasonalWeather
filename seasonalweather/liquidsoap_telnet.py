@@ -138,57 +138,102 @@ class LiquidsoapTelnet:
 
     def _parse_help_commands(self, help_text: str) -> set[str]:
         """
-        Extract command names from help output.
-        We support both:
-          - piped help lines: "| request_queue.push <uri>"
-          - plain list lines (fallback): "request_queue.push <uri>"
+        Extract Liquidsoap server command help lines.
+
+        Liquidsoap 2.x help output is not stable enough to key on the exact
+        usage suffix.  Depending on build and command registration, the same
+        command may appear as any of these forms::
+
+          | sw.full_alert.push <uri>
+          | sw.full_alert.push
+          | sw.full_alert.push <uri> : Push full alert audio
+          sw.full_alert.push <uri>
+
+        Keep the raw help payloads, but also add the first command token so
+        discovery can key on command names instead of fragile rendered usage.
         """
         cmds: set[str] = set()
+
+        def add_payload(payload: str) -> None:
+            text = payload.strip()
+            if not text:
+                return
+            cmds.add(text)
+            m = re.match(r"^([A-Za-z0-9_.-]+)(?:\s|:|$)", text)
+            if m:
+                cmds.add(m.group(1))
 
         for ln in help_text.splitlines():
             ln = ln.rstrip()
             m = _HELP_PIPE_RE.match(ln)
             if m:
-                cmds.add(m.group(1).strip())
+                add_payload(m.group(1))
                 continue
 
-            # Fallback: accept non-empty non-header lines that look like commands
-            if ln and not ln.lower().startswith(("available commands", "type ")) and not ln.startswith("END"):
-                # keep it conservative
-                if re.match(r"^[A-Za-z0-9_.-]+(?:\s+<.*?>)?$", ln.strip()):
-                    cmds.add(ln.strip())
+            # Fallback: accept non-empty non-header lines that look like commands.
+            stripped = ln.strip()
+            if stripped and not stripped.lower().startswith(("available commands", "type ")) and not stripped.startswith("END"):
+                if re.match(r"^[A-Za-z0-9_.-]+(?:\s+.*)?$", stripped):
+                    add_payload(stripped)
 
         return cmds
+
+    def _has_help_command(self, cmds: set[str], name: str) -> bool:
+        if name in cmds:
+            return True
+        return any(item == name or item.startswith(name + " ") or item.startswith(name + ":") for item in cmds)
+
+    def _push_command_names(self, cmds: set[str]) -> list[str]:
+        names: set[str] = set()
+        for item in cmds:
+            m = re.match(r"^([A-Za-z0-9_.-]+\.push)(?:\s|:|$)", item.strip())
+            if m:
+                names.add(m.group(1))
+        return sorted(names)
 
     def _discover(self) -> None:
         help_txt = self._send("help", read_deadline=4.0)
         cmds = self._parse_help_commands(help_txt)
 
-        # 1) Prefer explicit queue IDs from the repository liquidsoap script.
-        if {
-            "cycle.push <uri>",
-            "voice_alert.push <uri>",
-            "full_alert.push <uri>",
-        }.issubset(cmds):
+        # 1) Prefer SeasonalWeather's explicit command aliases.  These are
+        # registered by liquidsoap/radio.liq specifically to avoid relying on
+        # Liquidsoap-generated request_queue/request_queue.N names.
+        if all(self._has_help_command(cmds, name) for name in (
+            "sw.cycle.push",
+            "sw.voice_alert.push",
+            "sw.full_alert.push",
+        )):
+            self._cycle_prefix = "sw.cycle"
+            self._voice_alert_prefix = "sw.voice_alert"
+            self._full_alert_prefix = "sw.full_alert"
+
+        # 2) Older explicit queue IDs from repository liquidsoap scripts.
+        elif all(self._has_help_command(cmds, name) for name in (
+            "cycle.push",
+            "voice_alert.push",
+            "full_alert.push",
+        )):
             self._cycle_prefix = "cycle"
             self._voice_alert_prefix = "voice_alert"
             self._full_alert_prefix = "full_alert"
 
-        # 2) Legacy two-plane script.  Collapse FULL and VOICE to alert so older
+        # 3) Legacy two-plane script.  Collapse FULL and VOICE to alert so older
         # deployments still work until liquidsoap/radio.liq is updated/restarted.
-        elif "cycle.push <uri>" in cmds and "alert.push <uri>" in cmds:
+        elif self._has_help_command(cmds, "cycle.push") and self._has_help_command(cmds, "alert.push"):
             self._cycle_prefix = "cycle"
             self._voice_alert_prefix = "alert"
             self._full_alert_prefix = "alert"
 
         else:
-            # 3) Newer style: request_queue and request_queue.N.  The expected
-            # declaration order in radio.liq is cycle, voice_alert, full_alert.
+            # 4) Last-resort compatibility for generated request_queue names.
+            # Map anonymous queues by declaration order, which is the only stable
+            # relationship the script controls: cycle, voice_alert, full_alert.
+            # New deployments should use the sw.* aliases above instead.
             prefixes: list[tuple[int, str]] = []
-            if "request_queue.push <uri>" in cmds:
+            if self._has_help_command(cmds, "request_queue.push"):
                 prefixes.append((0, "request_queue"))
-            for item in cmds:
-                m = re.match(r"^(request_queue\.(\d+))\.push <uri>$", item)
+            for item in self._push_command_names(cmds):
+                m = re.match(r"^(request_queue\.(\d+))\.push$", item)
                 if m:
                     prefixes.append((int(m.group(2)), m.group(1)))
 
@@ -197,10 +242,26 @@ class LiquidsoapTelnet:
                 self._cycle_prefix = prefixes[0][1]
                 self._voice_alert_prefix = prefixes[1][1]
                 self._full_alert_prefix = prefixes[2][1]
+                log.warning(
+                    "Liquidsoap exposed only anonymous request_queue controls; "
+                    "mapped by declaration order cycle=%s voice=%s full=%s. "
+                    "Install the current liquidsoap/radio.liq to enable stable sw.* aliases. push_commands=%s",
+                    self._cycle_prefix,
+                    self._voice_alert_prefix,
+                    self._full_alert_prefix,
+                    ",".join(self._push_command_names(cmds)) or "-",
+                )
             elif len(prefixes) >= 2:
                 self._cycle_prefix = prefixes[0][1]
                 self._voice_alert_prefix = prefixes[1][1]
                 self._full_alert_prefix = prefixes[1][1]
+                log.warning(
+                    "Liquidsoap exposed two anonymous request_queue controls; "
+                    "mapped cycle=%s alert=%s. Install the current liquidsoap/radio.liq to enable stable sw.* aliases. push_commands=%s",
+                    self._cycle_prefix,
+                    self._voice_alert_prefix,
+                    ",".join(self._push_command_names(cmds)) or "-",
+                )
             elif len(prefixes) == 1:
                 # Degenerate case: one queue exists; use it for everything rather than dead air.
                 self._cycle_prefix = prefixes[0][1]
@@ -214,17 +275,17 @@ class LiquidsoapTelnet:
         # Flush commands vary by version.
         def pick_flush(prefix: str) -> str:
             # Prefer flush_and_skip, else flush, else skip as last-ditch.
-            if f"{prefix}.flush_and_skip" in cmds:
+            if self._has_help_command(cmds, f"{prefix}.flush_and_skip"):
                 return f"{prefix}.flush_and_skip"
-            if f"{prefix}.flush" in cmds:
+            if self._has_help_command(cmds, f"{prefix}.flush"):
                 return f"{prefix}.flush"
-            if f"{prefix}.skip" in cmds:
+            if self._has_help_command(cmds, f"{prefix}.skip"):
                 return f"{prefix}.skip"
             # If nothing exists, keep something predictable; sending it will raise.
             return f"{prefix}.flush_and_skip"
 
         def pick_skip(prefix: str, fallback_flush: str) -> str:
-            return f"{prefix}.skip" if f"{prefix}.skip" in cmds else fallback_flush
+            return f"{prefix}.skip" if self._has_help_command(cmds, f"{prefix}.skip") else fallback_flush
 
         self._cycle_flush_cmd = pick_flush(self._cycle_prefix)
         self._voice_alert_flush_cmd = pick_flush(self._voice_alert_prefix)
@@ -252,7 +313,15 @@ class LiquidsoapTelnet:
 
     def _push_to_prefix(self, prefix: str, wav_path: str, *, meta: dict[str, str] | None = None) -> None:
         uri = self._to_uri(wav_path)
-        uri = self._annotate_uri(uri, meta)
+        # SeasonalWeather's explicit sw.* aliases are Liquidsoap server.register
+        # callbacks.  Unlike the built-in request_queue.push command, those
+        # callbacks are not a safe place to send long annotate: URIs containing
+        # quoted metadata with spaces.  In production this manifested as the
+        # alert request being accepted but falling off after the first SAME/header
+        # edge while Liquidsoap returned to cycle audio.  Keep sw.* pushes boring:
+        # send the bare file URI and let Icecast continue with existing metadata.
+        if not prefix.startswith("sw."):
+            uri = self._annotate_uri(uri, meta)
         self._send(f'{prefix}.push {uri}')
 
     # -------- Public API --------

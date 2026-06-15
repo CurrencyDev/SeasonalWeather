@@ -57,6 +57,7 @@ class SeasonalWeatherServiceRuntime:
             p.mkdir(parents=True, exist_ok=True)
 
         await o._wait_for_liquidsoap()
+        o._clear_liquidsoap_queues_on_startup()
         o.discord.service_started(
             cap_enabled=o.cfg.cap.enabled,
             ern_enabled=o.cfg.ern.enabled,
