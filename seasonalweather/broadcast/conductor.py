@@ -15,8 +15,9 @@ Key differences from the old architecture
   drains, so the queue depth stays bounded and stays fresh.
 - The "time" segment is synthesised at push time (never cached) so the
   spoken time is always within a few seconds of accurate.
-- After an alert flushes the cycle queue, call ``notify_flush()``; the
-  conductor sees estimated_remaining_s ≈ 0 and immediately refills.
+- Interrupt admission places the conductor on hold while Liquidsoap owns the
+  output.  Once both alert planes are idle, the routine cycle is reset and
+  rebuilt from station ID/current time instead of resuming stale audio.
 - Alert-tracker voice segments are injected right after "time" each
   rotation in operational-priority order, without re-toning.
 - In focus mode, routine low-priority segments are deferred instead of
@@ -58,6 +59,12 @@ _TIME_BUF_COUNT: int = 2
 
 # Maximum segments to push in a single tick (safety valve).
 _MAX_PUSHES_PER_TICK: int = 30
+
+# Once the expected interrupt duration has elapsed, poll Liquidsoap at this
+# cadence until both interrupt queues are actually idle.  Duration-based wakeup
+# avoids opening a telnet connection every few hundred milliseconds throughout
+# long alerts, while the final status check covers queued/preempted alerts.
+_INTERRUPT_STATUS_POLL_S: float = 0.5
 
 # Fixed base content order — alert segments are injected after "time".
 _BASE_CONTENT: List[str] = ["health", "status", "hwo", "spc", "zfp", "fcst", "cwf", "obs", "marine_obs"]
@@ -222,6 +229,13 @@ class CycleConductor:
         # Flush notification event (set by notify_flush to wake the loop early)
         self._flush_event: asyncio.Event = asyncio.Event()
 
+        # Interrupt hold.  The cycle queue is safely reset after alert admission,
+        # then the conductor stops feeding it until all admitted interrupt audio
+        # has had time to play and Liquidsoap confirms both alert planes are idle.
+        self._interrupt_hold: bool = False
+        self._interrupt_expected_end: float = 0.0
+        self._interrupt_reason: str = ""
+
         # Rotation accounting (for Discord embed + heartbeat log)
         self._rotation_count: int = 0
         self._rotation_seg_count: int = 0
@@ -256,6 +270,33 @@ class CycleConductor:
         self._flush_event.set()
         log.debug("CycleConductor: scheduled inserts changed — waking loop")
 
+    def notify_interrupt_started(self, *, duration_s: float, reason: str = "") -> None:
+        """Pause cycle production while interrupt audio owns the output.
+
+        Each newly admitted alert extends the expected end deadline.  FULL and
+        VOICE sources are mutually exclusive in the fallback graph, so their
+        on-air durations are additive even when one preempts the other.
+        """
+        duration = max(0.1, float(duration_s))
+        now = time.monotonic()
+        self._interrupt_expected_end = max(now, self._interrupt_expected_end) + duration
+        self._interrupt_hold = True
+        self._interrupt_reason = reason or self._interrupt_reason or "interrupt"
+
+        # The Liquidsoap queue has just been reset.  Reset local accounting too,
+        # but do not refill until the hold is released.
+        self._push_start_ts = time.time()
+        self._total_pushed_s = 0.0
+        self._cycle_order = []
+        self._position_in_rotation = 0
+        self._flush_event.set()
+        log.info(
+            "CycleConductor: interrupt hold started/extended duration=%.1fs expected_remaining=%.1fs reason=%s",
+            duration,
+            max(0.0, self._interrupt_expected_end - now),
+            self._interrupt_reason,
+        )
+
     @property
     def estimated_remaining_s(self) -> float:
         """Estimated seconds of audio buffered ahead in Liquidsoap."""
@@ -273,9 +314,15 @@ class CycleConductor:
             self._tick_s,
         )
         while True:
+            if self._interrupt_hold:
+                await self._wait_for_interrupt_end()
+                continue
+
             try:
                 pushes = 0
                 while self.estimated_remaining_s < self._lookahead_s:
+                    if self._interrupt_hold:
+                        break
                     pushed = await self._push_next_segment()
                     pushes += 1
                     if not pushed:
@@ -294,6 +341,56 @@ class CycleConductor:
                 await asyncio.wait_for(self._flush_event.wait(), timeout=self._tick_s)
             except asyncio.TimeoutError:
                 pass
+
+    async def _wait_for_interrupt_end(self) -> None:
+        """Hold cycle production until expected audio ends and queues are idle."""
+        now = time.monotonic()
+        remaining = self._interrupt_expected_end - now
+        if remaining > 0.0:
+            self._flush_event.clear()
+            try:
+                await asyncio.wait_for(self._flush_event.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                pass
+            return
+
+        active: Optional[bool] = None
+        try:
+            active = self._telnet.interrupt_active()
+        except AttributeError:
+            active = None
+        except Exception:
+            # A failed state query must not prematurely return stale cycle audio.
+            log.warning(
+                "CycleConductor: interrupt status query failed; retaining cycle hold",
+                exc_info=True,
+            )
+            active = True
+
+        if active is True:
+            self._interrupt_expected_end = time.monotonic() + _INTERRUPT_STATUS_POLL_S
+            return
+
+        # Re-clear at release to catch a cycle push that was already rendering
+        # when the interrupt began.  The guarded alias skips only when a current
+        # cycle request exists, so an empty source cannot acquire a pending skip.
+        reset_ok = False
+        try:
+            reset_ok = bool(self._telnet.reset_cycle_safely())
+        except AttributeError:
+            reset_ok = False
+        except Exception:
+            log.exception("CycleConductor: final safe cycle reset failed")
+
+        self._interrupt_hold = False
+        self._interrupt_expected_end = 0.0
+        reason = self._interrupt_reason or "interrupt-ended"
+        self._interrupt_reason = ""
+        self.notify_flush(reset_rotation=True, reason=f"{reason}:ended")
+        log.info(
+            "CycleConductor: interrupt hold released; cycle reset=%s and refill requested",
+            reset_ok,
+        )
 
     # ------------------------------------------------------------------
     #  Segment push orchestration
@@ -443,6 +540,9 @@ class CycleConductor:
         Advance the position by one and push that segment to Liquidsoap.
         Returns True if audio was actually pushed, False if nothing was ready.
         """
+        if self._interrupt_hold:
+            return False
+
         if self._position_in_rotation == 0 or not self._cycle_order:
             self._rebuild_cycle_order()
 
@@ -628,6 +728,13 @@ class CycleConductor:
             concat_wavs(out_tmp, [gap_tmp, tts_tmp, gap_tmp])
             dur = wav_duration_seconds(out_tmp)
             os.replace(str(out_tmp), str(wav))
+
+            # TTS runs in an executor.  An alert may have been admitted while it
+            # was rendering; do not append this now-stale time request behind the
+            # interrupt hold.
+            if self._interrupt_hold:
+                log.debug("CycleConductor: discarded rendered live time during interrupt hold")
+                return 0.0
 
             meta = self._np_meta_fn(
                 title=_NP_TITLES["time"],

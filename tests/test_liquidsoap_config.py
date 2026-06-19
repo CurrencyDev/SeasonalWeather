@@ -14,8 +14,10 @@ def test_radio_liq_uses_flat_priority_fallback_with_compatible_queue_syntax():
     assert 'server.register(namespace="sw.voice_alert", usage="push <uri>"' in script
     assert 'server.register(namespace="sw.full_alert", usage="push <uri>"' in script
     assert 'server.register(namespace="sw.cycle", usage="skip"' in script
+    assert 'server.register(namespace="sw.cycle", usage="reset"' in script
     assert 'server.register(namespace="sw.voice_alert", usage="skip"' in script
     assert 'server.register(namespace="sw.full_alert", usage="skip"' in script
+    assert 'server.register(namespace="sw.interrupt", usage="status"' in script
     assert 'usage="<uri>"' not in script
     assert 'usage=""' not in script
     assert 'description="Push voice alert audio and nudge cycle playback."' not in script
@@ -24,3 +26,10 @@ def test_radio_liq_uses_flat_priority_fallback_with_compatible_queue_syntax():
     full_push = script.split('def sw_full_alert_push(uri) =', 1)[1].split('end', 1)[0]
     assert 'source.skip(cycle)' not in voice_push
     assert 'source.skip(cycle)' not in full_push
+
+    cycle_reset = script.split('def sw_cycle_reset(_) =', 1)[1].split('end', 1)[0]
+    assert 'queued = cycle.queue()' in cycle_reset
+    assert 'cycle.set_queue([])' in cycle_reset
+    assert 'list.iter(request.destroy, queued)' in cycle_reset
+    assert 'if cycle.current() != null() then' in cycle_reset
+    assert 'cycle.skip()' in cycle_reset

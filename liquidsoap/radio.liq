@@ -43,6 +43,32 @@ def sw_cycle_skip(_) =
   "OK"
 end
 
+# Reset only the routine cycle plane.  Emptying the queued requests is not
+# enough because fallback(track_sensitive=false) leaves the interrupted current
+# request paused.  Conversely, an unconditional skip on an empty request source
+# can remain pending and kill the next request.  Only skip when Liquidsoap says
+# a current cycle request actually exists, and explicitly destroy the detached
+# queued requests after replacing the queue.
+def sw_cycle_reset(_) =
+  queued = cycle.queue()
+  cycle.set_queue([])
+  list.iter(request.destroy, queued)
+  if cycle.current() != null() then
+    cycle.skip()
+  end
+  "OK"
+end
+
+def sw_interrupt_status(_) =
+  full_active = full_alert.current() != null() or full_alert.length() > 0
+  voice_active = voice_alert.current() != null() or voice_alert.length() > 0
+  if full_active or voice_active then
+    "ACTIVE"
+  else
+    "IDLE"
+  end
+end
+
 def sw_voice_alert_skip(_) =
   source.skip(voice_alert)
   "OK"
@@ -57,8 +83,10 @@ server.register(namespace="sw.cycle", usage="push <uri>", description="Push rout
 server.register(namespace="sw.voice_alert", usage="push <uri>", description="Push voice alert audio.", "push", sw_voice_alert_push)
 server.register(namespace="sw.full_alert", usage="push <uri>", description="Push full alert audio.", "push", sw_full_alert_push)
 server.register(namespace="sw.cycle", usage="skip", description="Skip current cycle audio.", "skip", sw_cycle_skip)
+server.register(namespace="sw.cycle", usage="reset", description="Safely clear queued and current routine cycle audio.", "reset", sw_cycle_reset)
 server.register(namespace="sw.voice_alert", usage="skip", description="Skip current voice alert audio.", "skip", sw_voice_alert_skip)
 server.register(namespace="sw.full_alert", usage="skip", description="Skip current full alert audio.", "skip", sw_full_alert_skip)
+server.register(namespace="sw.interrupt", usage="status", description="Report whether interrupt audio is current or queued.", "status", sw_interrupt_status)
 
 # Always have something to output (silence) so the mount stays up.
 silence = blank()

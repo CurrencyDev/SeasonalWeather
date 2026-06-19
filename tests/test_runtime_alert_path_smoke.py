@@ -1,4 +1,5 @@
 import asyncio
+import wave
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -6,6 +7,18 @@ from seasonalweather.alerts.cap_nws import CapAlertEvent
 from seasonalweather.alerts.product import ParsedProduct
 from seasonalweather.config import load_config
 from seasonalweather.main import Orchestrator
+
+
+def _write_test_wav(path: Path, *, duration_s: float = 0.25) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sample_rate = 8000
+    frames = max(1, int(sample_rate * duration_s))
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(b"\x00\x00" * frames)
+    return path
 
 
 class _FakeAudioOriginator:
@@ -17,16 +30,12 @@ class _FakeAudioOriginator:
     async def render_alert_audio(self, parsed, script: str, *, same_locations=None):
         self.full_calls.append((parsed, script, list(same_locations or [])))
         path = self.base / f"full-{len(self.full_calls)}.wav"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"RIFFfakeWAVE")
-        return path
+        return _write_test_wav(path)
 
     async def render_voice_only_audio(self, script: str, *, prefix: str = "voice"):
         self.voice_calls.append((prefix, script))
         path = self.base / f"{prefix}-{len(self.voice_calls)}.wav"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"RIFFfakeWAVE")
-        return path
+        return _write_test_wav(path)
 
 
 class _FakeTelnet:
@@ -37,11 +46,17 @@ class _FakeTelnet:
         self.flushed_full = 0
         self.skipped_voice = 0
         self.skipped_full = 0
+        self.safe_cycle_resets = 0
         self.ops = []
 
     def flush_cycle(self) -> None:
         self.flushed_cycle += 1
         self.ops.append("flush_cycle")
+
+    def reset_cycle_safely(self) -> bool:
+        self.safe_cycle_resets += 1
+        self.ops.append("reset_cycle_safe")
+        return True
 
     def flush_voice_alert(self) -> None:
         self.flushed_voice += 1
@@ -117,9 +132,13 @@ class _FakeRefresher:
 class _FakeConductor:
     def __init__(self) -> None:
         self.calls = []
+        self.interrupt_calls = []
 
     def notify_flush(self, *, reset_rotation=True, reason="") -> None:
         self.calls.append((reset_rotation, reason))
+
+    def notify_interrupt_started(self, *, duration_s, reason="") -> None:
+        self.interrupt_calls.append((duration_s, reason))
 
 
 
@@ -222,7 +241,8 @@ def test_cap_full_runtime_path_smoke(tmp_path, monkeypatch):
     assert orch.telnet.flushed_full == 0
     assert orch.telnet.skipped_full == 0
     assert orch.telnet.flushed_cycle == 0
-    assert orch.telnet.ops == ["push_full"]
+    assert orch.telnet.ops == ["push_full", "reset_cycle_safe"]
+    assert orch.conductor.interrupt_calls == [(0.25, "full-interrupt")]
     assert any(kind == "aired" for kind, _payload in orch.discord.calls)
 
 
@@ -241,7 +261,8 @@ def test_cap_voice_runtime_path_smoke(tmp_path, monkeypatch):
     assert orch.telnet.flushed_voice == 0
     assert orch.telnet.skipped_voice == 0
     assert orch.telnet.flushed_cycle == 0
-    assert orch.telnet.ops == ["push_voice"]
+    assert orch.telnet.ops == ["push_voice", "reset_cycle_safe"]
+    assert orch.conductor.interrupt_calls == [(0.25, "voice-interrupt")]
 
 
 def test_nwws_full_runtime_path_smoke(tmp_path, monkeypatch):
@@ -261,7 +282,8 @@ def test_nwws_full_runtime_path_smoke(tmp_path, monkeypatch):
     assert orch.telnet.flushed_full == 0
     assert orch.telnet.skipped_full == 0
     assert orch.telnet.flushed_cycle == 0
-    assert orch.telnet.ops == ["push_full"]
+    assert orch.telnet.ops == ["push_full", "reset_cycle_safe"]
+    assert orch.conductor.interrupt_calls == [(0.25, "full-interrupt")]
 
 
 def test_nwws_voice_runtime_path_smoke(tmp_path, monkeypatch):
@@ -280,27 +302,36 @@ def test_nwws_voice_runtime_path_smoke(tmp_path, monkeypatch):
     assert orch.telnet.flushed_voice == 0
     assert orch.telnet.skipped_voice == 0
     assert orch.telnet.flushed_cycle == 0
-    assert orch.telnet.ops == ["push_voice"]
+    assert orch.telnet.ops == ["push_voice", "reset_cycle_safe"]
+    assert orch.conductor.interrupt_calls == [(0.25, "voice-interrupt")]
 
 
-def test_interrupt_push_preserves_cycle_fallback_full(tmp_path, monkeypatch):
+def test_interrupt_push_resets_only_cycle_after_full_admission(tmp_path, monkeypatch):
     orch = _orchestrator(tmp_path, monkeypatch)
-    wav = tmp_path / "full.wav"
-    wav.write_bytes(b"RIFFfakeWAVE")
+    wav = _write_test_wav(tmp_path / "full.wav", duration_s=1.5)
 
     asyncio.run(orch._push_interrupt_audio(wav, full=True))
 
-    assert orch.telnet.ops == ["push_full"]
+    assert orch.telnet.ops == ["push_full", "reset_cycle_safe"]
+    assert orch.telnet.flushed_full == 0
+    assert orch.telnet.flushed_voice == 0
+    assert orch.telnet.skipped_full == 0
+    assert orch.telnet.skipped_voice == 0
+    assert orch.conductor.interrupt_calls == [(1.5, "full-interrupt")]
 
 
-def test_interrupt_push_preserves_cycle_fallback_voice(tmp_path, monkeypatch):
+def test_interrupt_push_resets_only_cycle_after_voice_admission(tmp_path, monkeypatch):
     orch = _orchestrator(tmp_path, monkeypatch)
-    wav = tmp_path / "voice.wav"
-    wav.write_bytes(b"RIFFfakeWAVE")
+    wav = _write_test_wav(tmp_path / "voice.wav", duration_s=2.0)
 
     asyncio.run(orch._push_interrupt_audio(wav, full=False))
 
-    assert orch.telnet.ops == ["push_voice"]
+    assert orch.telnet.ops == ["push_voice", "reset_cycle_safe"]
+    assert orch.telnet.flushed_full == 0
+    assert orch.telnet.flushed_voice == 0
+    assert orch.telnet.skipped_full == 0
+    assert orch.telnet.skipped_voice == 0
+    assert orch.conductor.interrupt_calls == [(2.0, "voice-interrupt")]
 
 
 def test_cycle_refill_wakes_conductor(tmp_path, monkeypatch):
@@ -313,15 +344,15 @@ def test_cycle_refill_wakes_conductor(tmp_path, monkeypatch):
     assert ("alerts", ()) in orch.refresher.calls
 
 
-def test_interrupt_push_does_not_hold_or_cut_cycle(tmp_path, monkeypatch):
+def test_interrupt_push_holds_conductor_after_guarded_cycle_reset(tmp_path, monkeypatch):
     orch = _orchestrator(tmp_path, monkeypatch)
-    wav = tmp_path / "voice.wav"
-    wav.write_bytes(b"RIFFfakeWAVE")
+    wav = _write_test_wav(tmp_path / "voice.wav", duration_s=3.0)
 
     asyncio.run(orch._push_interrupt_audio(wav, full=False))
 
     assert "flush_cycle" not in orch.telnet.ops
-    assert orch.conductor.calls == []
+    assert orch.telnet.ops == ["push_voice", "reset_cycle_safe"]
+    assert orch.conductor.interrupt_calls == [(3.0, "voice-interrupt")]
 
 
 def test_startup_queue_reset_does_not_poison_liquidsoap_planes(tmp_path, monkeypatch):

@@ -25,10 +25,12 @@ def test_liquidsoap_telnet_prefers_seasonalweather_aliases(tmp_path: Path) -> No
         """
 | sw.cycle.push <uri>
 | sw.cycle.skip
+| sw.cycle.reset
 | sw.voice_alert.push <uri>
 | sw.voice_alert.skip
 | sw.full_alert.push <uri>
 | sw.full_alert.skip
+| sw.interrupt.status
 | request_queue.push <uri>
 | request_queue.1.push <uri>
 | request_queue.2.push <uri>
@@ -39,11 +41,13 @@ END
     tn.push_full_alert(str(wav))
     tn.push_voice_alert(str(wav))
     tn.push_cycle(str(wav))
+    assert tn.reset_cycle_safely() is True
     tn.flush_alert()
 
     assert any(cmd.startswith("sw.full_alert.push ") for cmd in commands)
     assert any(cmd.startswith("sw.voice_alert.push ") for cmd in commands)
     assert any(cmd.startswith("sw.cycle.push ") for cmd in commands)
+    assert "sw.cycle.reset" in commands
     assert "sw.full_alert.skip" in commands
     assert "sw.voice_alert.skip" in commands
 
@@ -208,3 +212,67 @@ END
     push_cmd = next(cmd for cmd in commands if cmd.startswith("request_queue.push "))
     assert "annotate:" in push_cmd
     assert 'title="Cycle title"' in push_cmd
+
+
+def test_liquidsoap_telnet_flush_cycle_prefers_guarded_alias() -> None:
+    tn = LiquidsoapTelnet("127.0.0.1", 1234)
+    commands = _wire_fake_send(
+        tn,
+        """
+| sw.cycle.push <uri>
+| sw.cycle.skip
+| sw.cycle.reset
+| sw.voice_alert.push <uri>
+| sw.full_alert.push <uri>
+END
+""",
+    )
+
+    tn.flush_cycle()
+
+    assert "sw.cycle.reset" in commands
+    assert "sw.cycle.skip" not in commands
+
+
+def test_liquidsoap_telnet_safe_cycle_reset_has_no_builtin_fallback() -> None:
+    tn = LiquidsoapTelnet("127.0.0.1", 1234)
+    commands = _wire_fake_send(
+        tn,
+        """
+| cycle.push <uri>
+| cycle.flush_and_skip
+| voice_alert.push <uri>
+| full_alert.push <uri>
+END
+""",
+    )
+
+    assert tn.reset_cycle_safely() is False
+    assert "cycle.flush_and_skip" not in commands
+
+
+def test_liquidsoap_telnet_reads_interrupt_status_alias() -> None:
+    tn = LiquidsoapTelnet("127.0.0.1", 1234)
+    commands: list[str] = []
+    responses = iter(("ACTIVE\nEND\n", "IDLE\nEND\n"))
+
+    def fake_send(command: str, *, read_deadline=None):
+        commands.append(command)
+        if command == "help":
+            return """
+| sw.cycle.push <uri>
+| sw.cycle.reset
+| sw.voice_alert.push <uri>
+| sw.full_alert.push <uri>
+| sw.interrupt.status
+END
+"""
+        if command == "sw.interrupt.status":
+            return next(responses)
+        return "OK\nEND\n"
+
+    tn._send = fake_send  # type: ignore[method-assign]
+
+    assert tn.interrupt_active() is True
+    assert tn.interrupt_active() is False
+    assert commands.count("sw.interrupt.status") == 2

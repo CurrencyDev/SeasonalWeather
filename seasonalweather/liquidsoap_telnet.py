@@ -51,6 +51,13 @@ class LiquidsoapTelnet:
         self._voice_alert_skip_cmd: Optional[str] = None
         self._full_alert_skip_cmd: Optional[str] = None
 
+        # New SeasonalWeather-only controls.  These deliberately have no
+        # destructive compatibility fallback: old built-in flush/skip commands
+        # are exactly what can poison an empty request source on Liquidsoap
+        # 2.3.x.
+        self._cycle_reset_cmd: Optional[str] = None
+        self._interrupt_status_cmd: Optional[str] = None
+
     def _to_uri(self, wav_path: str) -> str:
         s = str(wav_path).strip()
         if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
@@ -292,10 +299,14 @@ class LiquidsoapTelnet:
         self._full_alert_flush_cmd = pick_flush(self._full_alert_prefix)
         self._voice_alert_skip_cmd = pick_skip(self._voice_alert_prefix, self._voice_alert_flush_cmd)
         self._full_alert_skip_cmd = pick_skip(self._full_alert_prefix, self._full_alert_flush_cmd)
+        if self._has_help_command(cmds, "sw.cycle.reset"):
+            self._cycle_reset_cmd = "sw.cycle.reset"
+        if self._has_help_command(cmds, "sw.interrupt.status"):
+            self._interrupt_status_cmd = "sw.interrupt.status"
 
         self._discovered = True
         log.info(
-            "Liquidsoap control discovered: cycle=%s voice_alert=%s full_alert=%s cycle_flush=%s voice_flush=%s full_flush=%s voice_skip=%s full_skip=%s",
+            "Liquidsoap control discovered: cycle=%s voice_alert=%s full_alert=%s cycle_flush=%s voice_flush=%s full_flush=%s voice_skip=%s full_skip=%s safe_cycle_reset=%s interrupt_status=%s",
             self._cycle_prefix,
             self._voice_alert_prefix,
             self._full_alert_prefix,
@@ -304,6 +315,8 @@ class LiquidsoapTelnet:
             self._full_alert_flush_cmd,
             self._voice_alert_skip_cmd,
             self._full_alert_skip_cmd,
+            self._cycle_reset_cmd or "-",
+            self._interrupt_status_cmd or "-",
         )
 
     def _ensure_discovered(self) -> None:
@@ -346,9 +359,44 @@ class LiquidsoapTelnet:
         self._push_to_prefix(self._cycle_prefix, wav_path, meta=meta)
 
     def flush_cycle(self) -> None:
+        """Clear routine cycle audio, preferring the guarded reset alias."""
         self._ensure_discovered()
+        if self._cycle_reset_cmd is not None:
+            self._send(self._cycle_reset_cmd)
+            return
         assert self._cycle_flush_cmd is not None
         self._send(self._cycle_flush_cmd)
+
+    def reset_cycle_safely(self) -> bool:
+        """Clear only the cycle plane with the guarded repository alias.
+
+        Returns ``False`` when the installed Liquidsoap script predates the
+        safe alias.  Never falls back to built-in ``flush_and_skip`` or an
+        unconditional ``skip`` because either can leave a pending skip on an
+        empty request source.
+        """
+        self._ensure_discovered()
+        if self._cycle_reset_cmd is None:
+            return False
+        self._send(self._cycle_reset_cmd)
+        return True
+
+    def interrupt_active(self) -> Optional[bool]:
+        """Return interrupt-plane state, or ``None`` when unsupported."""
+        self._ensure_discovered()
+        if self._interrupt_status_cmd is None:
+            return None
+        out = self._send(self._interrupt_status_cmd)
+        tokens = {
+            line.strip().upper()
+            for line in out.replace("\r", "").split("\n")
+            if line.strip()
+        }
+        if "ACTIVE" in tokens:
+            return True
+        if "IDLE" in tokens:
+            return False
+        raise RuntimeError(f"Unexpected Liquidsoap interrupt status response: {out.strip()!r}")
 
     def flush_voice_alert(self) -> None:
         self._ensure_discovered()

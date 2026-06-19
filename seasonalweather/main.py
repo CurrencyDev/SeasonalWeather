@@ -29,6 +29,7 @@ _APP_CFG: "AppConfig | None" = None
 from .alerts.nws_api import NWSApi
 from .alerts.product import parse_product_text, ParsedProduct
 from .tts.tts import TTS
+from .tts.audio import wav_duration_seconds
 from .liquidsoap_telnet import LiquidsoapTelnet
 from .broadcast.cycle import CycleBuilder, CycleContext
 from .broadcast.segment_store import SegmentStore
@@ -529,9 +530,9 @@ class Orchestrator:
 
         FULL alerts preempt both the cycle plane and lower-priority voice updates.
         VOICE alerts interrupt only the cycle plane and never clear queued/current
-        FULL alerts.  Do not cut the cycle plane during admission: cycle must stay
-        available as the fallback if Liquidsoap briefly resolves or rejects the
-        interrupt request after accepting the telnet push.
+        FULL alerts.  Do not cut the cycle plane before admission: cycle must stay
+        available as the fallback if Liquidsoap rejects the interrupt request.
+        After a successful push, only the guarded cycle reset may run.
         """
 
         def _notify_refill_after_failed_push() -> None:
@@ -546,6 +547,7 @@ class Orchestrator:
                 log.debug("Cycle refill notification after failed interrupt push failed", exc_info=True)
 
         async with self._cycle_lock:
+            mode = "full" if full else "voice"
             if full:
                 # Do not pre-flush or pre-skip the FULL/VOICE request queues here.
                 # On the Liquidsoap 2.3.x build seen in production, queue control
@@ -574,6 +576,46 @@ class Orchestrator:
                 except Exception:
                     _notify_refill_after_failed_push()
                     raise
+
+            # The interrupt is now admitted and available to the priority
+            # fallback.  Clear only the paused routine cycle source using the
+            # guarded repository alias; never touch FULL/VOICE queue controls.
+            # Then hold the conductor so it cannot rebuild a stale backlog while
+            # Liquidsoap has the cycle source paused.
+            try:
+                duration_s = wav_duration_seconds(Path(wav_path))
+            except Exception:
+                log.exception("Could not determine %s interrupt duration; using conservative hold", mode)
+                duration_s = 60.0
+
+            reset_ok = False
+            try:
+                reset_ok = bool(self.telnet.reset_cycle_safely())
+            except AttributeError:
+                reset_ok = False
+            except Exception:
+                log.exception("Safe cycle reset failed after %s interrupt admission", mode)
+
+            if reset_ok:
+                try:
+                    self.conductor.notify_interrupt_started(
+                        duration_s=duration_s,
+                        reason=f"{mode}-interrupt",
+                    )
+                except AttributeError:
+                    pass
+                except Exception:
+                    # The alert is already admitted and the cycle reset already
+                    # happened.  Do not convert a conductor bookkeeping failure
+                    # into an alert push failure or trigger duplicate origination.
+                    log.exception("Could not start cycle interrupt hold after %s admission", mode)
+            else:
+                # Preserve alert delivery on mixed-version deployments, but make
+                # the stale-cycle risk explicit until radio.liq is updated and
+                # Liquidsoap restarted.
+                log.error(
+                    "Liquidsoap does not expose sw.cycle.reset; cycle freshness protection is disabled for this interrupt"
+                )
 
 
     async def _render_and_push_interrupt_audio(
