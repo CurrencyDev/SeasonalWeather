@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import logging
 import re
 import socket
@@ -43,6 +44,13 @@ class LiquidsoapTelnet:
         self._cycle_prefix: Optional[str] = None
         self._voice_alert_prefix: Optional[str] = None
         self._full_alert_prefix: Optional[str] = None
+
+        # Concrete push commands.  Current SeasonalWeather Liquidsoap scripts
+        # expose base64 transport aliases so annotate: URIs never cross the
+        # line-oriented control socket with embedded quotes or spaces.
+        self._cycle_push_cmd: Optional[str] = None
+        self._voice_alert_push_cmd: Optional[str] = None
+        self._full_alert_push_cmd: Optional[str] = None
 
         # Derived commands for flush/skip.
         self._cycle_flush_cmd: Optional[str] = None
@@ -279,6 +287,16 @@ class LiquidsoapTelnet:
 
         assert self._cycle_prefix and self._voice_alert_prefix and self._full_alert_prefix
 
+        def pick_push(prefix: str) -> str:
+            b64 = f"{prefix}.push_b64"
+            if self._has_help_command(cmds, b64):
+                return b64
+            return f"{prefix}.push"
+
+        self._cycle_push_cmd = pick_push(self._cycle_prefix)
+        self._voice_alert_push_cmd = pick_push(self._voice_alert_prefix)
+        self._full_alert_push_cmd = pick_push(self._full_alert_prefix)
+
         # Flush commands vary by version.
         def pick_flush(prefix: str) -> str:
             # Prefer flush_and_skip, else flush, else skip as last-ditch.
@@ -306,10 +324,13 @@ class LiquidsoapTelnet:
 
         self._discovered = True
         log.info(
-            "Liquidsoap control discovered: cycle=%s voice_alert=%s full_alert=%s cycle_flush=%s voice_flush=%s full_flush=%s voice_skip=%s full_skip=%s safe_cycle_reset=%s interrupt_status=%s",
+            "Liquidsoap control discovered: cycle=%s voice_alert=%s full_alert=%s cycle_push=%s voice_push=%s full_push=%s cycle_flush=%s voice_flush=%s full_flush=%s voice_skip=%s full_skip=%s safe_cycle_reset=%s interrupt_status=%s",
             self._cycle_prefix,
             self._voice_alert_prefix,
             self._full_alert_prefix,
+            self._cycle_push_cmd,
+            self._voice_alert_push_cmd,
+            self._full_alert_push_cmd,
             self._cycle_flush_cmd,
             self._voice_alert_flush_cmd,
             self._full_alert_flush_cmd,
@@ -324,30 +345,33 @@ class LiquidsoapTelnet:
             if not self._discovered:
                 self._discover()
 
-    def _push_to_prefix(self, prefix: str, wav_path: str, *, meta: dict[str, str] | None = None) -> None:
+    def _push_to_command(self, command: str, wav_path: str, *, meta: dict[str, str] | None = None) -> None:
         uri = self._to_uri(wav_path)
-        # SeasonalWeather's explicit sw.* aliases are Liquidsoap server.register
-        # callbacks.  Unlike the built-in request_queue.push command, those
-        # callbacks are not a safe place to send long annotate: URIs containing
-        # quoted metadata with spaces.  In production this manifested as the
-        # alert request being accepted but falling off after the first SAME/header
-        # edge while Liquidsoap returned to cycle audio.  Keep sw.* pushes boring:
-        # send the bare file URI and let Icecast continue with existing metadata.
-        if not prefix.startswith("sw."):
-            uri = self._annotate_uri(uri, meta)
-        self._send(f'{prefix}.push {uri}')
+        annotated_uri = self._annotate_uri(uri, meta)
+
+        if command.endswith(".push_b64"):
+            payload = base64.b64encode(annotated_uri.encode("utf-8")).decode("ascii")
+            self._send(f"{command} {payload}")
+            return
+
+        # Built-in request.queue commands accept annotate: URIs directly.
+        # Older sw.* aliases do not have the safe base64 transport, so retain
+        # the v0.14.3 bare-URI fallback rather than risking alert truncation.
+        if command.startswith("sw."):
+            annotated_uri = uri
+        self._send(f"{command} {annotated_uri}")
 
     # -------- Public API --------
 
     def push_full_alert(self, wav_path: str, *, meta: dict[str, str] | None = None) -> None:
         self._ensure_discovered()
-        assert self._full_alert_prefix is not None
-        self._push_to_prefix(self._full_alert_prefix, wav_path, meta=meta)
+        assert self._full_alert_push_cmd is not None
+        self._push_to_command(self._full_alert_push_cmd, wav_path, meta=meta)
 
     def push_voice_alert(self, wav_path: str, *, meta: dict[str, str] | None = None) -> None:
         self._ensure_discovered()
-        assert self._voice_alert_prefix is not None
-        self._push_to_prefix(self._voice_alert_prefix, wav_path, meta=meta)
+        assert self._voice_alert_push_cmd is not None
+        self._push_to_command(self._voice_alert_push_cmd, wav_path, meta=meta)
 
     def push_alert(self, wav_path: str, *, meta: dict[str, str] | None = None) -> None:
         """Compatibility wrapper for older callers; use the VOICE interrupt plane."""
@@ -355,8 +379,8 @@ class LiquidsoapTelnet:
 
     def push_cycle(self, wav_path: str, *, meta: dict[str, str] | None = None) -> None:
         self._ensure_discovered()
-        assert self._cycle_prefix is not None
-        self._push_to_prefix(self._cycle_prefix, wav_path, meta=meta)
+        assert self._cycle_push_cmd is not None
+        self._push_to_command(self._cycle_push_cmd, wav_path, meta=meta)
 
     def flush_cycle(self) -> None:
         """Clear routine cycle audio, preferring the guarded reset alias."""

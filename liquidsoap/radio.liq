@@ -38,6 +38,24 @@ def sw_full_alert_push(uri) =
   "OK"
 end
 
+# Metadata-bearing requests are transported as base64-encoded complete URIs.
+# This keeps annotate: values, quotes, and spaces out of Liquidsoap's
+# line-oriented server command parser while preserving per-request metadata.
+def sw_cycle_push_b64(payload) =
+  cycle.push(request.create(string.base64.decode(payload)))
+  "OK"
+end
+
+def sw_voice_alert_push_b64(payload) =
+  voice_alert.push(request.create(string.base64.decode(payload)))
+  "OK"
+end
+
+def sw_full_alert_push_b64(payload) =
+  full_alert.push(request.create(string.base64.decode(payload)))
+  "OK"
+end
+
 def sw_cycle_skip(_) =
   source.skip(cycle)
   "OK"
@@ -82,6 +100,9 @@ end
 server.register(namespace="sw.cycle", usage="push <uri>", description="Push routine cycle audio.", "push", sw_cycle_push)
 server.register(namespace="sw.voice_alert", usage="push <uri>", description="Push voice alert audio.", "push", sw_voice_alert_push)
 server.register(namespace="sw.full_alert", usage="push <uri>", description="Push full alert audio.", "push", sw_full_alert_push)
+server.register(namespace="sw.cycle", usage="push_b64 <base64-uri>", description="Push routine cycle audio with safely encoded request metadata.", "push_b64", sw_cycle_push_b64)
+server.register(namespace="sw.voice_alert", usage="push_b64 <base64-uri>", description="Push voice alert audio with safely encoded request metadata.", "push_b64", sw_voice_alert_push_b64)
+server.register(namespace="sw.full_alert", usage="push_b64 <base64-uri>", description="Push full alert audio with safely encoded request metadata.", "push_b64", sw_full_alert_push_b64)
 server.register(namespace="sw.cycle", usage="skip", description="Skip current cycle audio.", "skip", sw_cycle_skip)
 server.register(namespace="sw.cycle", usage="reset", description="Safely clear queued and current routine cycle audio.", "reset", sw_cycle_reset)
 server.register(namespace="sw.voice_alert", usage="skip", description="Skip current voice alert audio.", "skip", sw_voice_alert_skip)

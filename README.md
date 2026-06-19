@@ -64,6 +64,7 @@ Freeze products are supported natively. `FZ.W` maps to SAME `FZW` (**Freeze Warn
 - NWS spoken-alert prose is centralized in the broadcast product text helpers; CAP/JSON-LD, IPAWS, NWWS-OI, and API backfill remain transport/parser paths feeding the same NWS presentation layer.
 - Interrupt alert audio render/push work runs through a priority dispatcher so FULL jobs are admitted ahead of queued VOICE jobs before Liquidsoap playout.
 - While interrupt audio is active, routine cycle production is held; after the FULL/VOICE planes become idle, a guarded cycle-only reset discards paused/queued stale audio and rebuilds from station ID and the current time.
+- Cycle and alert requests carry per-item Now Playing/IP-RDS metadata to Icecast through a base64-safe Liquidsoap control alias, avoiding quoted `annotate:` payloads on the line-oriented telnet socket.
 - Typical mounts: `/seasonalweather.ogg`, `/seasonalweather.mp3`
 
 ### Ops

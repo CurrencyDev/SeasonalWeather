@@ -1,3 +1,4 @@
+import base64
 from pathlib import Path
 
 from seasonalweather.liquidsoap_telnet import LiquidsoapTelnet
@@ -24,11 +25,14 @@ def test_liquidsoap_telnet_prefers_seasonalweather_aliases(tmp_path: Path) -> No
         tn,
         """
 | sw.cycle.push <uri>
+| sw.cycle.push_b64 <base64-uri>
 | sw.cycle.skip
 | sw.cycle.reset
 | sw.voice_alert.push <uri>
+| sw.voice_alert.push_b64 <base64-uri>
 | sw.voice_alert.skip
 | sw.full_alert.push <uri>
+| sw.full_alert.push_b64 <base64-uri>
 | sw.full_alert.skip
 | sw.interrupt.status
 | request_queue.push <uri>
@@ -44,9 +48,9 @@ END
     assert tn.reset_cycle_safely() is True
     tn.flush_alert()
 
-    assert any(cmd.startswith("sw.full_alert.push ") for cmd in commands)
-    assert any(cmd.startswith("sw.voice_alert.push ") for cmd in commands)
-    assert any(cmd.startswith("sw.cycle.push ") for cmd in commands)
+    assert any(cmd.startswith("sw.full_alert.push_b64 ") for cmd in commands)
+    assert any(cmd.startswith("sw.voice_alert.push_b64 ") for cmd in commands)
+    assert any(cmd.startswith("sw.cycle.push_b64 ") for cmd in commands)
     assert "sw.cycle.reset" in commands
     assert "sw.full_alert.skip" in commands
     assert "sw.voice_alert.skip" in commands
@@ -169,7 +173,7 @@ END
     assert not any(cmd.startswith("request_queue") and ".push " in cmd for cmd in commands)
 
 
-def test_liquidsoap_telnet_sends_bare_file_uri_to_sw_aliases(tmp_path: Path) -> None:
+def test_liquidsoap_telnet_restores_metadata_over_base64_aliases(tmp_path: Path) -> None:
     wav = tmp_path / "alert with spaces.wav"
     wav.write_bytes(b"RIFFfakeWAVE")
     tn = LiquidsoapTelnet("127.0.0.1", 1234)
@@ -177,16 +181,44 @@ def test_liquidsoap_telnet_sends_bare_file_uri_to_sw_aliases(tmp_path: Path) -> 
         tn,
         """
 | sw.cycle.push <uri>
+| sw.cycle.push_b64 <base64-uri>
 | sw.cycle.skip
 | sw.voice_alert.push <uri>
+| sw.voice_alert.push_b64 <base64-uri>
 | sw.voice_alert.skip
 | sw.full_alert.push <uri>
+| sw.full_alert.push_b64 <base64-uri>
 | sw.full_alert.skip
 END
 """,
     )
 
     tn.push_full_alert(str(wav), meta={"title": "Manual alert with spaces", "album": "Weather information"})
+
+    push_cmd = next(cmd for cmd in commands if cmd.startswith("sw.full_alert.push_b64 "))
+    encoded = push_cmd.split(" ", 1)[1]
+    decoded = base64.b64decode(encoded).decode("utf-8")
+    assert decoded.startswith("annotate:")
+    assert 'title="Manual alert with spaces"' in decoded
+    assert 'album="Weather information"' in decoded
+    assert decoded.endswith("alert%20with%20spaces.wav")
+
+
+def test_liquidsoap_telnet_old_sw_aliases_keep_bare_uri_fallback(tmp_path: Path) -> None:
+    wav = tmp_path / "alert with spaces.wav"
+    wav.write_bytes(b"RIFFfakeWAVE")
+    tn = LiquidsoapTelnet("127.0.0.1", 1234)
+    commands = _wire_fake_send(
+        tn,
+        """
+| sw.cycle.push <uri>
+| sw.voice_alert.push <uri>
+| sw.full_alert.push <uri>
+END
+""",
+    )
+
+    tn.push_full_alert(str(wav), meta={"title": "Manual alert with spaces"})
 
     push_cmd = next(cmd for cmd in commands if cmd.startswith("sw.full_alert.push "))
     assert "annotate:" not in push_cmd

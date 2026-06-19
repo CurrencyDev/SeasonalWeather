@@ -13,6 +13,9 @@ def test_radio_liq_uses_flat_priority_fallback_with_compatible_queue_syntax():
     assert 'server.register(namespace="sw.cycle", usage="push <uri>"' in script
     assert 'server.register(namespace="sw.voice_alert", usage="push <uri>"' in script
     assert 'server.register(namespace="sw.full_alert", usage="push <uri>"' in script
+    assert 'server.register(namespace="sw.cycle", usage="push_b64 <base64-uri>"' in script
+    assert 'server.register(namespace="sw.voice_alert", usage="push_b64 <base64-uri>"' in script
+    assert 'server.register(namespace="sw.full_alert", usage="push_b64 <base64-uri>"' in script
     assert 'server.register(namespace="sw.cycle", usage="skip"' in script
     assert 'server.register(namespace="sw.cycle", usage="reset"' in script
     assert 'server.register(namespace="sw.voice_alert", usage="skip"' in script
@@ -26,6 +29,13 @@ def test_radio_liq_uses_flat_priority_fallback_with_compatible_queue_syntax():
     full_push = script.split('def sw_full_alert_push(uri) =', 1)[1].split('end', 1)[0]
     assert 'source.skip(cycle)' not in voice_push
     assert 'source.skip(cycle)' not in full_push
+
+    cycle_push_b64 = script.split('def sw_cycle_push_b64(payload) =', 1)[1].split('end', 1)[0]
+    voice_push_b64 = script.split('def sw_voice_alert_push_b64(payload) =', 1)[1].split('end', 1)[0]
+    full_push_b64 = script.split('def sw_full_alert_push_b64(payload) =', 1)[1].split('end', 1)[0]
+    assert 'request.create(string.base64.decode(payload))' in cycle_push_b64
+    assert 'request.create(string.base64.decode(payload))' in voice_push_b64
+    assert 'request.create(string.base64.decode(payload))' in full_push_b64
 
     cycle_reset = script.split('def sw_cycle_reset(_) =', 1)[1].split('end', 1)[0]
     assert 'queued = cycle.queue()' in cycle_reset
