@@ -69,7 +69,6 @@ def build_cap_full_script(props: dict) -> str:
     if instr:
         lines.append("Instructions.")
         lines.append(instr)
-    lines.append("End of message.")
     return "\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
 
 

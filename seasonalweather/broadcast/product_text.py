@@ -454,7 +454,6 @@ def build_nws_full_alert_script(
         lines.append("Instructions.")
         lines.append(instr)
 
-    lines.append("End of message.")
     return "\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
 
 
@@ -572,7 +571,7 @@ def expiry_summary_script(official_text: str) -> str | None:
     line = cap_expiry_summary_line(flat)
     if not line:
         return None
-    return f"{line}\nEnd of message."
+    return line
 
 
 # ---------------------------------------------------------------------------
@@ -633,7 +632,6 @@ def build_statement_vtec_action_script(
         lines.append(summary_line)
     elif event:
         lines.append(f"The {event} has been updated.")
-    lines.append("End of message.")
     return "\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
 
 
@@ -712,7 +710,6 @@ def build_warning_vtec_action_script(
         if instruction:
             lines.append(instruction)
 
-    lines.append("End of message.")
     return "\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
 
 
@@ -1075,7 +1072,6 @@ def build_nwws_partial_cancel_script(
 
     if not lines:
         return ""
-    lines.append("End of message.")
     return "\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
 
 
@@ -1588,7 +1584,6 @@ def build_nwws_watch_partial_cancel_script(
         "Stay tuned to NOAA Weather Radio, commercial radio, and television outlets, "
         "or internet sources for the latest severe weather information."
     )
-    lines.append("End of message.")
     return "\n\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
 
 def build_nwws_watch_vtec_script(
@@ -1641,7 +1636,6 @@ def build_nwws_watch_vtec_script(
         "Stay tuned to NOAA Weather Radio, commercial radio, and television outlets, "
         "or internet sources for the latest severe weather information."
     )
-    lines.append("End of message.")
     return "\n\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
 
 

@@ -9,11 +9,10 @@ def build_ipaws_script(ev: Any) -> str:
     Build a NWR-style TTS script for an IPAWS civil alert.
 
     Format mirrors how real NWR handles NWEMs:
-      "The following message is transmitted at the request of [authority].
+      The following message is transmitted at the request of [authority].
       [headline if useful]
       [description]
       [instruction, if distinct]
-      End of message."
 
     The authority line is omitted only when the cleaned senderName is
     unusable AND no area description is available to anchor it.
@@ -65,5 +64,4 @@ def build_ipaws_script(ev: Any) -> str:
         lines.append("Instructions.")
         lines.append(instruction)
 
-    lines.append("End of message.")
     return "\n".join(ln.strip() for ln in lines if ln.strip()).strip()

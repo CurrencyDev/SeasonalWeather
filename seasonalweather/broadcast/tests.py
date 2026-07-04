@@ -46,7 +46,6 @@ def default_test_script_lines(code: str) -> list[str]:
             "For hazardous watches and warnings affecting our service area, this stream uses the standard warning alarm tone of 1050 Hz.",
             "This broadcast also carries Specific Area Message Encoding, or SAME, allowing properly equipped receivers and software decoders to respond only to selected event codes and locations.",
             "This concludes the weekly test of the SeasonalNet IP Weather Radio station, SeasonalWeather.",
-            "End of message.",
         ]
     if event_code == "RMT":
         return [
@@ -59,6 +58,5 @@ def default_test_script_lines(code: str) -> list[str]:
             "For hazardous watches and warnings affecting our service area, this stream uses the standard warning alarm tone of 1050 Hz.",
             "This broadcast also carries Specific Area Message Encoding, or SAME, allowing properly equipped receivers and software decoders to respond only to selected event codes and locations.",
             "This concludes the required monthly test of the SeasonalNet IP Weather Radio station, SeasonalWeather.",
-            "End of message.",
         ]
     return []

@@ -151,7 +151,7 @@ class CapRuntime:
                 script = o.cap_text._build_watch_expansion_script(ev)
             else:
                 # NEW or UPG watch
-                script = o.cap_text._build_cap_watch_script(ev, mode="full")
+                script = o.cap_text._build_cap_watch_script(ev)
             if not script.strip():
                 script = o.cap_text._build_cap_full_script(ev)
         else:

@@ -63,7 +63,7 @@ def test_wcn_sva_new_uses_watch_specific_narration():
     assert "in Virginia: Arlington" in script
     assert "WATCH COUNTY NOTIFICATION" not in script
     assert "DCC001" not in script
-    assert script.endswith("End of message.")
+    assert "End of message." not in script
 
 
 def test_wcn_watch_script_prefers_resolved_area_text_when_available():
@@ -243,7 +243,7 @@ def test_wcn_mixed_can_con_uses_watch_specific_partial_script():
     assert "DCC001" not in script
     assert "MDC001" not in script
     assert "THE NATIONAL WEATHER SERVICE HAS CANCELLED" not in script
-    assert script.endswith("End of message.")
+    assert "End of message." not in script
 
 
 WCN_SVA_MIXED_EXP_CON = """WWUS61 KLWX 120204

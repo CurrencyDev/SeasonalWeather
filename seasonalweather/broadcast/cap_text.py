@@ -50,7 +50,7 @@ class CapTextRenderer:
         """Shim → product_text.clean_cap_text()."""
         return _pt_clean_cap_text(s, limit=limit)
 
-    def _build_cap_watch_script(self, ev: "CapAlertEvent", *, mode: str = "full") -> str:  # type: ignore[name-defined]
+    def _build_cap_watch_script(self, ev: "CapAlertEvent") -> str:  # type: ignore[name-defined]
         """
         Build a sane, NWR-style script for CAP Tornado Watch / Severe Thunderstorm Watch.
         Returns "" if this CAP event is not a watch.
@@ -277,10 +277,6 @@ class CapTextRenderer:
         lines.append(remember)
         lines.append(stay_tuned)
 
-        # Keep SeasonalWeather’s usual closer (optional, but consistent)
-        if mode == "full":
-            lines.append("End of message.")
-
         # Double-newlines => better pacing
         return "\n\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
 
@@ -349,7 +345,7 @@ class CapTextRenderer:
             exp_phrase=exp_phrase,
         )
         # If the free function produced nothing, fall through to the full script.
-        if not result or result.strip() == "End of message.":
+        if not result:
             return self._build_cap_full_script(ev)
         return result
 
@@ -421,10 +417,9 @@ class CapTextRenderer:
             lines.append(f"This watch includes the following areas: {_county_segs()}.")
 
         if not lines:
-            return self._build_cap_watch_script(ev, mode="full")
+            return self._build_cap_watch_script(ev)
 
         lines.append("Stay tuned to NOAA Weather Radio, commercial radio, and television outlets for the latest severe weather information.")
-        lines.append("End of message.")
         return "\n".join(ln.strip() for ln in lines if ln and ln.strip()).strip()
 
     def _build_watch_expansion_script(self, ev: "CapAlertEvent") -> str:  # type: ignore[name-defined]

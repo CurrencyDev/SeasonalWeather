@@ -122,7 +122,7 @@ def test_partial_can_con_script_says_cancelled_and_remains_in_effect():
     assert "A severe thunderstorm warning remains in effect until 700 PM EDT" in script
     assert "The Severe Thunderstorm Warning remains in effect" not in script
     assert "Locations impacted include: Winchester, Martinsburg" in script
-    assert script.endswith("End of message.")
+    assert "End of message." not in script
 
 KCTP_PARTIAL_CAN_CON_SVS = """930
 WWUS51 KCTP 201726
@@ -241,7 +241,7 @@ KJP
 
 
 def test_fls_terminal_cancel_keeps_scoped_cancellation_prose():
-    assert expiry_summary_script(FLS_CAN_FA_W) == "The heavy rain has ended.\nEnd of message."
+    assert expiry_summary_script(FLS_CAN_FA_W) == "The heavy rain has ended."
 
     script = build_nwws_terminal_cancel_expiry_script("Flood Warning", FLS_CAN_FA_W)
 
@@ -251,7 +251,7 @@ def test_fls_terminal_cancel_keeps_scoped_cancellation_prose():
     assert "Flooding is no longer expected to pose a threat" in script
     assert "Please continue to heed remaining road closures" in script
     assert "Flood warning is cancelled.\nThe Flood Warning is cancelled" not in script
-    assert script.endswith("End of message.")
+    assert "End of message." not in script
 
 EXP_SVS = """246
 WWUS51 KLWX 201855

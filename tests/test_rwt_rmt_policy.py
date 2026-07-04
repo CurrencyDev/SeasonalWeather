@@ -69,6 +69,7 @@ def test_default_test_scripts_are_outside_main() -> None:
     rmt = default_test_script_lines("RMT")
     assert any("weekly test" in line.lower() for line in rwt)
     assert any("monthly test" in line.lower() for line in rmt)
+    assert all("End of message." not in line for line in rwt + rmt)
 
 
 def test_presentation_template_falls_back_to_literal_on_bad_template() -> None:
