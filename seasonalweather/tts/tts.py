@@ -31,6 +31,46 @@ _NWS_COMPACT_CLOCK_RE = re.compile(
     re.IGNORECASE,
 )
 
+_NWS_MACHINE_BLOCK_START_RE = re.compile(
+    r"^(?:"
+    r"LAT\.\.\.LON|"
+    r"TIME\.\.\.MOT\.\.\.LOC|"
+    r"TORNADO\.\.\.|"
+    r"TORNADO DAMAGE THREAT\.\.\.|"
+    r"THUNDERSTORM DAMAGE THREAT\.\.\.|"
+    r"FLASH FLOOD DAMAGE THREAT\.\.\.|"
+    r"DAMAGE THREAT\.\.\.|"
+    r"HAIL THREAT\.\.\.|"
+    r"MAX HAIL SIZE\.\.\.|"
+    r"WIND THREAT\.\.\.|"
+    r"MAX WIND GUST\.\.\.|"
+    r"EXPECTED RAINFALL RATE\.\.\.|"
+    r"RAINFALL AMOUNT\.\.\."
+    r")",
+    re.IGNORECASE,
+)
+_NWS_COORDINATE_ROW_RE = re.compile(r"^(?:\d{4}\s+){2,}\d{4}\.?$")
+_NWS_COORDINATE_TAIL_RE = re.compile(r"(?:\s+\d{4}){4,}\.?$")
+_NWS_SAINT_NAME_RE = re.compile(r"\bSt\.\s+(?=[A-Z][A-Za-z'’-]*\b)")
+_NWS_SAINT_ALL_CAPS_RE = re.compile(r"\bST\.\s+(?=[A-Z][A-Z'’-]*\b)")
+
+_NWS_TZ_ABBR_RE = re.compile(
+    r"\b(EDT|EST|CDT|CST|MDT|MST|PDT|PST|AKDT|AKST|HST|UTC|GMT)\b",
+    re.IGNORECASE,
+)
+_NWS_AMPM_ABBR_RE = re.compile(r"\b(AM|PM)\b", re.IGNORECASE)
+_NWS_STATE_ABBRS = {
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
+    "HI", "ID", "IL", "IA", "KS", "KY", "LA", "ME", "MD", "MA",
+    "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM",
+    "NY", "NC", "ND", "OH", "OK", "PA", "RI", "SC", "SD", "TN",
+    "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY", "DC",
+}
+_NWS_STATE_ABBR_RE = re.compile(
+    r"\b(" + "|".join(sorted(_NWS_STATE_ABBRS)) + r")\b",
+    re.IGNORECASE,
+)
+
 # Characters that commonly trail a URL in NWS product text but are not part of it.
 _URL_TRAIL_RE = re.compile(r"[.,;:)\]]+$")
 
@@ -183,6 +223,41 @@ def _is_zoneish_line(line: str) -> bool:
     return True
 
 
+def _looks_like_all_caps_prose(line: str) -> bool:
+    """Return true for NWS all-caps prose that TTS must not spell out."""
+    s = (line or "").strip()
+    letters = re.sub(r"[^A-Za-z]+", "", s)
+    if len(letters) < 3 or any(ch.islower() for ch in letters):
+        return False
+    return bool(re.search(r"\s", s)) or s.startswith("...")
+
+
+def _sentence_case_nws_prose(line: str) -> str:
+    """Sentence-case all-caps NWS prose while preserving key abbreviations."""
+    s = (line or "").strip()
+    if not _looks_like_all_caps_prose(s):
+        return _NWS_SAINT_NAME_RE.sub("Saint ", s)
+
+    s = re.sub(r"^\.\.\.\s*", "", s)
+    if s.endswith("..."):
+        s = s[:-3].rstrip() + "."
+
+    s = _NWS_SAINT_ALL_CAPS_RE.sub("Saint ", s)
+    s = s.lower()
+    if s:
+        s = s[0].upper() + s[1:]
+
+    s = re.sub(
+        r"\bsaint\s+([a-z])",
+        lambda m: f"Saint {m.group(1).upper()}",
+        s,
+    )
+    s = _NWS_AMPM_ABBR_RE.sub(lambda m: m.group(1).upper(), s)
+    s = _NWS_TZ_ABBR_RE.sub(lambda m: m.group(1).upper(), s)
+    s = _NWS_STATE_ABBR_RE.sub(lambda m: m.group(1).upper(), s)
+    return s
+
+
 def clean_for_tts(text: str) -> str:
     """
     De-noise NWS-ish content without rewriting meaning too aggressively.
@@ -197,6 +272,7 @@ def clean_for_tts(text: str) -> str:
     # HWO needs special handling: it's ALL CAPS + huge zone blocks that should not be spoken.
     is_hwo = _looks_like_hwo(t)
     skip_hwo_zone_block = False
+    skip_nws_machine_block = False
 
     # Strip a few common formatting artifacts
     t = t.replace("*", " ")
@@ -213,6 +289,20 @@ def clean_for_tts(text: str) -> str:
     for raw in t.split("\n"):
         line = raw.strip()
         if not line:
+            continue
+
+        # Machine-readable blocks are terminal metadata, not prose.  NWS
+        # products normally place ``&&`` before them, but malformed products
+        # sometimes omit that delimiter.  Once a block starts, discard all
+        # continuation rows through the next product delimiter (or EOF).
+        if skip_nws_machine_block:
+            if _SKIP_LINE_RE.match(line):
+                skip_nws_machine_block = False
+            continue
+        if _NWS_MACHINE_BLOCK_START_RE.match(line):
+            skip_nws_machine_block = True
+            continue
+        if _NWS_COORDINATE_ROW_RE.match(line):
             continue
 
         # Kill pure control/footer markers
@@ -272,12 +362,25 @@ def clean_for_tts(text: str) -> str:
         if _METAISH_RE.match(line) and (" " not in line or line == line.upper()):
             if not is_hwo:
                 # Try to keep things that look like real sentences
-                if not any(ch in line for ch in (".", ",", "!", "?", "'")):
+                if (
+                    not _looks_like_all_caps_prose(line)
+                    and not any(ch in line for ch in (".", ",", "!", "?", "'"))
+                ):
                     continue
             else:
                 # In HWO, only drop meta-ish if it's a pure token (no spaces)
                 if " " not in line and not any(ch in line for ch in (".", ",", "!", "?", "'")):
                     continue
+
+        # Keep NWS prose out of screaming caps so VoiceText does not spell
+        # ordinary words (for example, ``AT``) as individual letters.
+        line = _sentence_case_nws_prose(line)
+
+        # Belt-and-suspenders removal for coordinate rows that were flattened
+        # onto the end of a prose line by an upstream formatter.
+        line = _NWS_COORDINATE_TAIL_RE.sub("", line).rstrip()
+        if not line:
+            continue
 
         # Normalize compact NWS local times before VT-Paul or other TTS sees them.
         line = normalize_nws_spoken_times(line)

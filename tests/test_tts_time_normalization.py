@@ -29,3 +29,30 @@ def test_clean_for_tts_normalizes_alert_times_before_synthesis() -> None:
     assert clean_for_tts(text) == (
         "At 6:51 PM EDT, severe thunderstorms were located near Winchester until 7:00 PM EDT."
     )
+
+
+def test_clean_for_tts_drops_undelimited_nws_machine_readable_block() -> None:
+    text = """The warning has been cancelled.
+LAT...LON 3876 7633 3884 7627
+      3879 7622 3879 7619
+TIME...MOT...LOC 2352Z 235DEG 29KT 3866 7628
+$$
+MPS
+"""
+
+    assert clean_for_tts(text) == "The warning has been cancelled."
+
+
+def test_clean_for_tts_sentence_cases_svs_headline_and_expands_saint() -> None:
+    text = (
+        "...THE SEVERE THUNDERSTORM WARNING FOR NORTH CENTRAL ST. MARYS "
+        "WILL EXPIRE AT 800 PM EDT..."
+    )
+
+    spoken = clean_for_tts(text)
+
+    assert spoken == (
+        "The severe thunderstorm warning for north central Saint Marys "
+        "will expire at 8:00 PM EDT."
+    )
+    assert " AT " not in spoken

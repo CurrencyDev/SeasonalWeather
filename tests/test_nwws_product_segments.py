@@ -486,3 +486,107 @@ A strong thunderstorm will impact Montgomery County.
         "And now a Special Weather Statement from your National Weather Service, issued at 3:30 PM Eastern Daylight Time Sunday June 14 2026."
     )
     assert "Special Weather Statement. A strong" not in rendered.script
+
+
+KPHI_UNDELIMITED_MACHINE_BLOCK_SVS = """542
+WWUS51 KPHI 042354
+SVSPHI
+
+Severe Weather Statement
+National Weather Service Mount Holly NJ
+754 PM EDT Sat Jul 4 2026
+
+MDC011-035-041-050004-
+/O.CAN.KPHI.SV.W.0131.000000T0000Z-260705T0030Z/
+Talbot MD-Queen Anne's MD-Caroline MD-
+754 PM EDT Sat Jul 4 2026
+
+...THE SEVERE THUNDERSTORM WARNING FOR TALBOT...SOUTH CENTRAL QUEEN
+ANNE'S AND SOUTHWESTERN CAROLINE COUNTIES IS CANCELLED...
+
+The storm which prompted the warning has weakened below severe
+limits, and no longer poses an immediate threat to life or property.
+Therefore, the warning has been cancelled.
+
+A Severe Thunderstorm Watch remains in effect until 1100 PM EDT for
+eastern and northeastern Maryland.
+
+To report severe weather, contact your nearest law enforcement
+agency. They will relay your report to the National Weather Service
+Mount Holly NJ.
+
+LAT...LON 3876 7633 3884 7627 3879 7622 3879 7619
+      3889 7620 3898 7609 3869 7590 3857 7603
+      3863 7608 3864 7615 3869 7618 3868 7621
+      3872 7624 3876 7622 3871 7628 3878 7629
+      3877 7632 3867 7634 3874 7634 3875 7638
+TIME...MOT...LOC 2352Z 235DEG 29KT 3866 7628
+
+$$
+
+MPS
+"""
+
+
+def test_terminal_svs_drops_undelimited_machine_readable_block() -> None:
+    script = build_nwws_terminal_cancel_expiry_script(
+        "Severe Thunderstorm Warning",
+        KPHI_UNDELIMITED_MACHINE_BLOCK_SVS,
+    )
+
+    assert "warning has been cancelled" in script
+    assert "National Weather Service Mount Holly NJ" in script
+    assert "LAT...LON" not in script
+    assert "TIME...MOT...LOC" not in script
+    assert "3876" not in script
+    assert "2352Z" not in script
+
+
+KLWX_ST_MARYS_EXP_SVS = """510
+WWUS51 KLWX 042357
+SVSLWX
+
+Severe Weather Statement
+National Weather Service Baltimore MD/Washington DC
+757 PM EDT Sat Jul 4 2026
+
+MDC009-037-050007-
+/O.EXP.KLWX.SV.W.0212.000000T0000Z-260705T0000Z/
+St. Marys MD-Calvert MD-
+757 PM EDT Sat Jul 4 2026
+
+...THE SEVERE THUNDERSTORM WARNING FOR NORTH CENTRAL ST. MARYS AND
+SOUTHERN CALVERT COUNTIES WILL EXPIRE AT 800 PM EDT...
+
+The storm which prompted the warning was moving out of the area.
+Therefore, the warning will be allowed to expire. However, gusty
+winds are still possible with this thunderstorm.
+
+A Severe Thunderstorm Watch remains in effect until 1000 PM EDT for
+southern Maryland.
+
+&&
+
+LAT...LON 3835 7659 3845 7671 3852 7649 3843 7640
+TIME...MOT...LOC 2357Z 227DEG 22KT 3854 7642
+
+$$
+Manning
+"""
+
+
+def test_terminal_svs_sentence_cases_headline_and_expands_saint() -> None:
+    script = build_nwws_terminal_cancel_expiry_script(
+        "Severe Thunderstorm Warning",
+        KLWX_ST_MARYS_EXP_SVS,
+    )
+
+    assert "Saint Marys" in script
+    assert "ST. MARYS" not in script
+    assert "WILL EXPIRE AT" not in script
+    assert "will expire at 800 PM EDT" in script
+
+    spoken = clean_for_tts(script)
+    assert "Saint Marys" in spoken
+    assert "will expire at 8:00 PM EDT" in spoken
+    assert " AT " not in spoken

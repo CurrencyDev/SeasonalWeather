@@ -732,6 +732,24 @@ _SEG_META_RE = re.compile(
     r"^(?:LAT\.\.\.LON|TIME\.\.\.MOT\.\.\.LOC|HAIL\.\.\.|WIND\.\.\.|NNNN)",
     re.IGNORECASE,
 )
+_SEG_MACHINE_BLOCK_START_RE = re.compile(
+    r"^(?:"
+    r"LAT\.\.\.LON|"
+    r"TIME\.\.\.MOT\.\.\.LOC|"
+    r"TORNADO\.\.\.|"
+    r"TORNADO DAMAGE THREAT\.\.\.|"
+    r"THUNDERSTORM DAMAGE THREAT\.\.\.|"
+    r"FLASH FLOOD DAMAGE THREAT\.\.\.|"
+    r"DAMAGE THREAT\.\.\.|"
+    r"HAIL THREAT\.\.\.|"
+    r"MAX HAIL SIZE\.\.\.|"
+    r"WIND THREAT\.\.\.|"
+    r"MAX WIND GUST\.\.\.|"
+    r"EXPECTED RAINFALL RATE\.\.\.|"
+    r"RAINFALL AMOUNT\.\.\."
+    r")",
+    re.IGNORECASE,
+)
 _SEG_PPA_RE = re.compile(r"^PRECAUTIONARY/PREPAREDNESS ACTIONS", re.IGNORECASE)
 _SEG_LOC_RE = re.compile(r"^Locations?\s+(?:impacted|affected)\s+include", re.IGNORECASE)
 _SEG_ACTION_LABEL_RE = re.compile(r"^(?:CANCELLED|CONTINUED|EXPIRED)(?:\.{1,3})?$", re.IGNORECASE)
@@ -751,7 +769,16 @@ def _fix_headline_case(h: str) -> str:
     """ALL-CAPS NWS headline → sentence case, preserving TZ abbreviations."""
     if not h.isupper():
         return h
+    # In NWS geographic names, ``ST.`` is an abbreviation for ``Saint``.
+    # Expanding it before lower-casing prevents VoiceText Paul from reading it
+    # as ``Street`` (for example, ``ST. MARYS``).
+    h = re.sub(r"\bST\.\s+(?=[A-Z])", "Saint ", h)
     h = h.capitalize()
+    h = re.sub(
+        r"\bsaint\s+([a-z])",
+        lambda m: f"Saint {m.group(1).upper()}",
+        h,
+    )
     h = _TZ_FIX_RE.sub(lambda m: m.group(1).upper(), h)
     h = _AMPM_FIX_RE.sub(lambda m: m.group(1).upper(), h)
     return h
@@ -779,6 +806,16 @@ def _split_nwws_vtec_sections(product_text: str) -> list[str]:
         if not _SEG_VTEC_RE.search(chunk):
             continue
         body = re.split(r"(?m)^\s*&&\s*$", chunk, maxsplit=1)[0].strip("\n")
+        # Some offices occasionally omit the expected ``&&`` separator before
+        # LAT/LON, motion, or impact-based warning tag blocks.  Those blocks are
+        # terminal machine-readable metadata; discard the marker and all of its
+        # continuation rows rather than allowing coordinate rows into narration.
+        body_lines: list[str] = []
+        for line in body.splitlines():
+            if _SEG_MACHINE_BLOCK_START_RE.match(line.strip()):
+                break
+            body_lines.append(line)
+        body = "\n".join(body_lines).strip("\n")
         if _SEG_VTEC_RE.search(body):
             sections.append(body)
 
