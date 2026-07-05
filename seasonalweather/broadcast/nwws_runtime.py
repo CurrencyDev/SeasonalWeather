@@ -202,6 +202,11 @@ class NwwsRuntime:
                 except Exception:
                     log.exception("PNS handler error wfo=%s", parsed.wfo)
 
+            # NOW (Short-Term Forecast) is routine, expiring cycle content.
+            # It never enters the alert interrupt planes or AlertTracker.
+            elif (parsed.product_type or "").strip().upper() == "NOW":
+                self.now_runtime.submit(parsed)
+
 
     async def _handle_toneout(self, parsed: ParsedProduct) -> None:
         log.info("NWWS toneout candidate: type=%s awips=%s wfo=%s", parsed.product_type, parsed.awips_id or "", parsed.wfo)

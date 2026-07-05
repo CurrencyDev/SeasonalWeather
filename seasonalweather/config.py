@@ -302,6 +302,25 @@ class PnsConfig:
     subtypes: List[PnsSubtypeConfig]
 
 
+# --- now / short-term forecast ---
+
+@dataclass(frozen=True)
+class NowBackfillConfig:
+    enabled: bool
+    initial_delay_seconds: int
+    interval_seconds: int
+    lookback_minutes: int
+    max_products_per_office: int
+
+
+@dataclass(frozen=True)
+class NowConfig:
+    enabled: bool
+    intro: str
+    default_expire_minutes: int
+    api_backfill: NowBackfillConfig
+
+
 # --- health state machine ---
 
 @dataclass(frozen=True)
@@ -743,6 +762,7 @@ class AppConfig:
     nwws: NWWSConfig
     nws: NwsConfig
     pns: PnsConfig
+    now: NowConfig
     health: HealthConfig
     policy: PolicyConfig
     tts: TTSConfig
@@ -1099,6 +1119,45 @@ def load_config(path: str) -> AppConfig:
             "metadata",
         ],
         subtypes=pns_subtypes,
+    )
+
+    # ------------------------------------------------------------------
+    # now / short-term forecast
+    # ------------------------------------------------------------------
+    now_raw = raw.get("now", {})
+    now_backfill_raw = now_raw.get("api_backfill", {}) or {}
+    now = NowConfig(
+        enabled=bool(now_raw.get("enabled", True)),
+        intro=str(
+            now_raw.get(
+                "intro",
+                "A statement from the National Weather Service.",
+            )
+            or "A statement from the National Weather Service."
+        ).strip(),
+        default_expire_minutes=max(
+            5,
+            int(now_raw.get("default_expire_minutes", 60)),
+        ),
+        api_backfill=NowBackfillConfig(
+            enabled=bool(now_backfill_raw.get("enabled", True)),
+            initial_delay_seconds=max(
+                0,
+                int(now_backfill_raw.get("initial_delay_seconds", 15)),
+            ),
+            interval_seconds=max(
+                30,
+                int(now_backfill_raw.get("interval_seconds", 120)),
+            ),
+            lookback_minutes=max(
+                15,
+                int(now_backfill_raw.get("lookback_minutes", 120)),
+            ),
+            max_products_per_office=max(
+                1,
+                int(now_backfill_raw.get("max_products_per_office", 25)),
+            ),
+        ),
     )
 
     # ------------------------------------------------------------------
@@ -1566,6 +1625,7 @@ def load_config(path: str) -> AppConfig:
         nwws=nwws,
         nws=nws,
         pns=pns,
+        now=now,
         health=health,
         policy=policy,
         tts=tts,

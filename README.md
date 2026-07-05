@@ -62,6 +62,7 @@ Freeze products are supported natively. `FZ.W` maps to SAME `FZW` (**Freeze Warn
 - Audio is produced for **Liquidsoap**, which feeds **Icecast**.
 - Liquidsoap uses separate interrupt planes for FULL alerts, VOICE alerts, and routine cycle audio; FULL alerts have the highest priority and can preempt lower-priority VOICE updates.
 - NWS spoken-alert prose is centralized in the broadcast product text helpers; CAP/JSON-LD, IPAWS, NWWS-OI, and API backfill remain transport/parser paths feeding the same NWS presentation layer.
+- NWWS Short-Term Forecast (`NOW`) products are UGC-targeted and inserted into the routine cycle as expiring, non-SAME statements. Their spoken body begins after `.NOW...`; routing headers, signatures, and terminal machine-readable blocks are never narrated. A bounded api.weather.gov product-index poller backfills recent NOW products missed by NWWS-OI through the same targeting, ordering, dedupe, and expiry path.
 - Interrupt alert audio render/push work runs through a priority dispatcher so FULL jobs are admitted ahead of queued VOICE jobs before Liquidsoap playout.
 - While interrupt audio is active, routine cycle production is held; after the FULL/VOICE planes become idle, a guarded cycle-only reset discards paused/queued stale audio and rebuilds from station ID and the current time.
 - Cycle and alert requests carry per-item Now Playing/IP-RDS metadata to Icecast through a base64-safe Liquidsoap control alias, avoiding quoted `annotate:` payloads on the line-oriented telnet socket.
@@ -127,6 +128,7 @@ This is the single source of truth for all runtime behaviour. The file is well-c
 | `cycle` | Broadcast reference points, SPC/forecast/obs/HWO tuning, heightened-mode policy, and alert-focus hold policy |
 | `observations` | ASOS/AWOS station IDs for current conditions |
 | `nwws` | NWWS-OI server, allowed WFOs, resiliency knobs |
+| `now` | Short-Term Forecast routine-cycle enablement, spoken intro, fallback expiry, and API recovery polling |
 | `policy` | Product types that trigger tone-out |
 | `cap.voice.events` | Voice-only CAP events; repo default includes `Freeze Watch` (`FZA`) here |
 | `same` | SAME encoding: enabled, sender ID, amplitude |

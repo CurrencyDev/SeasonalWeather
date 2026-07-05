@@ -198,6 +198,23 @@ pns:
       require_same_day: false
       max_chars: 1200
 
+# Short-Term Forecast (NOW) products are routine, expiring cycle inserts.
+# They are targeted from the product UGC block and never generate SAME tones
+# or alert-focus state.
+now:
+  enabled: true
+  intro: "A statement from the National Weather Service."
+  default_expire_minutes: 60
+  # Recovery path for NOW products missed by NWWS-OI. Each configured NWWS
+  # office is polled through /products/types/NOW/locations/{WFO}; recent
+  # products feed the same targeting, stale-order, and cycle-insert path.
+  api_backfill:
+    enabled: true
+    initial_delay_seconds: 15
+    interval_seconds: 120
+    lookback_minutes: 120
+    max_products_per_office: 25
+
 # Runtime source-health state machine. This does not originate alerts; it
 # controls degraded-cycle presentation when SeasonalWeather loses confidence
 # in one or more upstream NWS feed paths.

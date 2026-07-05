@@ -596,7 +596,11 @@ class CycleConductor:
             extra={
                 "sw_cycle_key": "insert",
                 "sw_insert_id": insert_id,
-                "sw_insert_kind": str(item.get("kind") or ""),
+                "sw_insert_kind": str(
+                    ((item.get("meta") or {}).get("source_type"))
+                    or item.get("kind")
+                    or ""
+                ),
             },
         )
         try:

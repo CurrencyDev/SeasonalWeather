@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -8,6 +9,14 @@ import httpx
 
 
 DEFAULT_UA = "SeasonalWeather/2.0 (automated IP radio system for weather; contact: info@seasonalnet.org)"
+
+
+@dataclass(frozen=True)
+class NWSProductReference:
+    product_id: str
+    issuance_time: str | None = None
+    product_type: str | None = None
+    wfo: str | None = None
 
 
 @dataclass
@@ -46,7 +55,35 @@ class NWSApi:
                 await asyncio.sleep(0.4 * (attempt + 1))
         raise RuntimeError(f"NWS API request failed: {url}") from last_exc
 
-    async def latest_product_id(self, product_type: str, wfo: str) -> Optional[str]:
+    @staticmethod
+    def _issuance_sort_key(value: str | None) -> dt.datetime:
+        raw = str(value or "").strip()
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        try:
+            parsed = dt.datetime.fromisoformat(raw)
+        except ValueError:
+            return dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.astimezone(dt.timezone.utc)
+
+    async def list_product_references(
+        self,
+        product_type: str,
+        wfo: str,
+        *,
+        limit: int | None = None,
+    ) -> List[NWSProductReference]:
+        """Return product-list metadata newest first.
+
+        api.weather.gov generally returns product indexes newest first, but the
+        ordering is not part of the local recovery contract. Sort explicitly by
+        issuanceTime so callers never backfill an older sibling ahead of a newer
+        product for the same office.
+        """
+        product_type = str(product_type or "").strip().upper()
+        wfo = str(wfo or "").strip().upper()
         url = f"https://api.weather.gov/products/types/{product_type}/locations/{wfo}"
         data = await self._get_json(url)
 
@@ -58,12 +95,40 @@ class NWSApi:
         elif isinstance(data.get("graph"), list):
             items = data["graph"]
 
+        refs: List[NWSProductReference] = []
         for item in items:
             pid = item.get("id") or item.get("@id") or item.get("productId")
-            if isinstance(pid, str) and pid:
-                # pid might be full URL
-                return pid.rstrip("/").split("/")[-1]
-        return None
+            if not isinstance(pid, str) or not pid.strip():
+                continue
+            refs.append(
+                NWSProductReference(
+                    product_id=pid.rstrip("/").split("/")[-1],
+                    issuance_time=item.get("issuanceTime") or item.get("issuance_time"),
+                    product_type=(
+                        item.get("productCode")
+                        or item.get("product_code")
+                        or product_type
+                    ),
+                    wfo=(
+                        item.get("issuingOffice")
+                        or item.get("wfo")
+                        or item.get("wfoCode")
+                        or wfo
+                    ),
+                )
+            )
+
+        refs.sort(
+            key=lambda item: self._issuance_sort_key(item.issuance_time),
+            reverse=True,
+        )
+        if limit is not None:
+            return refs[: max(0, int(limit))]
+        return refs
+
+    async def latest_product_id(self, product_type: str, wfo: str) -> Optional[str]:
+        refs = await self.list_product_references(product_type, wfo, limit=1)
+        return refs[0].product_id if refs else None
 
     async def get_product(self, product_id: str) -> Optional[NWSProduct]:
         url = f"https://api.weather.gov/products/{product_id}"
@@ -76,7 +141,7 @@ class NWSApi:
             product_text=text,
             issuance_time=data.get("issuanceTime") or data.get("issuance_time"),
             product_type=data.get("productCode") or data.get("product_code"),
-            wfo=data.get("wfo") or data.get("wfoCode"),
+            wfo=data.get("issuingOffice") or data.get("wfo") or data.get("wfoCode"),
         )
 
     async def point_forecast_periods(self, lat: float, lon: float) -> List[Dict[str, Any]]:

@@ -43,6 +43,7 @@ from .broadcast.ipaws_runtime import IpawsRuntime
 from .broadcast.cap_runtime import CapRuntime
 from .broadcast.nwws_runtime import NwwsRuntime
 from .broadcast.pns_runtime import PnsRuntime
+from .broadcast.now_runtime import NowRuntime
 from .broadcast.tests_runtime import RequiredTestRuntime
 from .broadcast.manual_runtime import ManualOriginationRuntime
 from .broadcast.service_runtime import SeasonalWeatherServiceRuntime
@@ -235,6 +236,7 @@ class Orchestrator:
         self.ipaws_runtime = IpawsRuntime(self)
         self.cap_runtime = CapRuntime(self)
         self.pns_runtime = PnsRuntime(self)
+        self.now_runtime = NowRuntime(self)
         self.nwws_runtime = NwwsRuntime(self)
         self.tests_runtime = RequiredTestRuntime(self)
         self.manual_runtime = ManualOriginationRuntime(self)

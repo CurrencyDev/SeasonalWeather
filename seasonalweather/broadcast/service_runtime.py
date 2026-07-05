@@ -127,6 +127,8 @@ class SeasonalWeatherServiceRuntime:
         tasks.append(asyncio.create_task(o.conductor.run(), name="conductor"))
         tasks.append(asyncio.create_task(o.refresher.run(), name="segment_refresher"))
         tasks.append(asyncio.create_task(o.pns_runtime.run_backfill_loop(), name="pns_api_backfill"))
+        tasks.append(asyncio.create_task(o.now_runtime.run(), name="now_cycle_worker"))
+        tasks.append(asyncio.create_task(o.now_runtime.run_backfill_loop(), name="now_api_backfill"))
 
         if o.cfg.nwws.credentials_defaulted:
             log.warning(

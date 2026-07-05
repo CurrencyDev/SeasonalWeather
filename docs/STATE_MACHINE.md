@@ -41,6 +41,20 @@ Hard reject/downrank signals include tabular report structure, `METADATA`, `TIME
 
 The delimiter line `&&` is treated as a hard spoken-text boundary before metadata-style content unless a future subtype explicitly handles that content.
 
+## NOW routine-cycle state
+
+Short-Term Forecast (`NOW`) handling is driven by `now:` in `config.yaml` and implemented by `seasonalweather.broadcast.now_runtime`.
+
+- NOW is routine cycle content, not an alert interruption and not AlertTracker state.
+- The NWWS product must contain a standard `.NOW...` body marker and a mappable UGC block.
+- Products with no intersection with the configured SAME service area are skipped.
+- Accepted products become persistent `after_status` cycle inserts and remain eligible during alert-focus mode.
+- A newer product for an overlapping WFO/UGC scope replaces the prior insert.
+- The insert expires at the UGC expiration time; the configured fallback lifetime is used only when the UGC block has no resolvable expiry.
+- Spoken text begins after `.NOW...` and stops before `&&`, `$$`, or terminal machine-readable blocks such as `LAT...LON` and `TIME...MOT...LOC`.
+- The API recovery loop polls the recent `/products/types/NOW/locations/{WFO}` index for each configured NWWS office. It processes bounded recent references newest first, fetches each product by ID, and submits it through the same runtime path used by NWWS-OI.
+- Product IDs are suppressed after successful processing for the current service lifetime. Exceptions remain retryable, while stale, out-of-area, malformed, mismatched-office, and superseded products fail closed in the normal NOW state machine.
+
 ## Health state machine
 
 Source-health presentation is driven by `health:` in `config.yaml` and implemented in `seasonalweather/health_state.py`.
