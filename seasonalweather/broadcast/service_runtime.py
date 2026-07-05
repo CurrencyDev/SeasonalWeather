@@ -10,8 +10,8 @@ try:
 except Exception:  # pragma: no cover
     NWWSClient = None  # type: ignore
 from .station_feed_runtime import (
-    enabled as _sf_enabled,
-    seed_from_alert_tracker as _station_feed_seed_from_alert_tracker,
+    hydrate_persisted_alerts as _sf_hydrate_persisted_alerts,
+    purge_legacy_synthetic_alerts as _sf_purge_legacy_synthetic_alerts,
 )
 
 # Optional CAP (api.weather.gov/alerts/active)
@@ -88,14 +88,20 @@ class SeasonalWeatherServiceRuntime:
             pass
 
         try:
-            _sf_restored_tracker = _station_feed_seed_from_alert_tracker(o.alert_tracker)
-            if _sf_restored_tracker and _sf_enabled():
+            _sf_removed_legacy = _sf_purge_legacy_synthetic_alerts()
+            if _sf_removed_legacy:
                 log.info(
-                    "Station feed: restored %d alerts from AlertTracker into SQLite read model on startup",
-                    _sf_restored_tracker,
+                    "Station feed: removed %d legacy synthetic CAP row(s) on startup",
+                    _sf_removed_legacy,
+                )
+            _sf_hydrated = _sf_hydrate_persisted_alerts()
+            if _sf_hydrated:
+                log.info(
+                    "Station feed: hydrated %d persisted row(s) into runtime cache",
+                    _sf_hydrated,
                 )
         except Exception:
-            log.exception("Station feed: startup restore from tracker failed")
+            log.exception("Station feed: persisted-state startup initialization failed")
 
         tasks: list[asyncio.Task] = []
 

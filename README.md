@@ -75,6 +75,7 @@ Freeze products are supported natively. `FZ.W` maps to SAME `FZW` (**Freeze Warn
 - OpenAPI 3.1 API document at `/openapi.json`; Swagger UI remains available at `/docs`.
 - RFC 9457 Problem Details error responses (`application/problem+json`) with `code`, `details`, and `request_id` extensions for operator/debug use.
 - Public handled-alerts feed API (`/v1/handled-alerts`) for external UI consumption, backed by SQLite.
+  Persisted station-feed rows remain authoritative across restarts; startup does not synthesize degraded public records from AlertTracker state.
 
 ---
 

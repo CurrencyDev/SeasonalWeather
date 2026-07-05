@@ -169,157 +169,97 @@ def _sf_prune(now_ts: float, *, max_items: int) -> list[str]:
 
 
 
-def _station_feed_seed_from_alert_tracker(alert_tracker) -> int:
-    """
-    Restore active alerts from the live AlertTracker state on startup.
-    This works whether the tracker is backed by SQLite or the tracker state file.
-    """
-    if not _sf_enabled() or StationFeedAlert is None or alert_tracker is None:
+def _sf_purge_legacy_synthetic_alerts() -> int:
+    """Remove obsolete synthetic CAP rows created by the retired startup seeder."""
+    legacy_name = "CAP restore"
+    removed_ids: set[str] = set()
+
+    for alert_id, (alert, _expires_at) in list(_STATION_FEED_STATE.items()):
+        sender = getattr(alert, "from_", None)
+        sender_name = str(getattr(sender, "name", "") or "").strip()
+        sender_kind = str(getattr(sender, "kind", "") or "").strip().lower()
+        if sender_name.casefold() == legacy_name.casefold() and sender_kind == "relay":
+            _STATION_FEED_STATE.pop(alert_id, None)
+            removed_ids.add(str(alert_id))
+
+    if _STATION_FEED_REPO is not None:
+        try:
+            removed_ids.update(_STATION_FEED_REPO.delete_legacy_synthetic_alerts())
+        except Exception:
+            log.exception("Station feed: failed removing legacy synthetic CAP rows")
+
+    return len(removed_ids)
+
+
+def _sf_hydrate_persisted_alerts() -> int:
+    """Hydrate the runtime cache from exact persisted station-feed payloads."""
+    if not _sf_enabled() or _STATION_FEED_REPO is None:
         return 0
 
-    now_ts = time.time()
+    now = dt.datetime.now(dt.timezone.utc)
+    _station_id, _source, max_items, _ttl_s = _sf_cfg()
     try:
-        items = alert_tracker.get_cycle_alerts()
+        payloads = _STATION_FEED_REPO.load_alerts(now=now, max_items=max_items)
     except Exception:
-        log.exception("Station feed: failed reading AlertTracker state for startup seed")
-        return 0
-    if not items:
+        log.exception("Station feed: failed loading persisted rows into runtime cache")
         return 0
 
-    existing_ids = set(_STATION_FEED_STATE.keys())
-    existing_wavs: set[str] = set()
-    for _alert_obj, _exp_ts in _STATION_FEED_STATE.values():
+    hydrated = 0
+    for payload in payloads:
         try:
-            _links = getattr(_alert_obj, "links", {}) or {}
-            _wav = str(_links.get("wav") or "").strip()
-            if _wav:
-                existing_wavs.add(_wav)
-        except Exception:
-            continue
+            alert_id = str(payload.get("id") or "").strip()
+            expires_raw = payload.get("expires") or payload.get("ends")
+            expires_dt = _sf_parse_dt(expires_raw)
+            if not alert_id or expires_dt is None:
+                continue
+            if expires_dt.tzinfo is None:
+                expires_dt = expires_dt.replace(tzinfo=dt.timezone.utc)
+            else:
+                expires_dt = expires_dt.astimezone(dt.timezone.utc)
+            if expires_dt <= now:
+                continue
 
-    existing_vtec_tracks: set[str] = set()
-    for _alert_obj, _exp_ts in _STATION_FEED_STATE.values():
-        try:
-            _links = getattr(_alert_obj, "links", {}) or {}
-            for _v in (_links.get("vtec") or []):
-                _tid = _vtec_track_id(str(_v))
-                if _tid:
-                    existing_vtec_tracks.add(_tid)
-        except Exception:
-            continue
+            sender_raw = payload.get("from")
+            sender = None
+            if isinstance(sender_raw, dict):
+                sender_name = str(sender_raw.get("name") or "").strip()
+                sender_kind = str(sender_raw.get("kind") or "unknown").strip().lower()
+                if sender_kind not in {"relay", "origin", "unknown"}:
+                    sender_kind = "unknown"
+                if sender_name:
+                    sender = FeedSender(name=sender_name, kind=sender_kind)
 
-    seeded = 0
-    for item in items:
-        expires_raw = item.expires
-        exp_dt = _sf_parse_dt(expires_raw)
-        if exp_dt is None:
-            continue
-        try:
-            exp_ts = float(exp_dt.timestamp())
-        except Exception:
-            continue
-        if exp_ts <= now_ts:
-            continue
+            links_raw = payload.get("links")
+            links = dict(links_raw) if isinstance(links_raw, dict) else None
+            same_codes_raw = payload.get("sameCodes")
+            same_codes = (
+                [str(value).strip() for value in same_codes_raw if str(value).strip()]
+                if isinstance(same_codes_raw, list)
+                else []
+            )
 
-        audio_path = str(item.audio_path or "").strip()
-        tracker_id = str(item.id or "").strip()
-        if tracker_id and tracker_id in existing_ids:
-            continue
-        if audio_path and audio_path in existing_wavs:
-            continue
-
-        source = str(item.source or "").strip().upper()
-        if _sf_is_non_alert_station_item(
-            alert_id=tracker_id,
-            source=source,
-            event=item.event,
-            headline=item.headline,
-            cycle_only=bool(item.cycle_only),
-        ):
-            continue
-
-        if source == "CAP":
-            sender_name, sender_kind = "CAP restore", "relay"
-        elif source == "NWWS":
-            sender_name, sender_kind = "NWWS-OI", "relay"
-        elif source in {"PNS_CYCLE", "LOCAL", "SEASONALWEATHER"}:
-            sender_name, sender_kind = "SeasonalWeather", "origin"
-        else:
-            sender_name, sender_kind = source or "SeasonalWeather", "unknown"
-
-        sender = FeedSender(name=sender_name, kind=sender_kind) if FeedSender else None
-        vtec_list = [str(x) for x in (item.vtec or []) if str(x).strip()]
-        tracker_vtec_tracks = {_vtec_track_id(v) for v in vtec_list if _vtec_track_id(v)}
-        if tracker_vtec_tracks and (tracker_vtec_tracks & existing_vtec_tracks):
-            continue
-
-        area = ""
-        for _raw_vtec in vtec_list:
-            _m = _VTEC_PARSE_RE.search(str(_raw_vtec))
-            if _m:
-                area = str(_m.group("office") or "").strip()
-                if area:
-                    break
-
-        script_text = str(item.script_text or "")
-        event = str(item.event or item.code or "Alert")
-        headline = str(item.headline or event)
-        issued_raw = item.issued
-        cycle_only = bool(item.cycle_only)
-        same_locs = [str(x) for x in (item.same_locs or []) if str(x).strip()]
-        code = str(item.code or "").strip()
-
-        if source == "NWWS":
-            event = _sf_nwws_event_label(code or event, vtec_list=vtec_list, text=script_text or headline)
-            if not headline or re.fullmatch(r"[A-Z0-9]{6,16}", headline):
-                headline = _sf_nwws_make_headline(
-                    event,
-                    issued_dt=_sf_parse_dt(issued_raw),
-                    end_dt=_sf_parse_dt(expires_raw),
-                    issuer=_sf_nwws_extract_issuer(script_text, fallback_wfo=area),
-                )
-            if not area or re.fullmatch(r"[A-Z]{4}", area):
-                area = _sf_nwws_area_from_text(script_text) or area
-
-        links = {"mode": "VOICE" if cycle_only else "FULL"}
-        if audio_path:
-            links["wav"] = audio_path
-        if vtec_list:
-            links["vtec"] = vtec_list
-        if code:
-            links["same"] = f"same:{code}"
-
-        try:
             alert = StationFeedAlert(
-                id=tracker_id or _sf_sha1_12(f"tracker:{source}:{headline}:{audio_path}"),
-                event=event,
-                headline=headline,
-                severity="Unknown",
-                urgency="Unknown",
-                certainty="Unknown",
-                area=area,
-                effective=_sf_iso(issued_raw),
-                ends=_sf_iso(expires_raw),
-                expires=_sf_iso(expires_raw),
-                sent=_sf_iso(issued_raw),
-                sameCodes=same_locs,
+                id=alert_id,
+                event=str(payload.get("event") or "Alert"),
+                headline=str(payload.get("headline") or ""),
+                severity=str(payload.get("severity") or "Unknown"),
+                urgency=str(payload.get("urgency") or "Unknown"),
+                certainty=str(payload.get("certainty") or "Unknown"),
+                area=str(payload.get("area") or ""),
+                effective=_sf_iso(payload.get("effective")),
+                ends=_sf_iso(payload.get("ends")),
+                expires=_sf_iso(payload.get("expires")),
+                sent=_sf_iso(payload.get("sent")),
+                sameCodes=same_codes,
                 from_=sender,
                 links=links,
             )
-            _STATION_FEED_STATE[str(alert.id)] = (alert, exp_ts)
-            _sf_repo_upsert(alert, expires_at=dt.datetime.fromtimestamp(exp_ts, tz=dt.timezone.utc))
-            existing_ids.add(str(alert.id))
-            if audio_path:
-                existing_wavs.add(audio_path)
-            existing_vtec_tracks.update({t for t in tracker_vtec_tracks if t})
-            seeded += 1
+            _STATION_FEED_STATE[alert_id] = (alert, expires_dt.timestamp())
+            hydrated += 1
         except Exception:
-            log.exception("Station feed: failed seeding one AlertTracker entry into StationFeed")
+            log.exception("Station feed: skipped malformed persisted row during cache hydration")
 
-    if seeded:
-        _station_id, _source, max_items, _ttl_s = _sf_cfg()
-        _sf_prune(now_ts, max_items=max_items)
-    return seeded
+    return hydrated
 
 
 def _station_feed_note_required_test(
@@ -1453,6 +1393,8 @@ sha1_12 = _sf_sha1_12
 repo_upsert = _sf_repo_upsert
 prune = _sf_prune
 station_feed_housekeeping_start = _sf_station_feed_hk_start
+purge_legacy_synthetic_alerts = _sf_purge_legacy_synthetic_alerts
+hydrate_persisted_alerts = _sf_hydrate_persisted_alerts
 is_non_alert_station_item = _sf_is_non_alert_station_item
 remove_ids = _sf_remove_ids
 remove_by_vtec_tracks = _sf_remove_by_vtec_tracks
@@ -1466,7 +1408,6 @@ nwws_area_from_text = _sf_nwws_area_from_text
 nwws_make_headline = _sf_nwws_make_headline
 nwws_extract_issuer = _sf_nwws_extract_issuer
 make_eas_headline = _sf_make_eas_headline
-seed_from_alert_tracker = _station_feed_seed_from_alert_tracker
 note_cap = _station_feed_note_cap
 note_ern = _station_feed_note_ern
 note_nwws = _station_feed_note_nwws

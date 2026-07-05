@@ -97,6 +97,37 @@ class StationFeedRepository:
         # sqlite3.executemany() rowcount may be -1 on some builds; calculate conservatively.
         return max(0, int(getattr(cur, "rowcount", 0) or 0))
 
+    def delete_legacy_synthetic_alerts(self) -> list[str]:
+        """Delete only rows emitted by the retired CAP startup reconstruction path."""
+        legacy_name = "CAP restore"
+        remove_ids: list[str] = []
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                "SELECT alert_id, payload_json FROM station_feed_alerts"
+            ).fetchall()
+            for row in rows:
+                try:
+                    payload = json.loads(str(row["payload_json"] or "{}"))
+                except Exception:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                sender = payload.get("from")
+                if not isinstance(sender, dict):
+                    continue
+                sender_name = str(sender.get("name") or "").strip()
+                sender_kind = str(sender.get("kind") or "").strip().lower()
+                if sender_name.casefold() != legacy_name.casefold() or sender_kind != "relay":
+                    continue
+                remove_ids.append(str(row["alert_id"]))
+
+            if remove_ids:
+                conn.executemany(
+                    "DELETE FROM station_feed_alerts WHERE alert_id = ?",
+                    [(alert_id,) for alert_id in remove_ids],
+                )
+        return remove_ids
+
     def prune_expired(self, *, now: Any | None = None, grace_seconds: int = 0) -> int:
         cutoff = _utc_now() if now is None else (now if isinstance(now, dt.datetime) else None)
         if cutoff is None:
