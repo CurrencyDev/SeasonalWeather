@@ -372,3 +372,136 @@ def test_nwws_render_facade_normalizes_wcn_partial_cancel_script():
     assert rendered.renderer == "nwws-watch-partial-cancel"
     assert "Severe Thunderstorm Watch Number 234 has been cancelled" in rendered.script
     assert "raw partial cancel fallback" not in rendered.script
+
+
+WCN_SVA_COMPLETE_CAN = """WWUS61 KLWX 050129
+WCNLWX
+
+WATCH COUNTY NOTIFICATION FOR WATCH 457
+NATIONAL WEATHER SERVICE BALTIMORE MD/WASHINGTON DC
+929 PM EDT SAT JUL 4 2026
+
+DCC001-MDC003-005-009-015-017-025-027-031-033-037-510-VAC013-059-
+099-153-177-179-510-600-610-630-683-685-050230-
+/O.CAN.KLWX.SV.A.0457.000000T0000Z-260705T0200Z/
+
+THE NATIONAL WEATHER SERVICE HAS CANCELLED SEVERE THUNDERSTORM
+WATCH 457 FOR THE FOLLOWING AREAS
+
+THE DISTRICT OF COLUMBIA
+
+IN MARYLAND THIS CANCELS 11 COUNTIES
+
+IN CENTRAL MARYLAND
+
+ANNE ARUNDEL                       HOWARD
+MONTGOMERY                         PRINCE GEORGES
+
+IN NORTHEAST MARYLAND
+
+CECIL
+
+IN NORTHERN MARYLAND
+
+BALTIMORE
+BALTIMORE CITY
+HARFORD
+
+IN SOUTHERN MARYLAND
+
+CALVERT                       CHARLES
+ST. MARYS
+
+IN VIRGINIA THIS CANCELS 12 COUNTIES
+
+IN CENTRAL VIRGINIA
+
+CITY OF FREDERICKSBURG
+KING GEORGE
+SPOTSYLVANIA
+
+IN NORTHERN VIRGINIA
+
+ARLINGTON
+CITY OF ALEXANDRIA
+CITY OF FAIRFAX
+CITY OF FALLS CHURCH
+CITY OF MANASSAS
+CITY OF MANASSAS PARK
+FAIRFAX
+PRINCE WILLIAM
+STAFFORD
+
+THIS INCLUDES THE CITIES OF ALEXANDRIA, ANNAPOLIS, BALTIMORE,
+FREDERICKSBURG, MANASSAS, WASHINGTON, AND WOODBRIDGE.
+
+$$
+
+ANZ530>543-050230-
+/O.CAN.KLWX.SV.A.0457.000000T0000Z-260705T0200Z/
+
+THE NATIONAL WEATHER SERVICE HAS CANCELLED SEVERE THUNDERSTORM
+WATCH 457 FOR THE FOLLOWING AREAS
+
+THIS CANCELS THE FOLLOWING ADJACENT COASTAL WATERS
+
+CHESAPEAKE BAY NORTH OF POOLES ISLAND MD
+CHESAPEAKE BAY FROM POOLES ISLAND TO SANDY POINT MD
+TIDAL POTOMAC FROM KEY BRIDGE TO INDIAN HEAD MD
+
+$$
+"""
+
+
+WCN_SVA_COMPLETE_EXP = """WWUS61 KLWX 050200
+WCNLWX
+
+WATCH COUNTY NOTIFICATION FOR WATCH 458
+NATIONAL WEATHER SERVICE BALTIMORE MD/WASHINGTON DC
+1000 PM EDT SAT JUL 4 2026
+
+MDC009-017-037-050300-
+/O.EXP.KLWX.SV.A.0458.000000T0000Z-260705T0200Z/
+
+THE NATIONAL WEATHER SERVICE HAS ALLOWED SEVERE THUNDERSTORM
+WATCH 458 TO EXPIRE FOR THE FOLLOWING AREAS
+
+IN MARYLAND THIS ALLOWS TO EXPIRE 3 COUNTIES
+
+IN SOUTHERN MARYLAND
+
+CALVERT                       CHARLES
+ST. MARYS
+
+$$
+"""
+
+
+def test_wcn_complete_can_omits_watch_definition_reminder():
+    vtec = [
+        "/O.CAN.KLWX.SV.A.0457.000000T0000Z-260705T0200Z/",
+        "/O.CAN.KLWX.SV.A.0457.000000T0000Z-260705T0200Z/",
+    ]
+    script = build_nwws_watch_vtec_script(
+        WCN_SVA_COMPLETE_CAN,
+        vtec,
+        local_tz=ZoneInfo("America/New_York"),
+        now=dt.datetime(2026, 7, 4, 21, 29, tzinfo=ZoneInfo("America/New_York")),
+    )
+
+    assert "Severe Thunderstorm Watch Number 457 has been cancelled" in script
+    assert "Remember, a severe thunderstorm watch means" not in script
+    assert "conditions are favorable for the development of severe weather" not in script
+
+
+def test_wcn_complete_expiration_omits_watch_definition_reminder():
+    script = build_nwws_watch_vtec_script(
+        WCN_SVA_COMPLETE_EXP,
+        ["/O.EXP.KLWX.SV.A.0458.000000T0000Z-260705T0200Z/"],
+        local_tz=ZoneInfo("America/New_York"),
+        now=dt.datetime(2026, 7, 4, 22, 0, tzinfo=ZoneInfo("America/New_York")),
+    )
+
+    assert "Severe Thunderstorm Watch Number 458 has been allowed to expire" in script
+    assert "Remember, a severe thunderstorm watch means" not in script
+    assert "conditions are favorable for the development of severe weather" not in script

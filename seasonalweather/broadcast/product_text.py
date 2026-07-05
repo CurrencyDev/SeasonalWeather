@@ -1666,7 +1666,19 @@ def build_nwws_watch_vtec_script(
         if area_sentence:
             lines.append(area_sentence)
 
-    if remember:
+    # Terminal WCN updates end the watch for every section represented by this
+    # product.  The watch-definition reminder is useful only while at least one
+    # section remains active; reading it after a complete CAN/EXP is misleading.
+    watch_actions = {
+        m.group("action").upper()
+        for raw in (vtec or [])
+        if (m := _WATCH_VTEC_RE.search(str(raw).strip().upper()))
+        and m.group("sig") == "A"
+        and m.group("phen") in {"TO", "SV"}
+    }
+    has_active_section = bool(watch_actions & {"NEW", "CON", "EXT", "EXA", "EXB"})
+    terminal_only = bool(watch_actions) and watch_actions <= {"CAN", "EXP"}
+    if remember and (has_active_section or not terminal_only):
         lines.append(remember)
 
     lines.append(
