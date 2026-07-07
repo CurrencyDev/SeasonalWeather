@@ -26,4 +26,5 @@ jobs:
 
       - name: Scan working tree for secrets
         run: |
-          gitleaks dir . --redact --verbose --no-banner
+          test -f .gitleaks.toml
+gitleaks dir . --config .gitleaks.toml --redact --verbose --no-banner
