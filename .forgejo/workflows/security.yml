@@ -26,4 +26,4 @@ jobs:
 
       - name: Scan working tree for secrets
         run: |
-          gitleaks dir --source . --redact --verbose --no-banner
+          gitleaks dir . --redact --verbose --no-banner
