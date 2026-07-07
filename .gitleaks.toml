@@ -3,7 +3,7 @@ title = "SeasonalNet Gitleaks configuration"
 [extend]
 useDefault = true
 
-[[allowlists]]
+[allowlist]
 description = "Allow intentionally empty Discord-style environment placeholders"
 regexTarget = "line"
 regexes = [
