@@ -24,7 +24,8 @@ jobs:
           tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
           gitleaks version
 
-      - name: Scan working tree for secrets
+      - name: Scan for secrets
         run: |
+          set -eu
           test -f .gitleaks.toml
-gitleaks dir . --config .gitleaks.toml --redact --verbose --no-banner
+          gitleaks dir . --config .gitleaks.toml --redact --verbose --no-banner
