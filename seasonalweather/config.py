@@ -645,6 +645,10 @@ class LogsDiscordConfig:
     cycle_rebuild_log: bool = True    # Post cycle rebuild events to ops channel
     # AlertTracker lifecycle (load/purge on startup) — slightly noisy, off by default
     alerttracker_lifecycle_log: bool = False
+    # Detailed ops/audit embeds (targeting, dedupe, audio, station-feed). Noisy, off by default.
+    ops_detail_log: bool = False
+    # Source health/startup source-state embeds. Low volume, on by default.
+    source_health_log: bool = True
 
     # Base URL for the Lucide icon CDN, e.g. "https://cdn.seasonalnet.org"
     # Leave empty to omit thumbnails from all embeds.
@@ -1613,6 +1617,8 @@ def load_config(path: str) -> AppConfig:
         alerttracker_lifecycle_log=bool(
             _get(_ld, "alerttracker_lifecycle_log", default=False)
         ),
+        ops_detail_log=bool(_get(_ld, "ops_detail_log", default=False)),
+        source_health_log=bool(_get(_ld, "source_health_log", default=True)),
         icon_cdn_url=str(_get(_ld, "icon_cdn_url", default="") or "").strip(),
     )
     logs = LogsConfig(runtime=_logs_runtime, discord=_logs_discord)

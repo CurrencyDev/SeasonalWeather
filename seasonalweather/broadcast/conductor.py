@@ -214,6 +214,7 @@ class CycleConductor:
         # Cycle position tracking
         self._position_in_rotation: int = 0
         self._cycle_order: List[str] = []   # rebuilt at each rotation start
+        self._last_cycle_order: List[str] = []
         self._insert_cache: Dict[str, Dict[str, Any]] = {}
         self._last_pushed_at: Dict[str, float] = {}
         self._focus_mode_active: bool = False
@@ -524,9 +525,19 @@ class CycleConductor:
                 )
 
         order.extend(self._insert_keys_for("end_of_rotation", rotation_count=self._rotation_count, focus=focus))
+        previous_order = list(self._last_cycle_order)
         self._cycle_order = order
+        self._last_cycle_order = list(order)
 
         alert_count = len([k for k in order if k.startswith("_alert_")])
+        if previous_order:
+            previous_set = set(previous_order)
+            current_set = set(order)
+            added = [k for k in order if k not in previous_set]
+            removed = [k for k in previous_order if k not in current_set]
+        else:
+            added = list(order)
+            removed = []
         log.info(
             "CycleConductor: starting rotation #%d — %d segments (%d active alerts, focus=%s)",
             self._rotation_count,
@@ -534,6 +545,21 @@ class CycleConductor:
             alert_count,
             focus,
         )
+        try:
+            if self._discord_fn and previous_order and (added or removed):
+                self._discord_fn(
+                    reason="order-rebuild",
+                    mode="focus" if focus else "normal",
+                    interval=0,
+                    seq_dur=0.0,
+                    segments=len(order),
+                    active_alerts=alert_count,
+                    added=added,
+                    removed=removed,
+                    order_preview=order[:10],
+                )
+        except Exception:
+            log.debug("CycleConductor: discord_fn failed during order rebuild", exc_info=True)
 
     async def _push_next_segment(self) -> bool:
         """

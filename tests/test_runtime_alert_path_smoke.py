@@ -99,6 +99,9 @@ class _FakeDiscord:
     def alert_expired(self, **kwargs) -> None:
         self.calls.append(("expired", kwargs))
 
+    def alert_partial_terminal(self, **kwargs) -> None:
+        self.calls.append(("partial_terminal", kwargs))
+
 
 class _FakeTargetResolver:
     def __init__(self, same_codes=None) -> None:
@@ -304,6 +307,86 @@ def test_nwws_voice_runtime_path_smoke(tmp_path, monkeypatch):
     assert orch.telnet.flushed_cycle == 0
     assert orch.telnet.ops == ["push_voice", "reset_cycle_safe"]
     assert orch.conductor.interrupt_calls == [(0.25, "voice-interrupt")]
+
+
+def test_nwws_svs_discord_uses_underlying_vtec_event_code(tmp_path, monkeypatch):
+    orch = _orchestrator(tmp_path, monkeypatch)
+    parsed, _official_text = _nwws_product(product_type="SVS", action="CON")
+
+    asyncio.run(orch.nwws_runtime._handle_toneout(parsed))
+
+    assert orch.discord.calls
+    kind, payload = orch.discord.calls[-1]
+    assert kind == "updated"
+    assert payload["code"] == "SVR"
+    assert payload["event"] == "Severe Thunderstorm Warning"
+
+
+def test_nwws_wcn_discord_uses_watch_vtec_event_code(tmp_path, monkeypatch):
+    orch = _orchestrator(tmp_path, monkeypatch)
+    raw = """WUUS61 KLWX 091830
+WCNLWX
+
+Severe Thunderstorm Watch
+National Weather Service Baltimore MD/Washington DC
+230 PM EDT Thu Jul 9 2026
+
+MDC031-092000-
+/O.NEW.KLWX.SV.A.0474.260709T1830Z-260710T0200Z/
+Montgomery MD-
+230 PM EDT Thu Jul 9 2026
+
+...A SEVERE THUNDERSTORM WATCH IS IN EFFECT UNTIL 1000 PM EDT...
+
+$$
+"""
+    parsed = ParsedProduct(product_type="WCN", wfo="KLWX", awips_id="WCNLWX", vtec=None, raw_text=raw)
+
+    asyncio.run(orch.nwws_runtime._handle_toneout(parsed))
+
+    assert orch.discord.calls
+    kind, payload = orch.discord.calls[-1]
+    assert kind == "aired"
+    assert payload["code"] == "SVA"
+    assert payload["event"] == "Severe Thunderstorm Watch"
+
+
+def test_nwws_partial_terminal_discord_is_not_logged_as_fully_cancelled(tmp_path, monkeypatch):
+    orch = _orchestrator(tmp_path, monkeypatch)
+    raw = """WWUS51 KLWX 091839
+SVSLWX
+
+Severe Thunderstorm Warning
+National Weather Service Baltimore MD/Washington DC
+239 PM EDT Thu Jul 9 2026
+
+MDC031-091845-
+/O.CAN.KLWX.SV.W.0247.000000T0000Z-260709T1845Z/
+Montgomery MD-
+239 PM EDT Thu Jul 9 2026
+
+...THE SEVERE THUNDERSTORM WARNING FOR MONTGOMERY COUNTY IS CANCELLED...
+
+MDC013-091845-
+/O.CON.KLWX.SV.W.0248.000000T0000Z-260709T1845Z/
+Carroll MD-
+239 PM EDT Thu Jul 9 2026
+
+...A SEVERE THUNDERSTORM WARNING REMAINS IN EFFECT FOR CARROLL COUNTY...
+
+$$
+"""
+    parsed = ParsedProduct(product_type="SVS", wfo="KLWX", awips_id="SVSLWX", vtec=None, raw_text=raw)
+
+    asyncio.run(orch.nwws_runtime._handle_toneout(parsed))
+
+    assert orch.discord.calls
+    kind, payload = orch.discord.calls[-1]
+    assert kind == "partial_terminal"
+    assert payload["code"] == "SVR"
+    assert payload["vtec_action"] == "CAN"
+    assert payload["ended_tracks"] == ["KLWX.SV.W.0247"]
+    assert payload["continuing_tracks"] == ["KLWX.SV.W.0248"]
 
 
 def test_interrupt_push_resets_only_cycle_after_full_admission(tmp_path, monkeypatch):

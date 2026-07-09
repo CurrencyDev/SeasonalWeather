@@ -705,4 +705,6 @@ logs:
     post_voice_only: true
     cycle_rebuild_log: true
     alerttracker_lifecycle_log: false
+    ops_detail_log: false          # detailed targeting/dedupe/audio/station-feed audit embeds; noisy
+    source_health_log: true        # startup/source health embeds; low-volume
     icon_cdn_url: ""

@@ -16,6 +16,7 @@ import asyncio
 import datetime as dt
 import hashlib
 import logging
+import time
 
 import re
 from pathlib import Path
@@ -633,17 +634,54 @@ class Orchestrator:
         async def _push(path):
             await self._push_interrupt_audio(path, meta=meta, full=full)
 
-        if full:
-            return await self.alert_audio.render_and_push_full(
-                source=source,
-                render=render,
-                push=_push,
-            )
-        return await self.alert_audio.render_and_push_voice(
-            source=source,
-            render=render,
-            push=_push,
-        )
+        started = time.monotonic()
+        mode = "full" if full else "voice"
+        try:
+            if full:
+                out_path = await self.alert_audio.render_and_push_full(
+                    source=source,
+                    render=render,
+                    push=_push,
+                )
+            else:
+                out_path = await self.alert_audio.render_and_push_voice(
+                    source=source,
+                    render=render,
+                    push=_push,
+                )
+            try:
+                duration_s = wav_duration_seconds(Path(out_path))
+            except Exception:
+                duration_s = None
+            try:
+                _audio_log = getattr(self.discord, "audio_pipeline", None)
+                if _audio_log is not None:
+                    _audio_log(
+                        source=source,
+                        status="rendered+pushed",
+                        mode=mode,
+                        path=str(out_path),
+                        duration_s=duration_s,
+                        backend="tts+same" if full else "tts",
+                        cache="miss",
+                    )
+            except Exception:
+                log.debug("Discord audio pipeline audit failed", exc_info=True)
+            return out_path
+        except Exception as exc:
+            try:
+                _audio_log = getattr(self.discord, "audio_pipeline", None)
+                if _audio_log is not None:
+                    _audio_log(
+                        source=source,
+                        status="failed",
+                        mode=mode,
+                        duration_s=time.monotonic() - started,
+                        fallback=type(exc).__name__,
+                    )
+            except Exception:
+                log.debug("Discord audio pipeline failure audit failed", exc_info=True)
+            raise
 
 
     def _nwws_api_product_matches_raw(self, parsed: ParsedProduct, api_text: str) -> bool:

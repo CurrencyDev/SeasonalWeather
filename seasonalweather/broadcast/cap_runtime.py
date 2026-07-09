@@ -25,6 +25,16 @@ from .station_feed_runtime import (
 log = logging.getLogger("seasonalweather")
 
 
+def _discord_audit(discord, method: str, **kwargs) -> None:
+    """Best-effort optional Discord audit call; never affects CAP handling."""
+    try:
+        fn = getattr(discord, method, None)
+        if fn is not None:
+            fn(**kwargs)
+    except Exception:
+        log.debug("Discord audit hook failed method=%s", method, exc_info=True)
+
+
 class CapRuntime:
     """Consumes NWS CAP alerts and handles CAP full/voice/update airing."""
 
@@ -62,6 +72,16 @@ class CapRuntime:
                     log.exception("AlertTracker: failed handling CAP cancel without VTEC id=%s", getattr(ev, "alert_id", None))
                 _sf_remove_ids(cap_ref_ids + [getattr(ev, "alert_id", None)])
                 log.info("CAP cancel: evicted state without airing id=%s refs=%s", getattr(ev, "alert_id", None), ",".join(cap_ref_ids[:4]))
+                _discord_audit(
+                    o.discord,
+                    "station_feed_update",
+                    action="remove",
+                    source="CAP",
+                    event=(ev.event or "").strip(),
+                    code=cap_event_to_same_code((ev.event or "").strip()),
+                    alert_id=str(getattr(ev, "alert_id", "") or ""),
+                    details={"refs": cap_ref_ids[:4], "reason": "cap_cancel_no_vtec"},
+                )
                 continue
 
             log.info(
@@ -88,6 +108,18 @@ class CapRuntime:
                 pass
 
             if o.cfg.cap.dryrun:
+                _discord_audit(
+                    o.discord,
+                    "alert_decision",
+                    source="CAP",
+                    result="skip",
+                    reason="dryrun",
+                    event=(ev.event or "").strip(),
+                    code=cap_event_to_same_code((ev.event or "").strip()),
+                    same_targets=len(getattr(ev, "same_fips", None) or []),
+                    vtec=vtec[:2],
+                    details={"alert_id": ev.alert_id},
+                )
                 continue
 
             if cap_should_full(o.cfg, ev):
@@ -110,6 +142,17 @@ class CapRuntime:
         last = o._cap_full_last_by_key.get(key)
         if last and (now - last).total_seconds() < o.cfg.cap.full.cooldown_seconds:
             log.info("CAP full: cooldown active; skipping id=%s sent=%s event=%s", ev.alert_id, ev.sent, ev.event)
+            _discord_audit(
+                o.discord,
+                "dedupe_event",
+                source="CAP",
+                result="cooldown",
+                key=f"CAPFULL:{key[0]}:{key[1]}",
+                event=(ev.event or "").strip(),
+                code=cap_event_to_same_code((ev.event or "").strip()),
+                mode="full",
+                ttl_s=max(0.0, o.cfg.cap.full.cooldown_seconds - (now - last).total_seconds()),
+            )
             return
 
         vtec = cap_vtec_list(ev)
@@ -245,6 +288,23 @@ class CapRuntime:
             o._schedule_cycle_refill("post-cap-full")
 
             log.info("CAP ACTION: aired FULL event=%s code=%s id=%s sent=%s vtec=%s audio=%s", ev.event, same_code, ev.alert_id, ev.sent, ",".join(vtec[:2]) if vtec else "", out_wav)
+            _discord_audit(
+                o.discord,
+                "alert_decision",
+                source="CAP",
+                result="air",
+                reason="cap_full",
+                event=(ev.event or "").strip(),
+                code=same_code,
+                mode="full",
+                same_targets=len(same_locs),
+                vtec=vtec[:2],
+                details={
+                    "alert_id": ev.alert_id,
+                    "same_raw": len(same_locs_raw),
+                    "tracks": [t for (t, _a) in tracks[:4]],
+                },
+            )
             # _CAP_FULL_DL_
             o.discord.alert_aired(
                 code=same_code,
@@ -258,6 +318,16 @@ class CapRuntime:
                 ),
             )
             _station_feed_note_cap(ev, mode="FULL", same_locations=(same_locs if same_locs else same_locs_raw), out_wav=str(out_wav), same_code=same_code, vtec=vtec)
+            _discord_audit(
+                o.discord,
+                "station_feed_update",
+                action="upsert",
+                source="CAP",
+                event=(ev.event or "").strip(),
+                code=same_code,
+                alert_id=str(ev.alert_id or ""),
+                details={"mode": "FULL", "same_targets": len(same_locs if same_locs else same_locs_raw)},
+            )
 
             # ---- Register to AlertTracker for active cycle rotation ----
             try:
@@ -311,6 +381,17 @@ class CapRuntime:
         last = o._cap_voice_last_by_key.get(key)
         if last and (now - last).total_seconds() < o.cfg.cap.voice.cooldown_seconds:
             log.info("CAP voice: cooldown active; skipping id=%s sent=%s event=%s", ev.alert_id, ev.sent, ev.event)
+            _discord_audit(
+                o.discord,
+                "dedupe_event",
+                source="CAP",
+                result="cooldown",
+                key=f"CAPVOICE:{key[0]}:{key[1]}",
+                event=(ev.event or "").strip(),
+                code=cap_event_to_same_code((ev.event or "").strip()),
+                mode="voice",
+                ttl_s=max(0.0, o.cfg.cap.voice.cooldown_seconds - (now - last).total_seconds()),
+            )
             return
 
         script = o.cap_text._build_cap_voice_script(ev)
@@ -340,6 +421,16 @@ class CapRuntime:
                 ev.sent,
                 ev.event,
                 ",".join(vtec[:2]) if vtec else "",
+            )
+            _discord_audit(
+                o.discord,
+                "dedupe_event",
+                source="CAP",
+                result="hit",
+                key=hit,
+                event=(ev.event or "").strip(),
+                code=same_code,
+                mode="voice",
             )
             return
 
@@ -373,6 +464,19 @@ class CapRuntime:
             o._schedule_cycle_refill("post-cap-voice")
 
             log.info("CAP ACTION: aired voice-only event=%s id=%s sent=%s audio=%s", ev.event, ev.alert_id, ev.sent, out_wav)
+            _discord_audit(
+                o.discord,
+                "alert_decision",
+                source="CAP",
+                result="air",
+                reason="cap_voice",
+                event=(ev.event or "").strip(),
+                code=same_code,
+                mode="voice",
+                same_targets=len(same_locs),
+                vtec=vtec[:2],
+                details={"alert_id": ev.alert_id, "same_raw": len(same_locs_raw)},
+            )
             # _CAP_VOICE_DL_
             o.discord.alert_aired(
                 code=same_code,
@@ -418,6 +522,16 @@ class CapRuntime:
                 out_wav=str(out_wav),
                 same_code=same_code,
                 vtec=vtec,
+            )
+            _discord_audit(
+                o.discord,
+                "station_feed_update",
+                action="upsert",
+                source="CAP",
+                event=(ev.event or "").strip(),
+                code=same_code,
+                alert_id=str(ev.alert_id or ""),
+                details={"mode": "VOICE", "same_targets": len(same_locs if same_locs else same_locs_raw)},
             )
         except Exception:
             await o._dedupe_release(keys)
@@ -467,6 +581,18 @@ class CapRuntime:
 
         if not script.strip():
             log.info("CAP update: empty script, skipping event=%s vtec_actions=%s", ev_event, vtec_actions)
+            _discord_audit(
+                o.discord,
+                "alert_decision",
+                source="CAP",
+                result="skip",
+                reason="empty_update_script",
+                event=ev_event,
+                code=cap_event_to_same_code(ev_event),
+                mode="voice",
+                vtec=vtec[:2],
+                details={"actions": sorted(vtec_actions), "alert_id": ev.alert_id},
+            )
             return
 
         same_code = cap_event_to_same_code(ev_event)
@@ -481,6 +607,16 @@ class CapRuntime:
         ok, hit = await o._dedupe_reserve(keys)
         if not ok:
             log.info("CAP update skipped (dedupe hit=%s) event=%s vtec_actions=%s", hit, ev_event, vtec_actions)
+            _discord_audit(
+                o.discord,
+                "dedupe_event",
+                source="CAP",
+                result="hit",
+                key=hit,
+                event=ev_event,
+                code=same_code,
+                mode="voice",
+            )
             return
 
         try:
@@ -545,6 +681,19 @@ class CapRuntime:
 
             log.info("CAP ACTION: aired UPDATE event=%s code=%s id=%s vtec_actions=%s audio=%s",
                      ev_event, same_code, ev.alert_id, vtec_actions, out_wav)
+            _discord_audit(
+                o.discord,
+                "alert_decision",
+                source="CAP",
+                result="air",
+                reason="cap_update",
+                event=ev_event,
+                code=same_code,
+                mode="voice",
+                same_targets=len(same_locs),
+                vtec=vtec[:2],
+                details={"actions": sorted(vtec_actions), "alert_id": ev.alert_id},
+            )
             # _CAP_UPDATE_DL_
             if vtec_actions & {"CAN", "EXP"}:
                 o.discord.alert_expired(
@@ -566,6 +715,16 @@ class CapRuntime:
                 )
             _station_feed_note_cap(ev, mode="VOICE", same_locations=(same_locs if same_locs else same_locs_raw),
                                    out_wav=str(out_wav), same_code=same_code, vtec=vtec)
+            _discord_audit(
+                o.discord,
+                "station_feed_update",
+                action="upsert",
+                source="CAP",
+                event=ev_event,
+                code=same_code,
+                alert_id=str(ev.alert_id or ""),
+                details={"mode": "VOICE", "actions": sorted(vtec_actions)},
+            )
         except Exception:
             await o._dedupe_release(keys)
             raise

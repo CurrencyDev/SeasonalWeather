@@ -6,7 +6,7 @@ import logging
 from ..alerts.active import ActiveAlert, _vtec_track_id
 from ..alerts.builder import build_spoken_alert
 from ..alerts.product import ParsedProduct, parse_product_text
-from ..alerts.vtec import toneout_policy as _vtec_toneout_policy
+from ..alerts.vtec import same_codes_for_vtec, toneout_policy as _vtec_toneout_policy
 from .audio_origination import safe_event_code as _safe_event_code
 from .cap_policy import best_expiry_from_vtec, vtec_matches_configured_toneout_code
 from .pns import parse_nws_header_issued_dt, pns_text_same_issuance
@@ -21,6 +21,36 @@ from .station_feed_runtime import (
 )
 
 log = logging.getLogger("seasonalweather")
+
+
+def _first_vtec_action(actions: set[str], priority: tuple[str, ...]) -> str:
+    """Return a deterministic VTEC action from a set using caller priority."""
+    for action in priority:
+        if action in actions:
+            return action
+    return ""
+
+
+def _nwws_discord_event_code(product_type: str, same_code: str | None, vtec: list[str]) -> str:
+    """Return the event code Discord should present for NWWS carrier products."""
+    policy_code = (same_code or "").strip().upper()
+    if policy_code:
+        return policy_code
+    for code in same_codes_for_vtec(vtec):
+        code_u = (code or "").strip().upper()
+        if code_u:
+            return code_u
+    return _safe_event_code(product_type)
+
+
+def _discord_audit(discord, method: str, **kwargs) -> None:
+    """Best-effort optional Discord audit call; never affects alert handling."""
+    try:
+        fn = getattr(discord, method, None)
+        if fn is not None:
+            fn(**kwargs)
+    except Exception:
+        log.debug("Discord audit hook failed method=%s", method, exc_info=True)
 
 
 class NwwsRuntime:
@@ -255,6 +285,20 @@ class NwwsRuntime:
                 parsed.wfo,
                 preview,
             )
+            _discord_audit(
+                self.discord,
+                "alert_decision",
+                source="NWWS-OI",
+                result="skip",
+                reason="out_of_area",
+                product_type=parsed.product_type,
+                awips=parsed.awips_id or "",
+                wfo=parsed.wfo,
+                same_targets=len(in_area_same or []),
+                zones=len(zones or []),
+                vtec=vtec_preview[:2],
+                details={"target_source": src, "mapped_ok": mapped_ok},
+            )
             return
 
         vtec = vtec_preview
@@ -267,6 +311,11 @@ class NwwsRuntime:
         _nw_policy = _vtec_toneout_policy(vtec)
         vtec_actions = {act for (_t, act) in tracks} if tracks else set()
         should_full = (_nw_policy.mode == "FULL")
+        discord_event_code = _nwws_discord_event_code(
+            parsed.product_type,
+            _nw_policy.same_code,
+            vtec,
+        )
         log.debug("NWWS vtec policy: %s", _nw_policy.reason)
 
 
@@ -281,6 +330,22 @@ class NwwsRuntime:
                 ",".join(zones[:12]) + ("..." if len(zones) > 12 else ""),
             )
             should_full = False
+            _discord_audit(
+                self.discord,
+                "alert_decision",
+                source="NWWS-OI",
+                result="downgrade",
+                reason="zone_map_failed",
+                code=discord_event_code,
+                product_type=parsed.product_type,
+                awips=parsed.awips_id or "",
+                wfo=parsed.wfo,
+                mode="voice",
+                same_targets=len(in_area_same or []),
+                zones=len(zones or []),
+                vtec=vtec[:2],
+                details={"target_source": src, "mapped_ok": mapped_ok},
+            )
 
         # WCN watch county notifications can legitimately have clean watch text
         # and VTEC, but no UGC block in the NWWS carrier.  When that happens we
@@ -300,6 +365,22 @@ class NwwsRuntime:
                 ",".join(vtec[:2]) if vtec else "",
             )
             should_full = False
+            _discord_audit(
+                self.discord,
+                "alert_decision",
+                source="NWWS-OI",
+                result="downgrade",
+                reason="watch_no_same_targets",
+                code=discord_event_code,
+                product_type=parsed.product_type,
+                awips=parsed.awips_id or "",
+                wfo=parsed.wfo,
+                mode="voice",
+                same_targets=0,
+                zones=len(zones or []),
+                vtec=vtec[:2],
+                details={"target_source": src, "policy": _nw_policy.reason},
+            )
 
         keys: list[str] = []
 
@@ -334,6 +415,31 @@ class NwwsRuntime:
                 parsed.awips_id or "",
                 parsed.wfo,
                 ",".join(vtec[:2]) if vtec else "",
+            )
+            _discord_audit(
+                self.discord,
+                "dedupe_event",
+                source="NWWS-OI",
+                result="hit",
+                key=hit,
+                code=discord_event_code,
+                mode="full" if should_full else "voice",
+            )
+            _discord_audit(
+                self.discord,
+                "alert_decision",
+                source="NWWS-OI",
+                result="skip",
+                reason="dedupe",
+                code=discord_event_code,
+                product_type=parsed.product_type,
+                awips=parsed.awips_id or "",
+                wfo=parsed.wfo,
+                mode="full" if should_full else "voice",
+                same_targets=len(in_area_same or []),
+                zones=len(zones or []),
+                vtec=vtec[:2],
+                details={"hit": hit},
             )
             return
 
@@ -468,47 +574,133 @@ class NwwsRuntime:
 
             self._nwws_acted += 1
             log.info(
-                "NWWS ACTION: aired %s #%d/%d type=%s awips=%s wfo=%s vtec=%s tracks=%s audio=%s",
+                "NWWS ACTION: aired %s #%d/%d type=%s code=%s awips=%s wfo=%s reason=%s same_targets=%d zones=%d vtec=%s tracks=%s audio=%s",
                 "FULL" if should_full else "VOICE",
                 self._nwws_acted,
                 self._nwws_seen,
                 parsed.product_type,
+                discord_event_code,
                 parsed.awips_id or "",
                 parsed.wfo,
+                _nw_policy.reason,
+                len(in_area_same or []),
+                len(zones or []),
                 ",".join(vtec[:2]) if vtec else "",
                 ",".join(t for (t, _a) in tracks[:2]) if tracks else "",
                 out_wav,
             )
+            _discord_audit(
+                self.discord,
+                "alert_decision",
+                source="NWWS-OI",
+                result="air",
+                reason=_nw_policy.reason,
+                event=sf_event_label,
+                code=discord_event_code,
+                product_type=parsed.product_type,
+                mode="full" if should_full else "voice",
+                awips=parsed.awips_id or "",
+                wfo=parsed.wfo,
+                same_targets=len(in_area_same or []),
+                zones=len(zones or []),
+                vtec=vtec[:2],
+                details={
+                    "tracks": [t for (t, _a) in tracks[:4]],
+                    "target_source": src,
+                    "mapped_ok": mapped_ok,
+                },
+            )
             # _NWWS_DL_
             _dl_vtec_acts = vtec_actions
             _dl_mode = "full" if should_full else "voice"
-            if _dl_vtec_acts & {"CAN", "EXP"}:
+            _dl_terminal_action = _first_vtec_action(_dl_vtec_acts, ("CAN", "EXP"))
+            _dl_update_action = _first_vtec_action(
+                _dl_vtec_acts,
+                ("CON", "EXT", "EXA", "EXB", "COR", "ROU", "NEW", "UPG"),
+            )
+            _dl_cancel_tracks = sorted(_nw_policy.cancel_tracks)
+            _dl_continuation_tracks = sorted(_nw_policy.continuation_tracks)
+            _dl_nonterminal_actions = _dl_vtec_acts - {"CAN", "EXP"}
+
+            if _dl_terminal_action and (_dl_continuation_tracks or _dl_nonterminal_actions):
+                _partial_logger = getattr(self.discord, "alert_partial_terminal", None)
+                if _partial_logger is not None:
+                    _partial_logger(
+                        code=discord_event_code,
+                        event=sf_event_label,
+                        vtec_action=_dl_terminal_action,
+                        source="NWWS-OI",
+                        area=sf_area_text,
+                        vtec=vtec[:2],
+                        ended_tracks=_dl_cancel_tracks,
+                        continuing_tracks=_dl_continuation_tracks or [
+                            t for (t, action) in tracks if action in _dl_nonterminal_actions
+                        ],
+                        mode=_dl_mode,
+                    )
+                else:
+                    self.discord.alert_updated(
+                        code=discord_event_code,
+                        event=sf_event_label,
+                        vtec_action=_dl_terminal_action,
+                        source="NWWS-OI",
+                        area=sf_area_text,
+                        vtec=vtec[:2],
+                    )
+                log.info(
+                    "NWWS Discord: state=partial_terminal action=%s type=%s code=%s ended_tracks=%d continuing_tracks=%d active_actions=%s",
+                    _dl_terminal_action,
+                    parsed.product_type,
+                    discord_event_code,
+                    len(_dl_cancel_tracks),
+                    len(_dl_continuation_tracks),
+                    ",".join(sorted(_dl_nonterminal_actions)),
+                )
+            elif _dl_terminal_action:
                 self.discord.alert_expired(
-                    code=parsed.product_type,
+                    code=discord_event_code,
                     event=sf_event_label,
-                    vtec_action=next(iter(_dl_vtec_acts & {"CAN", "EXP"})),
+                    vtec_action=_dl_terminal_action,
                     source="NWWS-OI",
                     area=sf_area_text,
                     vtec=vtec[:2],
                 )
-            elif not should_full and _dl_vtec_acts & {"CON", "EXT", "EXA", "EXB"}:
+                log.info(
+                    "NWWS Discord: state=terminal action=%s type=%s code=%s",
+                    _dl_terminal_action,
+                    parsed.product_type,
+                    discord_event_code,
+                )
+            elif not should_full and _dl_update_action:
                 self.discord.alert_updated(
-                    code=parsed.product_type,
+                    code=discord_event_code,
                     event=sf_event_label,
-                    vtec_action=next(iter(_dl_vtec_acts & {"CON", "EXT", "EXA", "EXB"})),
+                    vtec_action=_dl_update_action,
                     source="NWWS-OI",
                     area=sf_area_text,
                     vtec=vtec[:2],
+                )
+                log.info(
+                    "NWWS Discord: state=continuing action=%s type=%s code=%s",
+                    _dl_update_action,
+                    parsed.product_type,
+                    discord_event_code,
                 )
             else:
                 self.discord.alert_aired(
-                    code=parsed.product_type,
+                    code=discord_event_code,
                     event=sf_event_label,
                     source="NWWS-OI",
                     mode=_dl_mode,
                     area=sf_area_text,
                     vtec=vtec[:2],
                     is_test=(parsed.product_type in {"RWT", "RMT"}),
+                )
+                log.info(
+                    "NWWS Discord: state=aired mode=%s type=%s code=%s",
+                    _dl_mode,
+                    parsed.product_type,
+                    discord_event_code,
                 )
             _sf_mode = getattr(spoken, "mode", ("FULL" if should_full else "VOICE"))
             _station_feed_note_nwws(
@@ -524,6 +716,16 @@ class NwwsRuntime:
                 event_text=sf_event_label,
                 headline=sf_headline,
                 area_text=sf_area_text,
+            )
+            _discord_audit(
+                self.discord,
+                "station_feed_update",
+                action="upsert",
+                source="NWWS-OI",
+                event=sf_event_label,
+                code=discord_event_code,
+                alert_id=(tracks[0][0] if tracks else (parsed.awips_id or "")),
+                details={"mode": _sf_mode, "same_targets": len(in_area_same or [])},
             )
 
             self._schedule_cycle_refill("post-alert")

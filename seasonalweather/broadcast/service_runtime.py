@@ -64,6 +64,42 @@ class SeasonalWeatherServiceRuntime:
             tests_enabled=o.cfg.tests.enabled,
             mode=o.mode,
         )
+        # Startup source-state embeds are low-volume and help distinguish
+        # intentionally disabled sources from unhealthy ones in Discord ops.
+        try:
+            _source_health = getattr(o.discord, "source_health", None)
+            if _source_health is not None:
+                _source_health(
+                    source="NWWS-OI",
+                    status="disabled" if (o.cfg.nwws.credentials_defaulted or not o.cfg.nwws.enabled) else "enabled",
+                    severity="warning" if (o.cfg.nwws.credentials_defaulted or not o.cfg.nwws.enabled) else "ok",
+                    details={
+                        "allowed_wfos": ",".join(o.cfg.nwws.allowed_wfos) or "all",
+                        "toneout_products": len(o.cfg.policy.toneout_product_types),
+                    },
+                )
+                _source_health(
+                    source="CAP API",
+                    status="enabled" if o.cfg.cap.enabled else "disabled",
+                    severity="ok" if o.cfg.cap.enabled else "warning",
+                    details={
+                        "dryrun": o.cfg.cap.dryrun,
+                        "full": o.cfg.cap.full.enabled,
+                        "voice": o.cfg.cap.voice.enabled,
+                    },
+                )
+                _source_health(
+                    source="IPAWS",
+                    status="enabled" if o.cfg.ipaws.enabled else "disabled",
+                    severity="ok" if o.cfg.ipaws.enabled else "warning",
+                )
+                _source_health(
+                    source="ERN",
+                    status="enabled" if o.cfg.ern.enabled else "disabled",
+                    severity="ok" if o.cfg.ern.enabled else "warning",
+                )
+        except Exception:
+            log.debug("Discord source health startup summary failed", exc_info=True)
 
         # --- Persistent alert state: restore from disk, drop expired ---
         _loaded = 0

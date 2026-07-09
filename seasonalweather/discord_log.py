@@ -116,6 +116,9 @@ _API_SUCCESS_COLOR   = "639922"
 _API_FAIL_COLOR      = "E24B4A"
 _WARN_COLOR          = "BA7517"
 _ERROR_COLOR         = "E24B4A"
+_TERMINAL_COLOR      = "888888"
+_DETAIL_COLOR        = "5D6FA3"
+_HEALTH_OK_COLOR     = "639922"
 
 # ---------------------------------------------------------------------------
 # EAS event code → Lucide icon name
@@ -207,6 +210,9 @@ _ICON_MAP: dict[str, str] = {
     "_error":   "circle-alert",
     "_startup": "power",
     "_stall":   "wifi-off",
+    "_decision": "list-checks",
+    "_audio":   "audio-lines",
+    "_feed":    "rss",
     "_default": "bell-ring",
 }
 
@@ -262,6 +268,27 @@ def _same_codes_display(same_codes: list[str] | None) -> str:
     if extra > 0:
         shown += f" · +{extra} more"
     return shown
+
+
+def _items_display(items: list[str] | tuple[str, ...] | set[str] | None, *, limit: int = 8) -> str:
+    vals = [str(v).strip() for v in (items or []) if str(v).strip()]
+    if not vals:
+        return "—"
+    shown = " · ".join(f"`{v}`" for v in vals[:limit])
+    extra = len(vals) - limit
+    if extra > 0:
+        shown += f" · +{extra} more"
+    return shown
+
+
+def _detail_value(value: Any) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, (list, tuple, set)):
+        return _items_display([str(v) for v in value])
+    return str(value).strip() or "—"
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +353,8 @@ class DiscordLogger:
         post_voice_only: bool = True,
         cycle_rebuild_log: bool = True,
         alerttracker_lifecycle_log: bool = False,
+        ops_detail_log: bool = False,
+        source_health_log: bool = True,
         icon_cdn_url: str = "",
     ) -> None:
         self._alerts_url     = alerts_url.strip()
@@ -342,6 +371,8 @@ class DiscordLogger:
         self._post_voice     = post_voice_only
         self._cycle_log      = cycle_rebuild_log
         self._tracker_log    = alerttracker_lifecycle_log
+        self._ops_detail_log = ops_detail_log
+        self._source_health_log = source_health_log
         self._icon_cdn       = icon_cdn_url.strip()
 
         self._queue: asyncio.Queue[tuple[str, dict]] = asyncio.Queue()
@@ -367,6 +398,8 @@ class DiscordLogger:
             post_voice_only=cfg.post_voice_only,
             cycle_rebuild_log=cfg.cycle_rebuild_log,
             alerttracker_lifecycle_log=cfg.alerttracker_lifecycle_log,
+            ops_detail_log=getattr(cfg, "ops_detail_log", False),
+            source_health_log=getattr(cfg, "source_health_log", True),
             icon_cdn_url=cfg.icon_cdn_url,
         )
 
@@ -491,6 +524,19 @@ class DiscordLogger:
     def _payload(embeds: list[dict]) -> dict:
         return {"username": "SeasonalWeather", "embeds": embeds[:10]}
 
+    def _detail_fields(
+        self,
+        details: dict | None,
+        *,
+        limit: int = 8,
+        inline: bool = True,
+    ) -> list[dict]:
+        fields: list[dict] = []
+        for key, value in list((details or {}).items())[:limit]:
+            name = str(key).replace("_", " ").strip().title() or "Detail"
+            fields.append(self._field(name, _detail_value(value), inline=inline))
+        return fields
+
     # ------------------------------------------------------------------
     # ── ALERTS CHANNEL ────────────────────────────────────────────────
     # ------------------------------------------------------------------
@@ -530,10 +576,8 @@ class DiscordLogger:
 
         if is_test:
             icon = _icon_name(code_u, sentinel="_test")
-        elif is_voice:
-            # voice-only: use event-specific icon but prefer the "quiet" variant
-            icon = _icon_name(code_u, sentinel="_voice")
         else:
+            # Voice-only alert presentations still use the underlying hazard icon.
             icon = _icon_name(code_u)
 
         thumb = self._icon_url(icon, hex_c)
@@ -600,7 +644,7 @@ class DiscordLogger:
         code_u = (code or "SPS").strip().upper()
         hex_c  = _alert_color_hex(code_u)
         color  = _color_int(hex_c)
-        thumb  = self._icon_url(_icon_name(code_u, sentinel="_voice"), hex_c)
+        thumb  = self._icon_url(_icon_name(code_u), hex_c)
 
         action_labels = {
             "CON": "continuing", "EXT": "extended",
@@ -636,13 +680,13 @@ class DiscordLogger:
         area: str = "",
         vtec: list[str] | None = None,
     ) -> None:
-        """CAN/EXP — sidebar gray, icon bell-off."""
+        """CAN/EXP where all in-scope tracks are terminal: gray, event icon."""
         if not self._alerts_enabled:
             return
 
         code_u = (code or "SPS").strip().upper()
-        color  = _color_int("888888")
-        thumb  = self._icon_url(_ICON_MAP["_expired"], "888888")
+        color  = _color_int(_TERMINAL_COLOR)
+        thumb  = self._icon_url(_icon_name(code_u), _TERMINAL_COLOR)
 
         action_labels = {"CAN": "cancelled", "EXP": "expired"}
         action_word = action_labels.get(vtec_action.upper(), vtec_action.lower())
@@ -661,6 +705,69 @@ class DiscordLogger:
         embed = self._embed(
             color=color, title=title, fields=fields,
             footer_text=f"SeasonalWeather · {source.lower()} · alerts",
+            thumbnail_url=thumb,
+        )
+        self._enqueue(self._alerts_url, self._payload([embed]))
+
+    def alert_partial_terminal(
+        self,
+        *,
+        code: str,
+        event: str,
+        vtec_action: str,
+        source: str = "CAP",
+        area: str = "",
+        vtec: list[str] | None = None,
+        ended_tracks: list[str] | None = None,
+        continuing_tracks: list[str] | None = None,
+        mode: str = "voice",
+    ) -> None:
+        """CAN/EXP mixed with non-terminal tracks: event color/icon, partial title."""
+        if not self._alerts_enabled or not self._post_voice:
+            return
+
+        code_u = (code or "SPS").strip().upper()
+        hex_c  = _alert_color_hex(code_u)
+        color  = _color_int(hex_c)
+        thumb  = self._icon_url(_icon_name(code_u), hex_c)
+
+        action_labels = {"CAN": "partially cancelled", "EXP": "partially expired"}
+        action_word = action_labels.get(vtec_action.upper(), f"partial {vtec_action.lower()}")
+        title = f"{(event or code_u).strip()} — {action_word}"
+
+        ended = [str(t).strip() for t in (ended_tracks or []) if str(t).strip()]
+        continuing = [str(t).strip() for t in (continuing_tracks or []) if str(t).strip()]
+
+        mode_l = (mode or "").strip().lower()
+        mode_display = (
+            "FULL + SAME mixed lifecycle"
+            if mode_l == "full"
+            else "Voice-only partial lifecycle (no retone)"
+        )
+
+        fields: list[dict] = [
+            self._field("VTEC action", vtec_action.upper(), inline=True),
+            self._field("Source", source, inline=True),
+            self._field("Mode", mode_display, inline=True),
+        ]
+        if area:
+            fields.append(self._field("Area", _area_display(area), inline=False))
+        if ended:
+            shown = " · ".join(f"`{t}`" for t in ended[:6])
+            if len(ended) > 6:
+                shown += f" · +{len(ended) - 6} more"
+            fields.append(self._field("Ended tracks", shown, inline=False))
+        if continuing:
+            shown = " · ".join(f"`{t}`" for t in continuing[:6])
+            if len(continuing) > 6:
+                shown += f" · +{len(continuing) - 6} more"
+            fields.append(self._field("Continuing tracks", shown, inline=False))
+        for v in (vtec or [])[:2]:
+            fields.append(self._field("VTEC", f"`{v}`", inline=False))
+
+        embed = self._embed(
+            color=color, title=title, fields=fields,
+            footer_text=f"SeasonalWeather · {source.lower()} partial lifecycle · alerts",
             thumbnail_url=thumb,
         )
         self._enqueue(self._alerts_url, self._payload([embed]))
@@ -705,6 +812,11 @@ class DiscordLogger:
         seq_dur: float = 0.0,
         segments: int = 0,
         active_alerts: int = 0,
+        old_mode: str = "",
+        new_mode: str = "",
+        added: list[str] | None = None,
+        removed: list[str] | None = None,
+        order_preview: list[str] | None = None,
     ) -> None:
         if not self._ops_enabled or not self._cycle_log:
             return
@@ -719,12 +831,262 @@ class DiscordLogger:
         ]
         if active_alerts:
             fields.append(self._field("Active alerts", str(active_alerts), inline=True))
+        if old_mode or new_mode:
+            fields.append(self._field("Mode change", f"{old_mode or '—'} → {new_mode or mode}", inline=True))
+        if added:
+            fields.append(self._field("Added", _items_display(added, limit=8), inline=False))
+        if removed:
+            fields.append(self._field("Removed", _items_display(removed, limit=8), inline=False))
+        if order_preview:
+            fields.append(self._field("Order preview", _items_display(order_preview, limit=10), inline=False))
         embed = self._embed(
             color=_color_int(_OPS_COLOR),
             title="Cycle rebuilt",
             fields=fields,
             footer_text="SeasonalWeather · cycle · ops",
             thumbnail_url=thumb,
+        )
+        self._enqueue(self._ops_url, self._payload([embed]))
+
+    def source_health(
+        self,
+        *,
+        source: str,
+        status: str,
+        message: str = "",
+        severity: str = "info",
+        details: dict | None = None,
+    ) -> None:
+        """Post a source health transition or startup source-state summary."""
+        if not self._ops_enabled or not self._source_health_log:
+            return
+
+        sev = (severity or "info").strip().lower()
+        status_l = (status or "status").strip().lower()
+        if sev in {"ok", "success", "recovered"} or status_l in {"ok", "online", "enabled", "connected", "recovered"}:
+            hex_c = _HEALTH_OK_COLOR
+            icon = _ICON_MAP["_ops"]
+        elif sev in {"warning", "warn", "degraded"} or status_l in {"disabled", "degraded", "stalled", "reconnecting"}:
+            hex_c = _WARN_COLOR
+            icon = _ICON_MAP["_stall"] if status_l in {"stalled", "reconnecting"} else _ICON_MAP["_ops"]
+        elif sev in {"error", "failed", "fail"} or status_l in {"failed", "error"}:
+            hex_c = _ERROR_COLOR
+            icon = _ICON_MAP["_error"]
+        else:
+            hex_c = _OPS_COLOR
+            icon = _ICON_MAP["_ops"]
+
+        fields = [self._field("Status", status or "—", inline=True)]
+        fields.extend(self._detail_fields(details, limit=6, inline=True))
+        embed = self._embed(
+            color=_color_int(hex_c),
+            title=f"{(source or 'Source').strip()} — {status or 'status'}",
+            description=message[:300] if message else "",
+            fields=fields,
+            footer_text="SeasonalWeather · source health · ops",
+            thumbnail_url=self._icon_url(icon, hex_c),
+        )
+        self._enqueue(self._ops_url, self._payload([embed]))
+
+    def alert_decision(
+        self,
+        *,
+        source: str,
+        result: str,
+        reason: str = "",
+        event: str = "",
+        code: str = "",
+        product_type: str = "",
+        mode: str = "",
+        awips: str = "",
+        wfo: str = "",
+        same_targets: int | None = None,
+        zones: int | None = None,
+        vtec: list[str] | None = None,
+        details: dict | None = None,
+    ) -> None:
+        """Structured alert routing/targeting decision for the ops channel."""
+        if not self._ops_enabled or not self._ops_detail_log:
+            return
+
+        result_l = (result or "decision").strip().lower()
+        if result_l in {"air", "aired", "admit", "accepted"}:
+            hex_c = _HEALTH_OK_COLOR
+        elif result_l in {"skip", "suppress", "dedupe", "drop", "reject"}:
+            hex_c = _WARN_COLOR
+        elif result_l in {"fail", "failed", "error"}:
+            hex_c = _ERROR_COLOR
+        else:
+            hex_c = _DETAIL_COLOR
+
+        title_bits = [(source or "Alert").strip(), "decision"]
+        if result:
+            title_bits.append(f"— {result}")
+        fields: list[dict] = [self._field("Result", result or "—", inline=True)]
+        if reason:
+            fields.append(self._field("Reason", reason, inline=True))
+        if mode:
+            fields.append(self._field("Mode", mode.upper(), inline=True))
+        if event:
+            fields.append(self._field("Event", event, inline=False))
+        if code:
+            fields.append(self._field("Code", f"`{code}`", inline=True))
+        if product_type and product_type != code:
+            fields.append(self._field("Product", f"`{product_type}`", inline=True))
+        if awips:
+            fields.append(self._field("AWIPS", f"`{awips}`", inline=True))
+        if wfo:
+            fields.append(self._field("WFO", f"`{wfo}`", inline=True))
+        if same_targets is not None:
+            fields.append(self._field("SAME targets", str(same_targets), inline=True))
+        if zones is not None:
+            fields.append(self._field("UGC zones", str(zones), inline=True))
+        for vv in (vtec or [])[:2]:
+            fields.append(self._field("VTEC", f"`{vv}`", inline=False))
+        fields.extend(self._detail_fields(details, limit=max(0, 25 - len(fields)), inline=True))
+
+        embed = self._embed(
+            color=_color_int(hex_c),
+            title=" ".join(title_bits),
+            fields=fields,
+            footer_text="SeasonalWeather · alert decision · ops",
+            thumbnail_url=self._icon_url(_ICON_MAP["_decision"], hex_c),
+        )
+        self._enqueue(self._ops_url, self._payload([embed]))
+
+    def dedupe_event(
+        self,
+        *,
+        source: str,
+        result: str,
+        key: str,
+        event: str = "",
+        code: str = "",
+        mode: str = "",
+        ttl_s: float | None = None,
+    ) -> None:
+        """Post a dedupe reservation/suppression event when detailed ops logging is enabled."""
+        if not self._ops_enabled or not self._ops_detail_log:
+            return
+        result_l = (result or "").strip().lower()
+        hex_c = _WARN_COLOR if result_l in {"hit", "skip", "suppressed"} else _DETAIL_COLOR
+        fields = [
+            self._field("Result", result or "—", inline=True),
+            self._field("Key", f"`{key[:180]}`", inline=False),
+        ]
+        if event:
+            fields.append(self._field("Event", event, inline=False))
+        if code:
+            fields.append(self._field("Code", f"`{code}`", inline=True))
+        if mode:
+            fields.append(self._field("Mode", mode.upper(), inline=True))
+        if ttl_s is not None:
+            fields.append(self._field("TTL", f"{ttl_s:.0f}s", inline=True))
+        embed = self._embed(
+            color=_color_int(hex_c),
+            title=f"{(source or 'Alert').strip()} dedupe — {result or 'event'}",
+            fields=fields,
+            footer_text="SeasonalWeather · dedupe · ops",
+            thumbnail_url=self._icon_url(_ICON_MAP["_decision"], hex_c),
+        )
+        self._enqueue(self._ops_url, self._payload([embed]))
+
+    def audio_pipeline(
+        self,
+        *,
+        source: str,
+        status: str,
+        event: str = "",
+        code: str = "",
+        mode: str = "",
+        path: str = "",
+        duration_s: float | None = None,
+        backend: str = "",
+        cache: str = "",
+        same_locs: int | None = None,
+        fallback: str = "",
+    ) -> None:
+        """Post alert audio render/push pipeline results."""
+        status_l = (status or "").strip().lower()
+        failed = status_l in {"failed", "error"}
+        if failed:
+            if not self._errors_enabled:
+                return
+            url = self._errors_url
+            hex_c = _ERROR_COLOR
+            footer = "SeasonalWeather · audio pipeline · errors"
+        else:
+            if not self._ops_enabled or not self._ops_detail_log:
+                return
+            url = self._ops_url
+            hex_c = _DETAIL_COLOR
+            footer = "SeasonalWeather · audio pipeline · ops"
+
+        fields: list[dict] = [
+            self._field("Source", source or "—", inline=True),
+            self._field("Status", status or "—", inline=True),
+        ]
+        if mode:
+            fields.append(self._field("Mode", mode.upper(), inline=True))
+        if event:
+            fields.append(self._field("Event", event, inline=False))
+        if code:
+            fields.append(self._field("Code", f"`{code}`", inline=True))
+        if duration_s is not None:
+            fields.append(self._field("Duration", f"{duration_s:.1f}s", inline=True))
+        if same_locs is not None:
+            fields.append(self._field("SAME locs", str(same_locs), inline=True))
+        if backend:
+            fields.append(self._field("Backend", backend, inline=True))
+        if cache:
+            fields.append(self._field("Cache", cache, inline=True))
+        if fallback:
+            fields.append(self._field("Fallback", fallback, inline=False))
+        if path:
+            fields.append(self._field("Output", f"`{path[-180:]}`", inline=False))
+
+        embed = self._embed(
+            color=_color_int(hex_c),
+            title=f"Audio pipeline — {status or 'event'}",
+            fields=fields,
+            footer_text=footer,
+            thumbnail_url=self._icon_url(_ICON_MAP["_audio"], hex_c),
+        )
+        self._enqueue(url, self._payload([embed]))
+
+    def station_feed_update(
+        self,
+        *,
+        action: str,
+        source: str,
+        event: str = "",
+        code: str = "",
+        alert_id: str = "",
+        active_count: int | None = None,
+        details: dict | None = None,
+    ) -> None:
+        """Post handled-alerts feed update summaries when detailed ops logging is enabled."""
+        if not self._ops_enabled or not self._ops_detail_log:
+            return
+        fields: list[dict] = [
+            self._field("Action", action or "—", inline=True),
+            self._field("Source", source or "—", inline=True),
+        ]
+        if code:
+            fields.append(self._field("Code", f"`{code}`", inline=True))
+        if event:
+            fields.append(self._field("Event", event, inline=False))
+        if alert_id:
+            fields.append(self._field("Alert ID", f"`{alert_id[:180]}`", inline=False))
+        if active_count is not None:
+            fields.append(self._field("Active count", str(active_count), inline=True))
+        fields.extend(self._detail_fields(details, limit=max(0, 25 - len(fields)), inline=True))
+        embed = self._embed(
+            color=_color_int(_DETAIL_COLOR),
+            title=f"Station feed — {action or 'update'}",
+            fields=fields,
+            footer_text="SeasonalWeather · station feed · ops",
+            thumbnail_url=self._icon_url(_ICON_MAP["_feed"], _DETAIL_COLOR),
         )
         self._enqueue(self._ops_url, self._payload([embed]))
 
