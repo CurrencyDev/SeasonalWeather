@@ -7,7 +7,7 @@ Each segment now has its own cadence:
   Segment    Interval   Trigger
   ─────────  ─────────  ──────────────────────────────────────────────────────
   id         60 s       Mode change (normal → heightened) also triggers early.
-  status     3 min      Reflects active watches/warnings; kept fresh.
+  status     3 min      Reflects the local active-alert tracker; kept fresh.
   hwo        60 min     HWO arrives via NWWS → call trigger_immediate("hwo").
   spc        30 min     SPC day1 data; convective products trigger early.
   zfp        60 min     RWS/AFD products trigger early.
@@ -258,7 +258,7 @@ class SegmentRefresher:
             elif key == "health":
                 await self._refresh_via_build("health")
             elif key == "status":
-                await self._refresh_via_build("status")
+                await self._refresh_status()
             elif key == "hwo":
                 await self._refresh_via_build("hwo")
             elif key == "spc":
@@ -313,6 +313,24 @@ class SegmentRefresher:
             text=text,
             title=_SEGMENT_TITLES["id"],
             interval=self._intervals["id"],
+        )
+
+    async def _refresh_status(self) -> None:
+        """Rebuild station status without making an upstream NWS API request."""
+        ctx = self._ctx_fn()
+        if getattr(ctx, "health_detached_loop_only", False):
+            await self._store.mark_placeholder(
+                "status",
+                _SEGMENT_TITLES["status"],
+                self._intervals["status"],
+            )
+            return
+
+        await self._synth(
+            key="status",
+            text=self._builder.build_status_text(ctx),
+            title=_SEGMENT_TITLES["status"],
+            interval=self._intervals["status"],
         )
 
     async def _refresh_via_build(self, key: str) -> None:

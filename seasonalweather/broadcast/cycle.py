@@ -7,9 +7,10 @@ import re
 import httpx
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
-from typing import Any, Dict, Iterable, Mapping
+from typing import Any, Dict, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
+from ..alerts.active import ActiveAlert
 from ..alerts.nws_api import NWSApi
 from .rwr import (
     ObsPressureCache, parse_rwr, build_rwr_obs_text, build_asos_obs_text,
@@ -452,6 +453,130 @@ class CycleContext:
     health_notice: Optional[str] = None
     health_status_line: Optional[str] = None
     health_detached_loop_only: bool = False
+    active_alerts: tuple[ActiveAlert, ...] = ()
+
+
+_ALERT_COUNT_WORDS = {
+    2: "two",
+    3: "three",
+    4: "four",
+    5: "five",
+    6: "six",
+    7: "seven",
+    8: "eight",
+    9: "nine",
+    10: "ten",
+    11: "eleven",
+    12: "twelve",
+}
+
+
+def _pluralize_station_status_label(label: str) -> str:
+    replacements = {
+        "advisory": "advisories",
+        "emergency": "emergencies",
+        "watch": "watches",
+        "warning": "warnings",
+        "statement": "statements",
+        "outlook": "outlooks",
+        "message": "messages",
+    }
+    low = label.casefold()
+    for singular, plural in replacements.items():
+        if low.endswith(singular):
+            suffix = label[-len(singular):]
+            spoken_plural = plural.capitalize() if suffix[:1].isupper() else plural
+            return label[: -len(singular)] + spoken_plural
+    return label if low.endswith("s") else label + "s"
+
+
+def _station_status_alert_summary(
+    alerts: Sequence[ActiveAlert],
+    *,
+    max_groups: int = 8,
+) -> tuple[str, int]:
+    grouped: dict[str, list[Any]] = {}
+    included_count = 0
+
+    for alert in alerts:
+        if (alert.source or "").strip().upper() == "PNS_CYCLE":
+            continue
+
+        included_count += 1
+        label = str(alert.event or alert.headline or alert.code or "Active alert")
+        label = _SPACE_RE.sub(" ", label).strip().rstrip(".") or "Active alert"
+        if (
+            alert.watch_number is not None
+            and "watch" in label.casefold()
+            and not re.search(r"\bnumber\s+\d+\b", label, flags=re.IGNORECASE)
+        ):
+            label = f"{label} number {alert.watch_number}"
+
+        key = label.casefold()
+        if key not in grouped:
+            grouped[key] = [label, 1]
+        elif " number " not in key:
+            grouped[key][1] += 1
+
+    groups = list(grouped.values())
+    visible = groups[: max(1, int(max_groups))]
+    rendered: list[str] = []
+    for label, count in visible:
+        if count == 1:
+            rendered.append(str(label))
+        else:
+            count_text = _ALERT_COUNT_WORDS.get(int(count), str(count))
+            rendered.append(f"{count_text} {_pluralize_station_status_label(str(label))}")
+
+    if len(groups) > len(visible):
+        remaining = sum(int(count) for _label, count in groups[len(visible):])
+        count_text = _ALERT_COUNT_WORDS.get(remaining, str(remaining))
+        rendered.append(f"{count_text} additional active alerts")
+
+    return "; ".join(rendered), included_count
+
+
+def build_station_status_text(
+    ctx: CycleContext,
+    active_alerts: Sequence[ActiveAlert],
+    *,
+    last_product_max_chars: int = 260,
+) -> str:
+    mode = "heightened" if (ctx.mode or "").strip().casefold() == "heightened" else "normal"
+    status_bits: list[str] = [
+        f"SeasonalWeather is currently operating in {mode} broadcast mode."
+    ]
+
+    if mode == "heightened" and ctx.last_heightened_ago:
+        status_bits.append(f"Heightened mode was activated {ctx.last_heightened_ago} ago.")
+
+    if ctx.last_product_desc:
+        line = _last_product_status_line(
+            ctx.last_product_desc,
+            max_chars=last_product_max_chars,
+        )
+        if line:
+            status_bits.append(line)
+
+    health_status_line = (ctx.health_status_line or "").strip()
+    if health_status_line:
+        status_bits.append(health_status_line)
+
+    alert_summary, alert_count = _station_status_alert_summary(active_alerts)
+    if alert_count == 1:
+        status_bits.append(
+            f"The active alert in the service area is {alert_summary}."
+        )
+    elif alert_count > 1:
+        status_bits.append(
+            f"The active alerts in the service area are: {alert_summary}."
+        )
+    else:
+        status_bits.append(
+            "No active alerts are currently being tracked for the service area."
+        )
+
+    return "And now, the station status and active alerts. " + " ".join(status_bits)
 
 
 @dataclass(frozen=True)
@@ -1250,6 +1375,15 @@ class CycleBuilder:
             name_map=dict(cfg.station_names),
         )
 
+    def build_status_text(self, ctx: CycleContext) -> str:
+        """Build the station-status segment from the local active-alert projection."""
+        max_chars = self._cycle_cfg.last_product_max_chars if self._cycle_cfg else 260
+        return build_station_status_text(
+            ctx,
+            ctx.active_alerts,
+            last_product_max_chars=max_chars,
+        )
+
     async def build_segments(
         self,
         station_name: str,
@@ -1270,19 +1404,6 @@ class CycleBuilder:
                 CycleSegment(key="id", title="Station service notice", text=notice),
                 CycleSegment(key="health", title="Data feed status", text=notice),
             ]
-
-        # --- Active alerts (filter to our SAME/FIPS list) ---
-        alerts = await self.api.active_alerts(self.alert_areas)
-        active_titles: List[str] = []
-        for feat in alerts:
-            props = (feat or {}).get("properties") or {}
-            geocode = props.get("geocode") or {}
-            sames = geocode.get("SAME") or geocode.get("same") or []
-            if isinstance(sames, list) and any(str(x).zfill(6) in self.same_fips for x in sames):
-                title = props.get("event") or props.get("headline")
-                if isinstance(title, str) and title.strip():
-                    active_titles.append(title.strip())
-        active_titles = sorted(set(active_titles))[:8]
 
         # --- Latest HWO (best-effort) ---
         hwo_text: Optional[str] = None
@@ -1500,7 +1621,6 @@ class CycleBuilder:
         # --- Station ID ---
         # --- Station ID ---
         health_notice = (getattr(ctx, "health_notice", None) or "").strip()
-        health_status_line = (getattr(ctx, "health_status_line", None) or "").strip()
 
         if ctx.mode == "heightened":
             station_id = (
@@ -1522,22 +1642,7 @@ class CycleBuilder:
                 # synthesised at push time so it is always accurate.
             )
         # --- Status ---
-        status_bits: List[str] = []
-        status_bits.append(f"The station's broadcast mode is currently in {ctx.mode} broadcast mode at this time.")
-        if ctx.last_heightened_ago:
-            status_bits.append(f"The most recent, heightened broadcast cycle mode activation was {ctx.last_heightened_ago} ago.")
-        if ctx.last_product_desc:
-            line = _last_product_status_line(ctx.last_product_desc, max_chars=self._cycle_cfg.last_product_max_chars if self._cycle_cfg else 260)
-            if line:
-                status_bits.append(line)
-        if health_status_line:
-            status_bits.append(health_status_line)
-        if active_titles:
-            status_bits.append("These are the active watches, warnings, and advisories in effect: " + ", ".join(active_titles) + ".")
-        else:
-            status_bits.append("There are no active watches, warnings, or advisories in the service area at this time.")
-
-        status_text = "And now for the overall station status, and alerts in the service area. " + " ".join(status_bits)
+        status_text = self.build_status_text(ctx)
 
         segments: List[CycleSegment] = [
             CycleSegment(key="id", title="Station ID", text=station_id),

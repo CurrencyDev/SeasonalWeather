@@ -435,6 +435,7 @@ class Orchestrator:
             health_notice=health.notice,
             health_status_line=health.status_line,
             health_detached_loop_only=health.detached_loop_only,
+            active_alerts=tuple(self.alert_tracker.get_cycle_alerts()),
         )
 
     def _update_mode(self) -> None:
