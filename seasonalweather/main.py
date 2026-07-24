@@ -25,6 +25,13 @@ from zoneinfo import ZoneInfo
 
 from .config import load_config, AppConfig
 from .logging_config import setup_logging
+from .lifecycle import (
+    Lifecycle,
+    LifecycleState,
+    PublicationFence,
+    TaskSupervisor,
+    WorkClass,
+)
 
 # Module-level config reference — set once at startup before Orchestrator is created.
 _APP_CFG: "AppConfig | None" = None
@@ -95,11 +102,20 @@ def _setup_logging(cfg: AppConfig | None = None) -> None:
 
 
 class Orchestrator:
-    def __init__(self, cfg: AppConfig) -> None:
+    def __init__(
+        self,
+        cfg: AppConfig,
+        *,
+        lifecycle: Lifecycle | None = None,
+        supervisor: TaskSupervisor | None = None,
+    ) -> None:
         global _APP_CFG
         _APP_CFG = cfg
         _sf_set_app_config(cfg)
         self.cfg = cfg
+        self.lifecycle = lifecycle or Lifecycle(cfg.lifecycle)
+        self.supervisor = supervisor or TaskSupervisor(self.lifecycle)
+        self.publication_fence = PublicationFence(self.lifecycle)
         self.api = NWSApi()
         self.telnet = LiquidsoapTelnet(
             host=cfg.secrets.liquidsoap_host,
@@ -134,6 +150,7 @@ class Orchestrator:
             sample_rate=cfg.audio.sample_rate,
             text_overrides=cfg.tts.text_overrides,
             vtp_cfg=cfg.tts.voicetext_paul,
+            admission_check=lambda: self.lifecycle.require(WorkClass.TTS),
         )
 
         self.mode = "normal"
@@ -233,7 +250,10 @@ class Orchestrator:
             paths=self._paths,
             discord=self.discord,
         )
-        self.alert_audio = AlertAudioDispatcher()
+        self.alert_audio = AlertAudioDispatcher(
+            admission_check=lambda: self.lifecycle.require(WorkClass.ALERT),
+            publication_fence=self.publication_fence,
+        )
         self.ern_relay_runtime = ErnRelayRuntime(self)
         self.ipaws_runtime = IpawsRuntime(self)
         self.cap_runtime = CapRuntime(self)
@@ -473,6 +493,8 @@ class Orchestrator:
 
     def _schedule_cycle_refill(self, reason: str) -> None:
         """Reset continuous-cycle buffer/order after an external state change."""
+        if not self.lifecycle.allows(WorkClass.ROUTINE):
+            return
         try:
             self.refresher.trigger_immediate("id", "status")
             self.refresher.notify_alerts_changed()
@@ -551,7 +573,7 @@ class Orchestrator:
             except Exception:
                 log.debug("Cycle refill notification after failed interrupt push failed", exc_info=True)
 
-        async with self._cycle_lock:
+        async with self._cycle_lock, self.publication_fence.enter():
             mode = "full" if full else "voice"
             if full:
                 # Do not pre-flush or pre-skip the FULL/VOICE request queues here.
@@ -852,6 +874,8 @@ class Orchestrator:
     async def run(self) -> None:
         """Run the SeasonalWeather service runtime."""
         await self.service_runtime.run()
+        if self.lifecycle.state is LifecycleState.FAILED:
+            raise await self.supervisor.wait_for_fatal()
 
 
 def main(argv: list[str] | None = None) -> int:

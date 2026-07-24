@@ -21,6 +21,7 @@ from ..health_service import (
     HealthComponent,
     HealthService,
 )
+from ..lifecycle import Lifecycle, WorkClass
 from .auth import ApiPrincipal, get_client_authentication, require_route_policy
 from .commands import CommandNotFoundError, CommandStore, IdempotencyConflictError
 from .models import (
@@ -194,6 +195,7 @@ def create_app(
     store: CommandStore | None = None,
     auth_service: AuthenticationService | None = None,
     health_service: HealthService | None = None,
+    lifecycle: Lifecycle | None = None,
 ) -> FastAPI:
     command_store = store or CommandStore()
     if health_service is None:
@@ -220,7 +222,27 @@ def create_app(
     app.state.command_store = command_store
     app.state.auth_service = auth_service
     app.state.health_service = health_service
+    app.state.lifecycle = lifecycle
     install_openapi(app)
+
+    @app.middleware("http")
+    async def _lifecycle_admission(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        if (
+            lifecycle is not None
+            and request.method not in {"GET", "HEAD", "OPTIONS"}
+            and not lifecycle.allows(WorkClass.COMMAND)
+        ):
+            return _problem_response(
+                request,
+                status_code=503,
+                code="service_draining",
+                detail="The service is draining and is not accepting mutable work.",
+                headers={"Retry-After": "5"},
+            )
+        return await call_next(request)
 
     @app.exception_handler(RequestValidationError)
     async def _handle_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:

@@ -30,6 +30,7 @@ import yaml
 from .auth.policy import KNOWN_API_SCOPES as _KNOWN_API_SCOPES
 from .auth.policy import SCOPE_RE as _AUTH_SCOPE_RE
 from .broadcast.tests import normalize_postpone_policy
+from .lifecycle import LifecycleTimeouts
 from .alerts.focus import (
     AlertFocusPolicy,
     DEFAULT_EXCLUDED_SOURCES,
@@ -822,6 +823,7 @@ class AppConfig:
     tts: TTSConfig
     audio: AudioConfig
     paths: PathsConfig
+    lifecycle: LifecycleTimeouts
     database: DatabaseConfig
     service_area: ServiceAreaConfig
 
@@ -1913,6 +1915,31 @@ def load_config(path: str) -> AppConfig:
     paths = PathsConfig(**raw["paths"])
 
     # ------------------------------------------------------------------
+    # controller lifecycle
+    # ------------------------------------------------------------------
+    lifecycle_raw = raw.get("lifecycle", {}) or {}
+    lifecycle = LifecycleTimeouts(
+        total_seconds=float(lifecycle_raw.get("total_seconds", 30.0)),
+        active_request_seconds=float(
+            lifecycle_raw.get("active_request_seconds", 10.0)
+        ),
+        publication_seconds=float(
+            lifecycle_raw.get("publication_seconds", 8.0)
+        ),
+        source_stop_seconds=float(
+            lifecycle_raw.get("source_stop_seconds", 8.0)
+        ),
+        tts_stop_seconds=float(lifecycle_raw.get("tts_stop_seconds", 8.0)),
+        task_cancel_seconds=float(
+            lifecycle_raw.get("task_cancel_seconds", 5.0)
+        ),
+        resource_close_seconds=float(
+            lifecycle_raw.get("resource_close_seconds", 5.0)
+        ),
+    )
+    lifecycle.validate()
+
+    # ------------------------------------------------------------------
     # database
     # ------------------------------------------------------------------
     db_raw = raw.get("database", {})
@@ -2030,6 +2057,7 @@ def load_config(path: str) -> AppConfig:
         tts=tts,
         audio=audio,
         paths=paths,
+        lifecycle=lifecycle,
         database=database,
         service_area=service_area,
         same=same,

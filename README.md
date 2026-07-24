@@ -267,6 +267,9 @@ flushing the Liquidsoap cycle queue.
 
 Health endpoint contracts and readiness aggregation are documented in
 [`docs/health-readiness.md`](docs/health-readiness.md).
+Controller lifecycle states, admission closure, task supervision, and bounded
+shutdown behavior are documented in
+[`docs/lifecycle-shutdown.md`](docs/lifecycle-shutdown.md).
 
 `POST /v1/auth/token` and `POST /v1/auth/revoke` are available only in
 `exchange` and `hybrid`. Both authenticate the client with
@@ -295,7 +298,7 @@ quality checks are documented in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 Do **not** clone directly into `/opt/seasonalweather/app`. Clone to any temporary or staging path and run bootstrap from there. The bootstrapper rsyncs the repo into `/opt/seasonalweather/app` automatically.
 
 ```bash
-git clone https://git.seasonalnet.org/Seasonal_Currency/SeasonalWeather /tmp/SeasonalWeather
+git clone https://git.seasonalnet.org/SeasonalNet/SeasonalWeather /tmp/SeasonalWeather
 cd /tmp/SeasonalWeather
 ```
 

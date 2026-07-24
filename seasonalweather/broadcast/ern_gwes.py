@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import json
 import logging
 import os
@@ -264,11 +265,13 @@ class ErnGwesMonitor:
 
             assert proc.stdout is not None
             assert proc.stderr is not None
+            stdout = proc.stdout
+            stderr = proc.stderr
 
             async def _drain_stderr() -> None:
                 try:
                     while True:
-                        b = await proc.stderr.readline()
+                        b = await stderr.readline()
                         if not b:
                             return
                         s = b.decode("utf-8", "replace").rstrip()
@@ -281,7 +284,7 @@ class ErnGwesMonitor:
 
             try:
                 while True:
-                    b = await proc.stdout.readline()
+                    b = await stdout.readline()
                     if not b:
                         break
                     line = b.decode("utf-8", "replace").strip()
@@ -317,14 +320,15 @@ class ErnGwesMonitor:
                         log.warning("ERN queue full; dropping event %s %s", ev.kind, ev.text[:32])
 
             finally:
-                try:
-                    stderr_task.cancel()
-                except Exception:
-                    pass
+                stderr_task.cancel()
                 try:
                     proc.kill()
-                except Exception:
+                except ProcessLookupError:
                     pass
+                with suppress(asyncio.CancelledError):
+                    await stderr_task
+                with suppress(Exception):
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
 
             # Restart backoff
             log.warning("ERN monitor exited; restarting in 2s (%s)", self.name)

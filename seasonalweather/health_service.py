@@ -111,11 +111,13 @@ class HealthReport:
     duration_ms: float
     ready: bool
     state: ComponentState
+    lifecycle_state: str
     components: tuple[HealthComponent, ...]
 
     def to_dict(self, *, detailed: bool) -> dict[str, Any]:
         return {
             "state": self.state.value,
+            "lifecycle_state": self.lifecycle_state,
             "ready": self.ready,
             "checked_at": _iso(self.checked_at),
             "duration_ms": round(max(0.0, min(self.duration_ms, 60_000.0)), 3),
@@ -132,10 +134,12 @@ class HealthService:
         *,
         timeout_seconds: float = 1.0,
         clock: Callable[[], dt.datetime] = _utc_now,
+        lifecycle_state: Callable[[], str] = lambda: "running",
     ) -> None:
         self._probes = tuple(probes)[:_MAX_COMPONENTS]
         self._timeout_seconds = max(0.01, min(float(timeout_seconds), 5.0))
         self._clock = clock
+        self._lifecycle_state = lifecycle_state
 
     async def _evaluate(self, probe: ComponentProbe) -> HealthComponent:
         try:
@@ -176,7 +180,11 @@ class HealthService:
                 key=lambda component: component.name,
             )
         )
-        ready = not any(component.required and component.state in _UNREADY_STATES for component in components)
+        lifecycle_state = str(self._lifecycle_state())
+        ready = lifecycle_state == "running" and not any(
+            component.required and component.state in _UNREADY_STATES
+            for component in components
+        )
         if not ready:
             state = ComponentState.UNAVAILABLE
         elif any(not component.required and component.state in _DEGRADED_STATES for component in components):
@@ -188,6 +196,7 @@ class HealthService:
             duration_ms=(time.monotonic() - started) * 1000.0,
             ready=ready,
             state=state,
+            lifecycle_state=lifecycle_state[:32],
             components=components,
         )
 
@@ -379,14 +388,30 @@ def build_runtime_health_service(
         )
 
     probes.append(ComponentProbe("segments", False, segments_probe))
-    probes.append(
-        _constant_probe(
-            "command_admission",
-            ComponentState.HEALTHY if command_store is not None else ComponentState.UNAVAILABLE,
-            required=True,
-            reason="admission_available" if command_store is not None else "admission_unavailable",
+    lifecycle = runtime.lifecycle
+
+    async def lifecycle_probe() -> HealthComponent:
+        running = lifecycle.ready
+        return _component(
+            "lifecycle",
+            ComponentState.HEALTHY if running else ComponentState.UNAVAILABLE,
+            True,
+            "running" if running else "not_running",
+            details={"state": lifecycle.state.value},
         )
-    )
+
+    probes.append(ComponentProbe("lifecycle", True, lifecycle_probe))
+
+    async def command_admission_probe() -> HealthComponent:
+        available = command_store is not None and lifecycle.ready
+        return _component(
+            "command_admission",
+            ComponentState.HEALTHY if available else ComponentState.UNAVAILABLE,
+            True,
+            "admission_available" if available else "admission_closed",
+        )
+
+    probes.append(ComponentProbe("command_admission", True, command_admission_probe))
 
     auth_mode = str(getattr(cfg.api.auth.mode, "value", cfg.api.auth.mode))
     exchange_required = auth_mode in {"exchange", "hybrid"}
@@ -438,4 +463,8 @@ def build_runtime_health_service(
             ),
         )
     )
-    return HealthService(probes, timeout_seconds=timeout_seconds)
+    return HealthService(
+        probes,
+        timeout_seconds=timeout_seconds,
+        lifecycle_state=lambda: lifecycle.state.value,
+    )

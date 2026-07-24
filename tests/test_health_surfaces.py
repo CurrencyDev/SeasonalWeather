@@ -23,6 +23,7 @@ from seasonalweather.health_service import (
     HealthService,
     build_runtime_health_service,
 )
+from seasonalweather.lifecycle import Lifecycle
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -401,6 +402,8 @@ def test_runtime_report_is_truthful_bounded_and_secret_free(
                 "consecutive_failures": 0,
             }
 
+    lifecycle = Lifecycle()
+    lifecycle.mark_running()
     runtime = SimpleNamespace(
         cfg=SimpleNamespace(
             database=SimpleNamespace(enabled=False),
@@ -412,6 +415,7 @@ def test_runtime_report_is_truthful_bounded_and_secret_free(
         telnet=SimpleNamespace(ping=lambda **_kwargs: True),
         tts=SimpleNamespace(availability=lambda: (True, "tts_available")),
         health_state=SourceHealth(),
+        lifecycle=lifecycle,
         _seg_store=SimpleNamespace(
             health_snapshot=lambda: {
                 "count": 5,

@@ -70,6 +70,11 @@ def render_segment_wav(
         write_silence_wav(gap_tmp, seg_gap_s, sample_rate)
         concat_wavs(out_tmp, [gap_tmp, tts_tmp, gap_tmp])
         dur = wav_duration_seconds(out_tmp)
+        # A synthesis admitted before drain may finish in an executor later.
+        # Re-check before the atomic promotion so stale routine output cannot
+        # replace the last authoritative artifact during shutdown.
+        if tts.admission_check is not None:
+            tts.admission_check()
         os.replace(str(out_tmp), str(output_path))
         return dur
     finally:

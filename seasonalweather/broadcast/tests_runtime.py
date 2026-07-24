@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 import datetime as dt
 import logging
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ..same.events import label_or_code as _same_label_or_code
 from .rwt_rmt import RwtRmtSchedule, RwtRmtScheduler
@@ -25,7 +24,11 @@ class RequiredTestRuntime:
     def __init__(self, orch: "Orchestrator") -> None:
         self.orch = orch
 
-    def start_scheduler(self, tasks: list[asyncio.Task[object]]) -> None:
+    def start_scheduler(
+        self,
+        *,
+        supervisor: Any,
+    ) -> None:
         orch = self.orch
         if not orch.cfg.tests.enabled:
             log.info("RWT/RMT scheduler disabled (set tests.enabled: true in config.yaml to enable)")
@@ -74,7 +77,12 @@ class RequiredTestRuntime:
                 log_fn=_rlog,
                 database=orch.database,
             )
-            tasks.append(asyncio.create_task(rsch.run_forever(), name="rwt_rmt_scheduler"))
+            supervisor.create_task(
+                rsch.run_forever(),
+                name="rwt_rmt_scheduler",
+                required=False,
+                stop=rsch.stop,
+            )
             log.info("RWT/RMT scheduler enabled (state=%s)", state_path)
         except Exception:
             log.exception("Failed to start RWT/RMT scheduler")

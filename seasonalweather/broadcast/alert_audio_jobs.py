@@ -7,7 +7,9 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
+
+from ..lifecycle import PublicationFence
 
 log = logging.getLogger("seasonalweather.alert_audio")
 
@@ -28,6 +30,7 @@ class _QueuedAlertAudioJob:
     push: PushCallable = field(compare=False)
     future: asyncio.Future[Path] = field(compare=False)
     stale_check: StaleCheck | None = field(default=None, compare=False)
+    publication_permit: object | None = field(default=None, compare=False)
 
 
 class AlertAudioDispatcher:
@@ -42,16 +45,27 @@ class AlertAudioDispatcher:
     FULL_PRIORITY = 0
     VOICE_PRIORITY = 10
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        admission_check: Callable[[], None] | None = None,
+        publication_fence: PublicationFence | None = None,
+    ) -> None:
         self._queue: asyncio.PriorityQueue[_QueuedAlertAudioJob] = asyncio.PriorityQueue()
         self._seq = itertools.count()
         self._started = False
+        self._admission_check = admission_check
+        self._publication_fence = publication_fence
 
-    def start(self, tasks: list[asyncio.Task]) -> None:
+    def start_supervised(self, supervisor: Any) -> None:
         if self._started:
             return
         self._started = True
-        tasks.append(asyncio.create_task(self.run_forever(), name="alert_audio_dispatcher"))
+        supervisor.create_task(
+            self.run_forever(),
+            name="alert_audio_dispatcher",
+            required=True,
+        )
         log.info("AlertAudioDispatcher: started")
 
     async def run_forever(self) -> None:
@@ -64,6 +78,16 @@ class AlertAudioDispatcher:
 
     def pending_count(self) -> int:
         return self._queue.qsize()
+
+    async def wait_idle(self, timeout_seconds: float) -> bool:
+        try:
+            await asyncio.wait_for(
+                self._queue.join(),
+                timeout=timeout_seconds,
+            )
+        except TimeoutError:
+            return False
+        return True
 
     async def render_and_push_full(
         self,
@@ -109,6 +133,9 @@ class AlertAudioDispatcher:
         push: PushCallable,
         stale_check: StaleCheck | None = None,
     ) -> Path:
+        if self._admission_check is not None:
+            self._admission_check()
+        permit = self._publication_fence.issue_permit() if self._publication_fence is not None else None
         if not self._started:
             # Unit tests and direct manual use do not always run service_runtime.
             # Preserve the old synchronous contract unless the worker has been
@@ -119,6 +146,7 @@ class AlertAudioDispatcher:
                 render=render,
                 push=push,
                 stale_check=stale_check,
+                publication_permit=permit,
             )
 
         loop = asyncio.get_running_loop()
@@ -134,6 +162,7 @@ class AlertAudioDispatcher:
                 push=push,
                 future=fut,
                 stale_check=stale_check,
+                publication_permit=permit,
             )
         )
         return await fut
@@ -146,19 +175,25 @@ class AlertAudioDispatcher:
         render: RenderCallable,
         push: PushCallable,
         stale_check: StaleCheck | None,
+        publication_permit: object | None,
     ) -> Path:
-        if stale_check is not None and stale_check():
-            raise RuntimeError(f"alert audio job stale before render: mode={mode} source={source}")
-        path = await render()
-        if stale_check is not None and stale_check():
-            raise RuntimeError(f"alert audio job stale before push: mode={mode} source={source}")
-        await push(path)
-        return path
+        token = self._activate_permit(publication_permit)
+        try:
+            if stale_check is not None and stale_check():
+                raise RuntimeError(f"alert audio job stale before render: mode={mode} source={source}")
+            path = await render()
+            if stale_check is not None and stale_check():
+                raise RuntimeError(f"alert audio job stale before push: mode={mode} source={source}")
+            await push(path)
+            return path
+        finally:
+            self._deactivate_permit(token)
 
     async def _run_job(self, job: _QueuedAlertAudioJob) -> None:
         if job.future.cancelled():
             return
         wait_ms = int((time.monotonic() - job.created_monotonic) * 1000)
+        token = self._activate_permit(job.publication_permit)
         try:
             if job.stale_check is not None and job.stale_check():
                 raise RuntimeError(f"alert audio job stale before render: mode={job.mode} source={job.source}")
@@ -189,3 +224,14 @@ class AlertAudioDispatcher:
             if not job.future.cancelled():
                 job.future.set_exception(exc)
             log.exception("AlertAudioDispatcher: failed mode=%s source=%s", job.mode, job.source)
+        finally:
+            self._deactivate_permit(token)
+
+    def _activate_permit(self, permit: object | None) -> Any:
+        if self._publication_fence is None or permit is None:
+            return None
+        return self._publication_fence.activate_permit(permit)
+
+    def _deactivate_permit(self, token: Any) -> None:
+        if self._publication_fence is not None and token is not None:
+            self._publication_fence.deactivate_permit(token)

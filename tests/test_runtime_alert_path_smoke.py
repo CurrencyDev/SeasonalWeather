@@ -167,6 +167,7 @@ def _minimal_config(tmp_path, monkeypatch):
 
 def _orchestrator(tmp_path, monkeypatch) -> Orchestrator:
     orch = Orchestrator(_minimal_config(tmp_path, monkeypatch))
+    orch.lifecycle.mark_running()
     orch.audio_originator = _FakeAudioOriginator(tmp_path / "audio")
     orch.telnet = _FakeTelnet()
     orch.discord = _FakeDiscord()

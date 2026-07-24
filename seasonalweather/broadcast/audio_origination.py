@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import logging
 import wave
@@ -84,7 +85,11 @@ class AudioOriginator:
         out = audio_dir / f"{safe_prefix}_{ts}.wav"
 
         write_silence_wav(pre, 0.35, self.cfg.audio.sample_rate)
-        self.tts.synth_to_wav(script_text, tts_wav)
+        await asyncio.to_thread(
+            self.tts.synth_to_wav,
+            script_text,
+            tts_wav,
+        )
         write_silence_wav(post, 1.2, self.cfg.audio.sample_rate)
         concat_wavs(out, [pre, tts_wav, post])
         return out
@@ -120,7 +125,11 @@ class AudioOriginator:
         )
 
         write_sine_wav(tone, self.cfg.audio.attention_tone_hz, self.cfg.audio.attention_tone_seconds, self.cfg.audio.sample_rate)
-        self.tts.synth_to_wav(script_text, tts_wav)
+        await asyncio.to_thread(
+            self.tts.synth_to_wav,
+            script_text,
+            tts_wav,
+        )
         write_silence_wav(gap, self.cfg.audio.inter_segment_silence_seconds, self.cfg.audio.sample_rate)
         write_silence_wav(post, self.cfg.audio.post_alert_silence_seconds, self.cfg.audio.sample_rate)
 

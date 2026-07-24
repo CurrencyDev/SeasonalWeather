@@ -330,8 +330,8 @@ class DiscordLogger:
         # In Orchestrator.__init__:
         self.discord = DiscordLogger.from_config(cfg.logs.discord)
 
-        # In Orchestrator.run(), before awaiting tasks:
-        tasks.append(asyncio.create_task(self.discord.start(), name="discord_log_drain"))
+        # SeasonalWeatherServiceRuntime registers self.discord.start() with
+        # the controller task supervisor.
 
         # Anywhere in the codebase:
         self.discord.alert_aired(code="TOR", event="Tornado Warning", ...)
@@ -431,8 +431,7 @@ class DiscordLogger:
 
     async def start(self) -> None:
         """
-        Long-running drain coroutine. Schedule as an asyncio Task:
-            asyncio.create_task(self.discord.start(), name="discord_log_drain")
+        Long-running drain coroutine registered by the controller supervisor.
         """
         if not self._any_enabled():
             log.info("Discord webhook logging: disabled (no URLs configured or all disabled)")
@@ -478,6 +477,13 @@ class DiscordLogger:
                     log.exception("Discord webhook post failed (url=%.50s...)", url)
             except Exception:
                 log.exception("Discord log drain loop error")
+
+    async def aclose(self) -> None:
+        """Close the current HTTP client during bounded controller shutdown."""
+        client = self._client
+        self._client = None
+        if client is not None:
+            await client.aclose()
 
     # ------------------------------------------------------------------
     # Internal embed / payload builders

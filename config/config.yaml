@@ -555,6 +555,17 @@ paths:
   config_dir: "/etc/seasonalweather"
   log_dir: "/var/log/seasonalweather"
 
+# Controller-owned graceful shutdown. Values are restart-time configuration.
+# The total deadline caps the complete drain; stage deadlines must not exceed it.
+lifecycle:
+  total_seconds: 30.0
+  active_request_seconds: 10.0
+  publication_seconds: 8.0
+  source_stop_seconds: 8.0
+  tts_stop_seconds: 8.0
+  task_cancel_seconds: 5.0
+  resource_close_seconds: 5.0
+
 database:
   enabled: true
   path: "/var/lib/seasonalweather/seasonalweather.sqlite3"  # also stores exchange clients, tokens, and auth audit

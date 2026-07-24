@@ -10,6 +10,7 @@ from typing import Any
 
 from ..database.commands import CommandRepository
 from ..database.core import SeasonalDatabase
+from ..lifecycle import Lifecycle, WorkClass
 from .models import CommandStatus
 
 
@@ -96,12 +97,18 @@ class EventBroker:
 
 
 class CommandStore:
-    def __init__(self, broker: EventBroker | None = None, database: SeasonalDatabase | None = None) -> None:
+    def __init__(
+        self,
+        broker: EventBroker | None = None,
+        database: SeasonalDatabase | None = None,
+        lifecycle: Lifecycle | None = None,
+    ) -> None:
         self._broker = broker or EventBroker()
         self._lock = asyncio.Lock()
         self._commands_by_id: dict[str, CommandRecord] = {}
         self._commands_by_idempotency_key: dict[str, str] = {}
         self._repo = CommandRepository(database) if database is not None else None
+        self._lifecycle = lifecycle
 
     @property
     def broker(self) -> EventBroker:
@@ -149,6 +156,8 @@ class CommandStore:
         actor: str,
         payload: dict[str, Any],
     ) -> tuple[CommandRecord, bool]:
+        if self._lifecycle is not None:
+            self._lifecycle.require(WorkClass.COMMAND)
         payload_hash = self._payload_hash(payload)
         async with self._lock:
             existing_id = self._commands_by_idempotency_key.get(idempotency_key)

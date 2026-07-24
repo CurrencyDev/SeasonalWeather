@@ -28,6 +28,7 @@ from .broadcast.segment_store import render_segment_wav
 from .database.assets import AudioAssetRepository
 from .database.inserts import CycleInsertRepository
 from .database.station_feed import StationFeedRepository
+from .lifecycle import WorkClass
 from .tts.audio import wav_duration_seconds
 from .tts.tts import TTS
 from .same.locations import (
@@ -1095,6 +1096,7 @@ class OrchestratorControl:
             sample_rate=new_cfg.audio.sample_rate,
             text_overrides=new_cfg.tts.text_overrides,
             vtp_cfg=new_cfg.tts.voicetext_paul,
+            admission_check=lambda: self.orch.lifecycle.require(WorkClass.TTS),
         )
         self.orch.cycle_builder = CycleBuilder(
             api=self.orch.api,

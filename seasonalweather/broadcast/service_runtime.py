@@ -139,7 +139,7 @@ class SeasonalWeatherServiceRuntime:
         except Exception:
             log.exception("Station feed: persisted-state startup initialization failed")
 
-        tasks: list[asyncio.Task] = []
+        supervisor = o.supervisor
 
         async def _health_probe_cap_api() -> None:
             await o.api.active_alerts(o.cycle_builder.alert_areas)
@@ -162,15 +162,42 @@ class SeasonalWeatherServiceRuntime:
             except Exception:
                 log.exception("Health state change refresh failed")
 
-        tasks.append(asyncio.create_task(o.health_state.run_forever(on_change=_health_changed), name="health_state"))
-        o.alert_audio.start(tasks)
+        if o.lifecycle.is_shutting_down:
+            return
+        o.lifecycle.mark_running()
+        supervisor.create_task(
+            o.health_state.run_forever(on_change=_health_changed),
+            name="health_state",
+            required=False,
+        )
+        o.alert_audio.start_supervised(supervisor)
 
         # CycleConductor + SegmentRefresher own routine cycle scheduling.
-        tasks.append(asyncio.create_task(o.conductor.run(), name="conductor"))
-        tasks.append(asyncio.create_task(o.refresher.run(), name="segment_refresher"))
-        tasks.append(asyncio.create_task(o.pns_runtime.run_backfill_loop(), name="pns_api_backfill"))
-        tasks.append(asyncio.create_task(o.now_runtime.run(), name="now_cycle_worker"))
-        tasks.append(asyncio.create_task(o.now_runtime.run_backfill_loop(), name="now_api_backfill"))
+        supervisor.create_task(
+            o.conductor.run(),
+            name="conductor",
+            required=True,
+        )
+        supervisor.create_task(
+            o.refresher.run(),
+            name="segment_refresher",
+            required=True,
+        )
+        supervisor.create_task(
+            o.pns_runtime.run_backfill_loop(),
+            name="pns_api_backfill",
+            required=False,
+        )
+        supervisor.create_task(
+            o.now_runtime.run(),
+            name="now_cycle_worker",
+            required=False,
+        )
+        supervisor.create_task(
+            o.now_runtime.run_backfill_loop(),
+            name="now_api_backfill",
+            required=False,
+        )
 
         if o.cfg.nwws.credentials_defaulted:
             log.warning(
@@ -194,8 +221,18 @@ class SeasonalWeatherServiceRuntime:
                     join_wait_seconds=o.cfg.nwws.resiliency.join_wait_seconds,
                     backoff_max_seconds=o.cfg.nwws.resiliency.backoff_max_seconds,
                 )
-                tasks.append(asyncio.create_task(xmpp.run_forever(), name="nwws_xmpp"))
-                tasks.append(asyncio.create_task(o.nwws_runtime.run(), name="nwws_consumer"))
+                supervisor.create_task(
+                    xmpp.run_forever(),
+                    name="nwws_xmpp",
+                    required=False,
+                    stop=xmpp.request_shutdown,
+                    stop_timeout_seconds=o.lifecycle.timeouts.source_stop_seconds,
+                )
+                supervisor.create_task(
+                    o.nwws_runtime.run(),
+                    name="nwws_consumer",
+                    required=False,
+                )
         # CycleConductor runs the cycle continuously.
 
         if o.cfg.cap.enabled:
@@ -216,8 +253,18 @@ class SeasonalWeatherServiceRuntime:
                     kwargs["url"] = url  # type: ignore[assignment]
 
                 cap = NwsCapPoller(**kwargs)  # type: ignore[arg-type]
-                tasks.append(asyncio.create_task(cap.run_forever(), name="cap_poller"))
-                tasks.append(asyncio.create_task(o.cap_runtime.run(), name="cap_consumer"))
+                supervisor.create_task(
+                    cap.run_forever(),
+                    name="cap_poller",
+                    required=False,
+                    stop=cap.aclose,
+                    stop_timeout_seconds=o.lifecycle.timeouts.source_stop_seconds,
+                )
+                supervisor.create_task(
+                    o.cap_runtime.run(),
+                    name="cap_consumer",
+                    required=False,
+                )
                 log.info("CAP ingest enabled (dryrun=%s full=%s voice=%s)", o.cfg.cap.dryrun, o.cfg.cap.full.enabled, o.cfg.cap.voice.enabled)
         else:
             log.info("CAP ingest disabled (set cap.enabled: true in config.yaml to enable)")
@@ -236,8 +283,18 @@ class SeasonalWeatherServiceRuntime:
                     ledger_max_age_days=o.cfg.ipaws.ledger_max_age_days,
                     database=o.database,
                 )
-                tasks.append(asyncio.create_task(ipaws_poller.run_forever(), name="ipaws_poller"))
-                tasks.append(asyncio.create_task(o.ipaws_runtime.run(), name="ipaws_consumer"))
+                supervisor.create_task(
+                    ipaws_poller.run_forever(),
+                    name="ipaws_poller",
+                    required=False,
+                    stop=ipaws_poller.aclose,
+                    stop_timeout_seconds=o.lifecycle.timeouts.source_stop_seconds,
+                )
+                supervisor.create_task(
+                    o.ipaws_runtime.run(),
+                    name="ipaws_consumer",
+                    required=False,
+                )
                 log.info(
                     "IPAWS ingest enabled (dryrun=%s full_events=%s)",
                     o.cfg.ipaws.dryrun,
@@ -267,8 +324,16 @@ class SeasonalWeatherServiceRuntime:
                         name=ern_cfg.name,
                         decoder_backend=ern_cfg.decoder_backend,
                     )
-                    tasks.append(asyncio.create_task(mon.run_forever(), name="ern_monitor"))
-                    tasks.append(asyncio.create_task(o.ern_relay_runtime.run(), name="ern_consumer"))
+                    supervisor.create_task(
+                        mon.run_forever(),
+                        name="ern_monitor",
+                        required=False,
+                    )
+                    supervisor.create_task(
+                        o.ern_relay_runtime.run(),
+                        name="ern_consumer",
+                        required=False,
+                    )
                     log.info(
                         "ERN monitor enabled (dryrun=%s url=%s relay=%s decoder=%s)",
                         o.cfg.ern.dryrun,
@@ -279,16 +344,20 @@ class SeasonalWeatherServiceRuntime:
         else:
             log.info("ERN monitor disabled (set ern.enabled: true in config.yaml to enable)")
 
-        o.tests_runtime.start_scheduler(tasks)
+        o.tests_runtime.start_scheduler(supervisor=supervisor)
 
         if o.db_housekeeper is not None:
-            tasks.append(asyncio.create_task(o.db_housekeeper.run_forever(), name="database_housekeeping"))
+            supervisor.create_task(
+                o.db_housekeeper.run_forever(),
+                name="database_housekeeping",
+                required=False,
+                stop=o.db_housekeeper.stop,
+            )
 
-        tasks.append(asyncio.create_task(o.discord.start(), name="discord_log_drain"))
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-        for t in done:
-            exc = t.exception()
-            if exc:
-                for p in pending:
-                    p.cancel()
-                raise exc
+        supervisor.create_task(
+            o.discord.start(),
+            name="discord_log_drain",
+            required=False,
+            stop=o.discord.aclose,
+        )
+        await o.lifecycle.wait_for_shutdown()

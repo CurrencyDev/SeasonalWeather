@@ -2,6 +2,7 @@ import asyncio
 from pathlib import Path
 
 from seasonalweather.broadcast.alert_audio_jobs import AlertAudioDispatcher
+from seasonalweather.lifecycle import Lifecycle, TaskSupervisor
 
 
 def test_alert_audio_dispatcher_runs_inline_until_started(tmp_path: Path) -> None:
@@ -26,8 +27,9 @@ def test_alert_audio_dispatcher_runs_inline_until_started(tmp_path: Path) -> Non
 def test_alert_audio_dispatcher_prioritizes_full_before_voice(tmp_path: Path) -> None:
     async def scenario() -> list[str]:
         disp = AlertAudioDispatcher()
-        tasks: list[asyncio.Task] = []
-        disp.start(tasks)
+        lifecycle = Lifecycle()
+        supervisor = TaskSupervisor(lifecycle)
+        disp.start_supervised(supervisor)
         events: list[str] = []
 
         async def render_voice() -> Path:
@@ -53,9 +55,8 @@ def test_alert_audio_dispatcher_prioritizes_full_before_voice(tmp_path: Path) ->
         )
 
         await asyncio.gather(voice_task, full_task)
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        lifecycle.request_shutdown()
+        await supervisor.stop()
         return events
 
     events = asyncio.run(scenario())

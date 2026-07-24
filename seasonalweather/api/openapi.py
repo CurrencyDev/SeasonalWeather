@@ -7,7 +7,7 @@ from fastapi.openapi.utils import get_openapi
 
 from .auth import ROUTE_AUTH_POLICIES
 
-API_VERSION = "1.2.0"
+API_VERSION = "1.3.0"
 PROBLEM_JSON = "application/problem+json"
 
 PROBLEM_DETAILS_SCHEMA: dict[str, Any] = {
@@ -93,6 +93,7 @@ READINESS_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
     "required": [
         "state",
+        "lifecycle_state",
         "ready",
         "checked_at",
         "duration_ms",
@@ -100,6 +101,17 @@ READINESS_SCHEMA: dict[str, Any] = {
     ],
     "properties": {
         "state": {"type": "string", "enum": HEALTH_STATES},
+        "lifecycle_state": {
+            "type": "string",
+            "enum": [
+                "starting",
+                "running",
+                "draining",
+                "stopping",
+                "stopped",
+                "failed",
+            ],
+        },
         "ready": {"type": "boolean"},
         "checked_at": {"type": "string", "format": "date-time"},
         "duration_ms": {"type": "number", "minimum": 0, "maximum": 60_000},

@@ -20,6 +20,7 @@ import tempfile
 import fcntl
 from dataclasses import dataclass
 from contextlib import contextmanager
+from collections.abc import Callable
 from pathlib import Path
 
 _SPACE_RE = re.compile(r"[ \t]+")
@@ -490,6 +491,7 @@ class TTS:
     sample_rate: int
     text_overrides: list[dict] | None = None
     vtp_cfg: object = None  # VoiceTextPaulConfig | None
+    admission_check: Callable[[], None] | None = None
 
     def _voicetext_available(self) -> bool:
         state_base = Path(
@@ -553,6 +555,8 @@ class TTS:
         return False, "backend_unsupported"
 
     def synth_to_wav(self, text: str, out_wav: Path) -> None:
+        if self.admission_check is not None:
+            self.admission_check()
         out_wav.parent.mkdir(parents=True, exist_ok=True)
 
         msg = clean_for_tts(text)

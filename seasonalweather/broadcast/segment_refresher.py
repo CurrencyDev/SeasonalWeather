@@ -34,10 +34,8 @@ Wiring in main.py (summary)
         sample_rate=cfg.audio.sample_rate,
     )
 
-  In Orchestrator.run():
-    tasks.append(asyncio.create_task(
-        self.refresher.run(), name="segment_refresher",
-    ))
+  SeasonalWeatherServiceRuntime registers ``self.refresher.run()`` with the
+  controller task supervisor.
 
   In _consume_nwws / _handle_toneout, after relevant products arrive:
     self.refresher.trigger_immediate("hwo")   # HWO received

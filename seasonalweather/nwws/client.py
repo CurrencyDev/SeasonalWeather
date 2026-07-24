@@ -606,6 +606,7 @@ class NWWSClient:
 
         self._thread: Optional[threading.Thread] = None
         self._stop_evt = threading.Event()
+        self._closing = threading.Event()
         self._started_evt = threading.Event()
         self._muc_joined_evt = threading.Event()
 
@@ -771,10 +772,12 @@ class NWWSClient:
 
         backoff = 2.0
 
-        while True:
+        while not self._closing.is_set():
             try:
                 # Hard stop any previous worker before starting a new one
                 self.stop()
+                if self._closing.is_set():
+                    return
 
                 self._worker_id += 1
                 wid = self._worker_id
@@ -851,11 +854,20 @@ class NWWSClient:
                 self.stop()
                 raise
             except Exception as e:
+                if self._closing.is_set():
+                    self.stop()
+                    return
                 log.warning("NWWS supervisor restarting: %s", e)
                 self.stop()
                 await asyncio.sleep(backoff + random.uniform(0, backoff * 0.25))
                 backoff = min(max_backoff, backoff * 1.6)
                 continue
+
+    def request_shutdown(self) -> None:
+        """Permanently stop this client; unlike ``stop``, reconnect is closed."""
+        self._closing.set()
+        self.stop()
+
     def stop(self) -> None:
         self._stop_evt.set()
 

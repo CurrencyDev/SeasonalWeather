@@ -53,6 +53,11 @@ class SeasonalDatabase:
         except Exception:
             return False
 
+    def checkpoint(self) -> None:
+        """Checkpoint current WAL state without retaining a connection."""
+        with self.connect() as conn:
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+
     @contextmanager
     def connect(self):
         self.bootstrap()

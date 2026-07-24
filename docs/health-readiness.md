@@ -18,6 +18,9 @@ process-restart signal.
 every currently configured required component can support normal broadcast
 operation and `503` otherwise.
 
+Readiness also requires controller lifecycle state `running`. It becomes
+unready immediately when intentional drain begins.
+
 Its public no-store report contains only stable component names, typed states,
 and bounded reason identifiers.
 
@@ -25,7 +28,8 @@ and bounded reason identifiers.
 
 `GET /v1/health` requires the `read:health` scope under static, exchange, and
 migration-only hybrid authentication. It returns the same readiness decision
-with bounded timestamps, ages, durations, and non-secret component details.
+with bounded timestamps, ages, durations, lifecycle state, and non-secret
+component details.
 
 ## Component states and aggregation
 
@@ -61,3 +65,6 @@ dedicated architecture is implemented.
 Reports never include configured paths, raw exceptions, credentials, tokens,
 authorization headers, source payloads, or client details. Component and
 detail collections are size-bounded.
+
+The complete lifecycle and shutdown contract is documented in
+[`lifecycle-shutdown.md`](lifecycle-shutdown.md).
