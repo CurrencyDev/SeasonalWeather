@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import hmac
-import json
-import os
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from fastapi import Depends, Header, HTTPException, Request, status
+
+from ..config import AuthMode, StaticCredentialConfig
 
 
 @dataclass(frozen=True)
@@ -31,21 +31,52 @@ class ApiPrincipal:
             )
 
 
-_DEFAULT_ADMIN_SCOPES = frozenset(
-    {
-        "read:health",
-        "read:status",
-        "read:alerts",
-        "read:config",
-        "control:cycle",
-        "control:mode",
-        "control:tests",
-        "control:originate",
-        "control:audio",
-        "control:inserts",
-        "control:config",
-    }
-)
+@dataclass(frozen=True)
+class RouteAuthPolicy:
+    scopes: frozenset[str] = frozenset()
+
+    @property
+    def public(self) -> bool:
+        return not self.scopes
+
+
+def _protected(*scopes: str) -> RouteAuthPolicy:
+    return RouteAuthPolicy(frozenset(scopes))
+
+
+PUBLIC_ROUTE = RouteAuthPolicy()
+
+ROUTE_AUTH_POLICIES: dict[tuple[str, str], RouteAuthPolicy] = {
+    ("GET", "/openapi.json"): PUBLIC_ROUTE,
+    ("HEAD", "/openapi.json"): PUBLIC_ROUTE,
+    ("GET", "/docs"): PUBLIC_ROUTE,
+    ("HEAD", "/docs"): PUBLIC_ROUTE,
+    ("GET", "/docs/oauth2-redirect"): PUBLIC_ROUTE,
+    ("HEAD", "/docs/oauth2-redirect"): PUBLIC_ROUTE,
+    ("GET", "/redoc"): PUBLIC_ROUTE,
+    ("HEAD", "/redoc"): PUBLIC_ROUTE,
+    ("GET", "/healthz"): _protected("read:health"),
+    ("GET", "/v1/health"): _protected("read:health"),
+    ("GET", "/v1/status"): _protected("read:status"),
+    ("GET", "/v1/handled-alerts"): PUBLIC_ROUTE,
+    ("GET", "/v1/station-feed"): _protected("read:alerts"),
+    ("GET", "/v1/config/summary"): _protected("read:config"),
+    ("GET", "/v1/commands/{command_id}"): _protected("read:status"),
+    ("POST", "/v1/cycle/rebuild"): _protected("control:cycle"),
+    ("POST", "/v1/mode/heightened"): _protected("control:mode"),
+    ("DELETE", "/v1/mode/heightened"): _protected("control:mode"),
+    ("POST", "/v1/tests/originate"): _protected("control:tests"),
+    ("POST", "/v1/uploads/audio"): _protected("control:audio"),
+    ("POST", "/v1/inserts/text"): _protected("control:inserts"),
+    ("POST", "/v1/inserts/audio"): _protected("control:inserts"),
+    ("GET", "/v1/inserts"): _protected("control:inserts"),
+    ("GET", "/v1/inserts/{insert_id}"): _protected("control:inserts"),
+    ("DELETE", "/v1/inserts/{insert_id}"): _protected("control:inserts"),
+    ("POST", "/v1/originate/text"): _protected("control:originate"),
+    ("POST", "/v1/originate/audio"): _protected("control:originate"),
+    ("POST", "/v1/config/reload"): _protected("control:config"),
+    ("GET", "/v1/events"): _protected("read:status"),
+}
 
 
 def _is_loopback(host: str | None) -> bool:
@@ -54,52 +85,21 @@ def _is_loopback(host: str | None) -> bool:
     return host in {"127.0.0.1", "::1", "localhost"}
 
 
-def _load_token_map() -> dict[str, dict[str, Any]]:
+def _load_static_credentials() -> tuple[StaticCredentialConfig, ...]:
     from ..main import _APP_CFG  # late import to avoid circular dependency
-    secrets = _APP_CFG.secrets if _APP_CFG else None
 
-    raw_json = (secrets.api_tokens_json if secrets else "") or ""
-    raw_json = raw_json.strip()
-    if raw_json:
-        try:
-            obj = json.loads(raw_json)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("SEASONAL_API_TOKENS_JSON is not valid JSON") from exc
-        if not isinstance(obj, dict):
-            raise RuntimeError("SEASONAL_API_TOKENS_JSON must be a JSON object")
-        out: dict[str, dict[str, Any]] = {}
-        for token, meta in obj.items():
-            if not isinstance(token, str) or not token:
-                continue
-            if isinstance(meta, dict):
-                subject = str(meta.get("subject") or "api-user")
-                scopes_raw = meta.get("scopes") or ["*"]
-                scopes = [str(s).strip() for s in scopes_raw if str(s).strip()]
-            else:
-                subject = "api-user"
-                scopes = ["*"]
-            out[token] = {"subject": subject, "scopes": scopes}
-        return out
-
-    single = (secrets.api_token if secrets else "") or ""
-    single = single.strip()
-    if not single:
-        raise RuntimeError(
-            "No API token configured. Set SEASONAL_API_TOKEN or SEASONAL_API_TOKENS_JSON in seasonalweather.env."
-        )
-
-    api_cfg = _APP_CFG.api if _APP_CFG else None
-    scopes_raw = (api_cfg.scopes if api_cfg else "") or ""
-    scopes = [s.strip() for s in scopes_raw.split(",") if s.strip()] if scopes_raw else sorted(_DEFAULT_ADMIN_SCOPES)
-    subject = (api_cfg.subject if api_cfg else "local-admin") or "local-admin"
-    return {single: {"subject": subject, "scopes": scopes}}
+    if _APP_CFG is None:
+        return ()
+    auth = _APP_CFG.api.auth
+    if auth.mode is not AuthMode.STATIC:
+        return ()
+    return auth.credentials
 
 
-def _authenticate_token(token: str) -> dict[str, Any] | None:
-    token_map = _load_token_map()
-    for configured, meta in token_map.items():
-        if hmac.compare_digest(configured, token):
-            return meta
+def _authenticate_token(token: str) -> StaticCredentialConfig | None:
+    for credential in _load_static_credentials():
+        if hmac.compare_digest(credential.token, token):
+            return credential
     return None
 
 
@@ -135,16 +135,19 @@ async def get_api_principal(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    meta = _authenticate_token(token.strip())
-    if meta is None:
+    credential = _authenticate_token(token.strip())
+    if credential is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"code": "invalid_token", "message": "Bearer token was not recognized."},
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    scopes = frozenset(str(s).strip() for s in (meta.get("scopes") or []) if str(s).strip())
-    return ApiPrincipal(subject=str(meta.get("subject") or "api-user"), scopes=scopes, client_host=client_host)
+    return ApiPrincipal(
+        subject=credential.subject,
+        scopes=credential.scopes,
+        client_host=client_host,
+    )
 
 
 def require_scopes(*scopes: str) -> Callable[..., Any]:
@@ -153,3 +156,20 @@ def require_scopes(*scopes: str) -> Callable[..., Any]:
         return principal
 
     return _dependency
+
+
+def route_auth_policy(method: str, path: str) -> RouteAuthPolicy:
+    key = (method.strip().upper(), path)
+    try:
+        return ROUTE_AUTH_POLICIES[key]
+    except KeyError as exc:
+        raise RuntimeError(f"No authentication policy is declared for {key[0]} {path}.") from exc
+
+
+def require_route_policy(method: str, path: str) -> Callable[..., Any]:
+    policy = route_auth_policy(method, path)
+    if policy.public:
+        raise RuntimeError(f"Public route {method.strip().upper()} {path} must not install an auth dependency.")
+    dependency = require_scopes(*sorted(policy.scopes))
+    dependency.__dict__["__seasonalweather_auth_policy__"] = policy
+    return dependency

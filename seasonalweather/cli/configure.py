@@ -147,6 +147,10 @@ def validate_candidate(path: Path) -> None:
     # load_config() requires secrets from the environment. Provide safe validation
     # placeholders when the operator has not filled seasonalweather.env yet.
     os.environ.setdefault("ICECAST_SOURCE_PASSWORD", "validation-source")
+    if not os.environ.get("SEASONAL_API_TOKEN") and not os.environ.get(
+        "SEASONAL_API_TOKENS_JSON"
+    ):
+        os.environ["SEASONAL_API_TOKEN"] = os.urandom(24).hex()
     try:
         from seasonalweather.config import load_config
         load_config(str(path))

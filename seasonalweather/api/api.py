@@ -13,7 +13,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .auth import ApiPrincipal, require_scopes
+from .auth import ApiPrincipal, require_route_policy
 from .commands import CommandNotFoundError, CommandStore, IdempotencyConflictError
 from .models import (
     AudioUploadAccepted,
@@ -248,7 +248,9 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
             **STANDARD_PROBLEM_RESPONSES,
         },
     )
-    async def healthz(principal: ApiPrincipal = Depends(require_scopes("read:health"))) -> dict[str, Any]:
+    async def healthz(
+        principal: ApiPrincipal = Depends(require_route_policy("GET", "/healthz")),
+    ) -> dict[str, Any]:
         return await control.get_health()
 
     @app.get(
@@ -260,7 +262,9 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
             **STANDARD_PROBLEM_RESPONSES,
         },
     )
-    async def v1_health(principal: ApiPrincipal = Depends(require_scopes("read:health"))) -> dict[str, Any]:
+    async def v1_health(
+        principal: ApiPrincipal = Depends(require_route_policy("GET", "/v1/health")),
+    ) -> dict[str, Any]:
         return await control.get_health()
 
     @app.get(
@@ -272,7 +276,9 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
             **STANDARD_PROBLEM_RESPONSES,
         },
     )
-    async def v1_status(principal: ApiPrincipal = Depends(require_scopes("read:status"))) -> dict[str, Any]:
+    async def v1_status(
+        principal: ApiPrincipal = Depends(require_route_policy("GET", "/v1/status")),
+    ) -> dict[str, Any]:
         return await control.get_status()
 
     @app.get(
@@ -297,7 +303,9 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
             **STANDARD_PROBLEM_RESPONSES,
         },
     )
-    async def v1_station_feed(principal: ApiPrincipal = Depends(require_scopes("read:alerts"))) -> dict[str, Any]:
+    async def v1_station_feed(
+        principal: ApiPrincipal = Depends(require_route_policy("GET", "/v1/station-feed")),
+    ) -> dict[str, Any]:
         return await control.get_station_feed()
 
     @app.get(
@@ -309,7 +317,11 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
             **STANDARD_PROBLEM_RESPONSES,
         },
     )
-    async def v1_config_summary(principal: ApiPrincipal = Depends(require_scopes("read:config"))) -> dict[str, Any]:
+    async def v1_config_summary(
+        principal: ApiPrincipal = Depends(
+            require_route_policy("GET", "/v1/config/summary")
+        ),
+    ) -> dict[str, Any]:
         return await control.get_config_summary()
 
     @app.get(
@@ -319,7 +331,12 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
         summary="Return a command snapshot by command ID.",
         responses=STANDARD_PROBLEM_RESPONSES,
     )
-    async def v1_command(command_id: str, principal: ApiPrincipal = Depends(require_scopes("read:status"))) -> CommandSnapshot:
+    async def v1_command(
+        command_id: str,
+        principal: ApiPrincipal = Depends(
+            require_route_policy("GET", "/v1/commands/{command_id}")
+        ),
+    ) -> CommandSnapshot:
         try:
             record = await command_store.get(command_id)
         except CommandNotFoundError as exc:
@@ -335,7 +352,9 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
     )
     async def v1_cycle_rebuild(
         req: RebuildCycleRequest,
-        principal: ApiPrincipal = Depends(require_scopes("control:cycle")),
+        principal: ApiPrincipal = Depends(
+            require_route_policy("POST", "/v1/cycle/rebuild")
+        ),
         idempotency_key: str = Depends(_require_idempotency_key),
     ) -> CommandAccepted:
         payload = req.model_dump(mode="json")
@@ -358,7 +377,9 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
     )
     async def v1_mode_heightened(
         req: SetHeightenedModeRequest,
-        principal: ApiPrincipal = Depends(require_scopes("control:mode")),
+        principal: ApiPrincipal = Depends(
+            require_route_policy("POST", "/v1/mode/heightened")
+        ),
         idempotency_key: str = Depends(_require_idempotency_key),
     ) -> CommandAccepted:
         payload = req.model_dump(mode="json")
@@ -381,7 +402,9 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
     )
     async def v1_mode_heightened_clear(
         req: ClearHeightenedModeRequest,
-        principal: ApiPrincipal = Depends(require_scopes("control:mode")),
+        principal: ApiPrincipal = Depends(
+            require_route_policy("DELETE", "/v1/mode/heightened")
+        ),
         idempotency_key: str = Depends(_require_idempotency_key),
     ) -> CommandAccepted:
         payload = req.model_dump(mode="json")
@@ -404,7 +427,9 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
     )
     async def v1_tests_originate(
         req: OriginateTestRequest,
-        principal: ApiPrincipal = Depends(require_scopes("control:tests")),
+        principal: ApiPrincipal = Depends(
+            require_route_policy("POST", "/v1/tests/originate")
+        ),
         idempotency_key: str = Depends(_require_idempotency_key),
     ) -> CommandAccepted:
         payload = req.model_dump(mode="json")
@@ -427,7 +452,9 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
     )
     async def v1_upload_audio(
         file: UploadFile = File(...),
-        principal: ApiPrincipal = Depends(require_scopes("control:audio")),
+        principal: ApiPrincipal = Depends(
+            require_route_policy("POST", "/v1/uploads/audio")
+        ),
     ) -> AudioUploadAccepted:
         data = await file.read()
         try:
@@ -450,7 +477,9 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
     )
     async def v1_inserts_text(
         req: CreateTextInsertRequest,
-        principal: ApiPrincipal = Depends(require_scopes("control:inserts")),
+        principal: ApiPrincipal = Depends(
+            require_route_policy("POST", "/v1/inserts/text")
+        ),
         idempotency_key: str = Depends(_require_idempotency_key),
     ) -> CommandAccepted:
         payload = req.model_dump(mode="json")
@@ -473,7 +502,9 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
     )
     async def v1_inserts_audio(
         req: CreateAudioInsertRequest,
-        principal: ApiPrincipal = Depends(require_scopes("control:inserts")),
+        principal: ApiPrincipal = Depends(
+            require_route_policy("POST", "/v1/inserts/audio")
+        ),
         idempotency_key: str = Depends(_require_idempotency_key),
     ) -> CommandAccepted:
         payload = req.model_dump(mode="json")
@@ -497,7 +528,9 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
     async def v1_inserts_list(
         include_inactive: bool = Query(default=False),
         limit: int = Query(default=100, ge=1, le=500),
-        principal: ApiPrincipal = Depends(require_scopes("control:inserts")),
+        principal: ApiPrincipal = Depends(
+            require_route_policy("GET", "/v1/inserts")
+        ),
     ) -> CycleInsertList:
         return CycleInsertList(inserts=[CycleInsertSnapshot.model_validate(item) for item in await control.list_inserts(include_inactive=include_inactive, limit=limit)])
 
@@ -510,7 +543,9 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
     )
     async def v1_inserts_get(
         insert_id: str,
-        principal: ApiPrincipal = Depends(require_scopes("control:inserts")),
+        principal: ApiPrincipal = Depends(
+            require_route_policy("GET", "/v1/inserts/{insert_id}")
+        ),
     ) -> CycleInsertSnapshot:
         return CycleInsertSnapshot.model_validate(await control.get_insert(insert_id))
 
@@ -523,7 +558,9 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
     )
     async def v1_inserts_cancel(
         insert_id: str,
-        principal: ApiPrincipal = Depends(require_scopes("control:inserts")),
+        principal: ApiPrincipal = Depends(
+            require_route_policy("DELETE", "/v1/inserts/{insert_id}")
+        ),
         idempotency_key: str = Depends(_require_idempotency_key),
     ) -> CommandAccepted:
         payload = {"insert_id": insert_id}
@@ -546,7 +583,9 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
     )
     async def v1_originate_text(
         req: OriginateTextRequest,
-        principal: ApiPrincipal = Depends(require_scopes("control:originate")),
+        principal: ApiPrincipal = Depends(
+            require_route_policy("POST", "/v1/originate/text")
+        ),
         idempotency_key: str = Depends(_require_idempotency_key),
     ) -> CommandAccepted:
         payload = req.model_dump(mode="json")
@@ -569,7 +608,9 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
     )
     async def v1_originate_audio(
         req: OriginateAudioRequest,
-        principal: ApiPrincipal = Depends(require_scopes("control:originate")),
+        principal: ApiPrincipal = Depends(
+            require_route_policy("POST", "/v1/originate/audio")
+        ),
         idempotency_key: str = Depends(_require_idempotency_key),
     ) -> CommandAccepted:
         payload = req.model_dump(mode="json")
@@ -592,7 +633,9 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
     )
     async def v1_config_reload(
         req: ConfigReloadRequest,
-        principal: ApiPrincipal = Depends(require_scopes("control:config")),
+        principal: ApiPrincipal = Depends(
+            require_route_policy("POST", "/v1/config/reload")
+        ),
         idempotency_key: str = Depends(_require_idempotency_key),
     ) -> CommandAccepted:
         payload = req.model_dump(mode="json")
@@ -618,7 +661,9 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
             **STANDARD_PROBLEM_RESPONSES,
         },
     )
-    async def v1_events(principal: ApiPrincipal = Depends(require_scopes("read:status"))) -> StreamingResponse:
+    async def v1_events(
+        principal: ApiPrincipal = Depends(require_route_policy("GET", "/v1/events")),
+    ) -> StreamingResponse:
         queue = await command_store.broker.subscribe()
 
         async def _stream() -> Any:

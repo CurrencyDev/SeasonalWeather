@@ -18,8 +18,11 @@ Everything else lives in config.yaml.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -570,16 +573,53 @@ class StationFeedConfig:
 
 # --- api ---
 
+class AuthMode(str, Enum):
+    STATIC = "static"
+    EXCHANGE = "exchange"
+    HYBRID = "hybrid"
+
+
+class AuthConfigurationError(ValueError):
+    """Bounded, redacted authentication configuration failure."""
+
+    def __init__(
+        self,
+        *,
+        kind: str,
+        path: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        self.kind = kind
+        self.path = path
+        self.details = dict(details or {})
+        super().__init__(message)
+
+
+@dataclass(frozen=True)
+class StaticCredentialConfig:
+    token: str = field(repr=False)
+    subject: str
+    scopes: frozenset[str]
+
+
+@dataclass(frozen=True)
+class ApiAuthConfig:
+    mode: AuthMode
+    credentials: tuple[StaticCredentialConfig, ...] = field(repr=False)
+    legacy_mode_normalized: bool
+    legacy_scope_normalized: bool
+
+
 @dataclass(frozen=True)
 class ApiConfig:
+    auth: ApiAuthConfig
     allow_remote: bool
     audio_max_bytes: int
     audio_max_seconds: int
     audio_ttl_seconds: int
     ffmpeg_bin: str
     full_eas_heightened: bool
-    scopes: str
-    subject: str
     manual_full_eas_heightens: bool
 
 
@@ -741,13 +781,13 @@ class SecretsConfig:
     Loaded once at startup by load_config() and kept here so no other
     module ever needs to call os.getenv() for credentials.
     """
-    nwws_jid: str
-    nwws_password: str
-    icecast_source_password: str
-    icecast_admin_password: str    # may be empty
-    icecast_relay_password: str    # may be empty
-    api_token: str                 # may be empty
-    api_tokens_json: str           # may be empty — JSON blob for multi-token
+    nwws_jid: str = field(repr=False)
+    nwws_password: str = field(repr=False)
+    icecast_source_password: str = field(repr=False)
+    icecast_admin_password: str = field(repr=False)    # may be empty
+    icecast_relay_password: str = field(repr=False)    # may be empty
+    api_token: str = field(repr=False)                 # may be empty
+    api_tokens_json: str = field(repr=False)           # may be empty — JSON blob for multi-token
     liquidsoap_host: str
     liquidsoap_port: int
 
@@ -829,6 +869,331 @@ def _upper_list(value: Any) -> List[str]:
         out.append(token)
         seen.add(token)
     return out
+
+
+_AUTH_SCOPE_RE = re.compile(r"^(?:\*|[a-z][a-z0-9_-]*:[a-z][a-z0-9_-]*)$")
+
+_DEFAULT_ADMIN_SCOPES = frozenset(
+    {
+        "read:health",
+        "read:status",
+        "read:alerts",
+        "read:config",
+        "control:cycle",
+        "control:mode",
+        "control:tests",
+        "control:originate",
+        "control:audio",
+        "control:inserts",
+        "control:config",
+    }
+)
+_KNOWN_API_SCOPES = _DEFAULT_ADMIN_SCOPES | {"*"}
+
+
+def _auth_error(
+    kind: str,
+    path: str,
+    message: str,
+    *,
+    details: dict[str, Any] | None = None,
+) -> AuthConfigurationError:
+    return AuthConfigurationError(
+        kind=kind,
+        path=path,
+        message=message,
+        details=details,
+    )
+
+
+def _parse_auth_mode(value: Any) -> AuthMode:
+    if not isinstance(value, str):
+        raise _auth_error(
+            "invalid_type",
+            "api.auth.mode",
+            "Authentication mode must be a string.",
+            details={"expected": "string"},
+        )
+    normalized = value.strip().lower()
+    if not normalized:
+        raise _auth_error(
+            "empty_value",
+            "api.auth.mode",
+            "Authentication mode must not be empty.",
+        )
+    try:
+        return AuthMode(normalized)
+    except ValueError as exc:
+        raise _auth_error(
+            "unknown_value",
+            "api.auth.mode",
+            "Authentication mode is not supported.",
+            details={"supported": [mode.value for mode in AuthMode]},
+        ) from exc
+
+
+def _validate_scope(value: Any, *, path: str) -> str:
+    if not isinstance(value, str):
+        raise _auth_error(
+            "invalid_type",
+            path,
+            "API scopes must be strings.",
+            details={"expected": "string"},
+        )
+    if (
+        value != value.strip()
+        or not value
+        or not _AUTH_SCOPE_RE.fullmatch(value)
+        or value not in _KNOWN_API_SCOPES
+    ):
+        raise _auth_error(
+            "malformed_scope",
+            path,
+            "API scope value is malformed.",
+        )
+    return value
+
+
+def _deduplicate_scopes(values: list[str], *, path: str) -> frozenset[str]:
+    if not values:
+        raise _auth_error("empty_scope", path, "API scope configuration must not be empty.")
+    if len(values) != len(set(values)):
+        raise _auth_error("duplicate_scope", path, "API scope configuration contains a duplicate.")
+    return frozenset(values)
+
+
+def _parse_scope_string(value: Any, *, path: str) -> tuple[frozenset[str], bool]:
+    if not isinstance(value, str):
+        raise _auth_error(
+            "invalid_type",
+            path,
+            "API scopes must be a space-separated string.",
+            details={"expected": "string"},
+        )
+    if not value or value != value.strip():
+        raise _auth_error("empty_scope", path, "API scope configuration must not be empty.")
+
+    legacy = "," in value
+    if legacy:
+        if any(char.isspace() for char in value):
+            raise _auth_error(
+                "mixed_scope_delimiters",
+                path,
+                "API scopes must not mix comma and whitespace delimiters.",
+            )
+        raw_scopes = value.split(",")
+    else:
+        if any(char.isspace() and char != " " for char in value):
+            raise _auth_error(
+                "malformed_scope",
+                path,
+                "API scopes must use a single ASCII space delimiter.",
+            )
+        raw_scopes = value.split(" ")
+
+    if any(not scope for scope in raw_scopes):
+        raise _auth_error("empty_scope", path, "API scope configuration contains an empty entry.")
+    scopes = [_validate_scope(scope, path=path) for scope in raw_scopes]
+    return _deduplicate_scopes(scopes, path=path), legacy
+
+
+def _parse_scope_list(value: Any, *, path: str) -> frozenset[str]:
+    if not isinstance(value, list):
+        raise _auth_error(
+            "invalid_type",
+            path,
+            "Multi-token API scopes must be a JSON array.",
+            details={"expected": "array"},
+        )
+    scopes = [
+        _validate_scope(scope, path=f"{path}[{index}]")
+        for index, scope in enumerate(value)
+    ]
+    return _deduplicate_scopes(scopes, path=path)
+
+
+def _validate_static_token(value: Any, *, path: str) -> str:
+    if not isinstance(value, str):
+        raise _auth_error(
+            "invalid_type",
+            path,
+            "Static API credential material must be a string.",
+            details={"expected": "string"},
+        )
+    if (
+        not value
+        or value != value.strip()
+        or any(char.isspace() for char in value)
+        or value.casefold() in {"changeme", "yourtoken"}
+    ):
+        raise _auth_error(
+            "invalid_credential",
+            path,
+            "Static API credential material is absent or malformed.",
+        )
+    return value
+
+
+def _parse_static_credentials(
+    *,
+    single_token: str,
+    tokens_json: str,
+    subject: Any,
+    scope_value: Any,
+    scope_path: str,
+) -> tuple[tuple[StaticCredentialConfig, ...], bool]:
+    if single_token and tokens_json:
+        raise _auth_error(
+            "conflicting_credentials",
+            "api.auth.credentials",
+            "Configure exactly one static API credential source.",
+        )
+
+    if tokens_json:
+        try:
+            parsed = json.loads(tokens_json)
+        except json.JSONDecodeError as exc:
+            raise _auth_error(
+                "invalid_credentials_json",
+                "SEASONAL_API_TOKENS_JSON",
+                "Static API credential JSON is invalid.",
+            ) from exc
+        if not isinstance(parsed, dict) or not parsed:
+            raise _auth_error(
+                "invalid_credentials_json",
+                "SEASONAL_API_TOKENS_JSON",
+                "Static API credential JSON must be a non-empty object.",
+            )
+
+        credentials: list[StaticCredentialConfig] = []
+        for index, (token_value, metadata) in enumerate(parsed.items()):
+            token = _validate_static_token(
+                token_value,
+                path=f"SEASONAL_API_TOKENS_JSON.credentials[{index}]",
+            )
+            if not isinstance(metadata, dict):
+                raise _auth_error(
+                    "invalid_credential_metadata",
+                    f"SEASONAL_API_TOKENS_JSON.credentials[{index}]",
+                    "Static API credential metadata must be an object.",
+                )
+            raw_subject = metadata.get("subject", "api-user")
+            if not isinstance(raw_subject, str) or not raw_subject.strip():
+                raise _auth_error(
+                    "invalid_subject",
+                    f"SEASONAL_API_TOKENS_JSON.credentials[{index}].subject",
+                    "Static API credential subject must be a non-empty string.",
+                )
+            raw_scopes = metadata.get("scopes", ["*"])
+            scopes = _parse_scope_list(
+                raw_scopes,
+                path=f"SEASONAL_API_TOKENS_JSON.credentials[{index}].scopes",
+            )
+            credentials.append(
+                StaticCredentialConfig(
+                    token=token,
+                    subject=raw_subject.strip(),
+                    scopes=scopes,
+                )
+            )
+        return tuple(credentials), False
+
+    token = _validate_static_token(single_token, path="SEASONAL_API_TOKEN")
+    if not isinstance(subject, str) or not subject.strip():
+        raise _auth_error(
+            "invalid_subject",
+            "api.auth.subject",
+            "Static API credential subject must be a non-empty string.",
+        )
+    if scope_value is None:
+        scopes = _DEFAULT_ADMIN_SCOPES
+        legacy_scope = False
+    else:
+        scopes, legacy_scope = _parse_scope_string(scope_value, path=scope_path)
+    return (
+        (
+            StaticCredentialConfig(
+                token=token,
+                subject=subject.strip(),
+                scopes=scopes,
+            ),
+        ),
+        legacy_scope,
+    )
+
+
+def _load_api_auth_config(api_raw: Any) -> ApiAuthConfig:
+    if not isinstance(api_raw, dict):
+        raise _auth_error(
+            "invalid_type",
+            "api",
+            "API configuration must be an object.",
+            details={"expected": "object"},
+        )
+
+    auth_present = "auth" in api_raw
+    auth_raw = api_raw.get("auth")
+    auth_block = auth_raw if isinstance(auth_raw, dict) else None
+    if auth_present and auth_block is None:
+        raise _auth_error(
+            "invalid_type",
+            "api.auth",
+            "API authentication configuration must be an object.",
+            details={"expected": "object"},
+        )
+
+    legacy_fields = {"scopes", "subject"}.intersection(api_raw)
+    if auth_present and legacy_fields:
+        raise _auth_error(
+            "conflicting_fields",
+            "api.auth",
+            "Legacy and current API authentication fields must not be combined.",
+            details={"legacy_fields": sorted(legacy_fields)},
+        )
+
+    single_token = os.environ.get("SEASONAL_API_TOKEN", "")
+    tokens_json = os.environ.get("SEASONAL_API_TOKENS_JSON", "")
+
+    if auth_block is not None:
+        if "mode" not in auth_block:
+            raise _auth_error(
+                "missing_value",
+                "api.auth.mode",
+                "Authentication mode is required in the current API auth configuration.",
+            )
+        mode = _parse_auth_mode(auth_block["mode"])
+        subject = auth_block.get("subject", "local-admin")
+        scope_value = auth_block.get("scopes")
+        scope_path = "api.auth.scopes"
+        legacy_mode = False
+    else:
+        mode = AuthMode.STATIC
+        subject = api_raw.get("subject", "local-admin")
+        scope_value = api_raw.get("scopes")
+        scope_path = "api.scopes"
+        legacy_mode = True
+
+    if mode in {AuthMode.EXCHANGE, AuthMode.HYBRID}:
+        raise _auth_error(
+            "authenticator_unavailable",
+            "api.auth.mode",
+            "The configured authentication mode requires an exchange authenticator that is unavailable.",
+            details={"mode": mode.value, "available_modes": [AuthMode.STATIC.value]},
+        )
+
+    credentials, legacy_scope = _parse_static_credentials(
+        single_token=single_token,
+        tokens_json=tokens_json,
+        subject=subject,
+        scope_value=scope_value,
+        scope_path=scope_path,
+    )
+    return ApiAuthConfig(
+        mode=mode,
+        credentials=credentials,
+        legacy_mode_normalized=legacy_mode,
+        legacy_scope_normalized=legacy_scope,
+    )
 
 
 def load_config(path: str) -> AppConfig:
@@ -1469,14 +1834,13 @@ def load_config(path: str) -> AppConfig:
     # ------------------------------------------------------------------
     api_raw = raw.get("api", {})
     api = ApiConfig(
+        auth=_load_api_auth_config(api_raw),
         allow_remote=bool(api_raw.get("allow_remote", False)),
         audio_max_bytes=int(api_raw.get("audio_max_bytes", 20971520)),
         audio_max_seconds=int(api_raw.get("audio_max_seconds", 180)),
         audio_ttl_seconds=int(api_raw.get("audio_ttl_seconds", 86400)),
         ffmpeg_bin=str(api_raw.get("ffmpeg_bin", "ffmpeg")),
         full_eas_heightened=bool(api_raw.get("full_eas_heightened", False)),
-        scopes=str(api_raw.get("scopes", "")),
-        subject=str(api_raw.get("subject", "local-admin")),
         manual_full_eas_heightens=bool(api_raw.get("manual_full_eas_heightens", True)),
     )
 
@@ -1564,8 +1928,8 @@ def load_config(path: str) -> AppConfig:
         icecast_source_password=_env_required("ICECAST_SOURCE_PASSWORD"),
         icecast_admin_password=_env_str("ICECAST_ADMIN_PASSWORD", ""),
         icecast_relay_password=_env_str("ICECAST_RELAY_PASSWORD", ""),
-        api_token=_env_str("SEASONAL_API_TOKEN", ""),
-        api_tokens_json=_env_str("SEASONAL_API_TOKENS_JSON", ""),
+        api_token=os.environ.get("SEASONAL_API_TOKEN", ""),
+        api_tokens_json=os.environ.get("SEASONAL_API_TOKENS_JSON", ""),
         liquidsoap_host=_env_str("LIQUIDSOAP_TELNET_HOST", "127.0.0.1"),
         liquidsoap_port=_env_int("LIQUIDSOAP_TELNET_PORT", 1234),
     )

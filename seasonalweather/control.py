@@ -383,6 +383,15 @@ class OrchestratorControl:
                 "toneout_product_types": list(cfg.policy.toneout_product_types),
                 "min_tone_gap_seconds": cfg.policy.min_tone_gap_seconds,
             },
+            "api": {
+                "auth": {
+                    "mode": cfg.api.auth.mode.value,
+                    "credential_count": len(cfg.api.auth.credentials),
+                    "legacy_mode_normalized": cfg.api.auth.legacy_mode_normalized,
+                    "legacy_scope_normalized": cfg.api.auth.legacy_scope_normalized,
+                },
+                "allow_remote": cfg.api.allow_remote,
+            },
             "tts": {
                 "backend": cfg.tts.backend,
                 "voice": cfg.tts.voice,

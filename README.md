@@ -157,9 +157,10 @@ NWWS_JID=yourjid@nwws-oi.weather.gov
 NWWS_PASSWORD=yourpassword
 ICECAST_SOURCE_PASSWORD=yourpassword
 
-# Optional — only needed if using the HTTP API with auth
-SEASONAL_API_TOKEN=yourtoken
-SEASONAL_API_TOKENS_JSON='{ ... }'
+# Required for the canonical static API authentication mode
+# Configure exactly one of these credential sources.
+SEASONAL_API_TOKEN=replace-with-a-strong-random-token
+# SEASONAL_API_TOKENS_JSON='{ ... }'
 
 # Optional — only if you changed the Liquidsoap telnet port
 LIQUIDSOAP_TELNET_HOST=127.0.0.1
@@ -173,13 +174,44 @@ VOICETEXT_PAUL_WINEDEBUG=-all,+seh,+tid,+timestamp
 
 Everything else that was previously in `.env` (SEASONAL_CAP_*, SEASONAL_ERN_*, SEASONAL_TESTS_*, SEASONAL_CYCLE_*, VOICETEXT_PAUL_RETRIES, etc.) is now in `config.yaml`.
 
+### API authentication modes
+
+`api.auth.mode` is required in current configuration and accepts exactly
+`static`, `exchange`, or `hybrid`. `static` retains the long-lived bearer-token
+model for development, recovery, loopback-only administration, minimal
+deployments, and break-glass access. `hybrid` is migration-only compatibility,
+not a preferred steady state.
+
+Operational `exchange` and `hybrid` authentication are not available until the
+P1-03 token-exchange work is implemented. Selecting either mode currently stops
+configuration loading with a structured compatibility error; neither mode
+degrades to static or unauthenticated access.
+
+Canonical static configuration uses `api.auth.mode: static`, a non-placeholder
+`SEASONAL_API_TOKEN`, and one space-separated `api.auth.scopes` string. The
+multi-token compatibility form uses `SEASONAL_API_TOKENS_JSON` with a JSON
+array of scope strings for each token. Configure exactly one credential source.
+Missing, empty, whitespace-only, malformed, placeholder, or conflicting
+credentials fail closed. Existing configuration that has no `api.auth` block
+may normalize to static only when exactly one valid legacy credential source is
+present; the effective configuration reports that normalization. Legacy
+comma-separated single-token scopes remain accepted only as an unmixed
+compatibility form.
+
 ## HTTP API contract
 
 The SeasonalWeather API publishes an OpenAPI 3.1 document at `/openapi.json` and interactive Swagger UI at `/docs`. The document includes the public station-feed routes and authenticated control-plane routes.
 
 Successful JSON endpoints use `application/json`. API errors use RFC 9457 Problem Details with `application/problem+json`; callers should read the standard `type`, `title`, `status`, `detail`, and `instance` members and may also use the SeasonalWeather extensions `code`, `details`, `errors`, and `request_id`. The same request identifier is returned in the `X-Request-ID` response header.
 
-`/v1/handled-alerts` remains public and cacheable for SPA/radio clients. Authenticated routes require Bearer tokens and mutating JSON routes require an `Idempotency-Key` header. Scheduled broadcast inserts live under `/v1/inserts/*` and require the `control:inserts` scope; they add bounded, non-SAME text or uploaded-audio segments into the normal cycle without flushing the Liquidsoap cycle queue.
+`/openapi.json`, `/docs`, `/docs/oauth2-redirect`, `/redoc`, and
+`/v1/handled-alerts` are public; the handled-alerts route remains cacheable for
+SPA/radio clients. All other current application routes, including `/healthz`,
+require a Bearer token and their declared scope. Mutating JSON routes also
+require an `Idempotency-Key` header. Scheduled broadcast inserts live under
+`/v1/inserts/*` and require the `control:inserts` scope; they add bounded,
+non-SAME text or uploaded-audio segments into the normal cycle without flushing
+the Liquidsoap cycle queue.
 
 For the wrapper install/runtime contract, see `docs/runtime-wrappers.md`.
 

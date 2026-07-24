@@ -476,14 +476,16 @@ station_feed:
 
 # HTTP API server settings
 api:
+  auth:
+    mode: "static"               # static | exchange | hybrid (exchange/hybrid require P1-03 and currently fail closed)
+    subject: "local-admin"       # subject name for SEASONAL_API_TOKEN
+    scopes: "read:health read:status read:alerts read:config control:cycle control:mode control:tests control:originate control:audio control:inserts control:config"
   allow_remote: false           # bind to 0.0.0.0 if true; localhost-only if false
   audio_max_bytes: 20971520     # 20 MiB — max upload size for audio inject endpoint
   audio_max_seconds: 180        # max audio clip duration accepted
   audio_ttl_seconds: 86400      # how long injected audio files are kept on disk
   ffmpeg_bin: "ffmpeg"
   full_eas_heightened: false    # entering heightened mode on full EAS cut-ins
-  scopes: ""                    # space-separated scopes for SEASONAL_API_TOKEN if used
-  subject: "local-admin"        # subject name for the implicit local token
   manual_full_eas_heightens: true
 
 # Cross-source alert deduplication window

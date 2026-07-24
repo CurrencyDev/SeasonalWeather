@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
-from fastapi.testclient import TestClient
+import httpx
 
 from seasonalweather.api.api import create_app
 from seasonalweather.api.auth import ApiPrincipal, get_api_principal
@@ -21,10 +22,26 @@ class FakeControl:
         return {}
 
 
-def test_openapi_is_31_and_documents_problem_details() -> None:
-    client = TestClient(create_app(FakeControl()))
+def _request(
+    app: Any,
+    method: str,
+    path: str,
+    *,
+    json: dict[str, Any] | None = None,
+) -> httpx.Response:
+    async def send() -> httpx.Response:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            return await client.request(method, path, json=json)
 
-    res = client.get("/openapi.json")
+    return asyncio.run(send())
+
+
+def test_openapi_is_31_and_documents_problem_details() -> None:
+    res = _request(create_app(FakeControl()), "GET", "/openapi.json")
 
     assert res.status_code == 200
     spec = res.json()
@@ -38,9 +55,7 @@ def test_openapi_is_31_and_documents_problem_details() -> None:
 
 
 def test_public_handled_alerts_still_returns_feed_json() -> None:
-    client = TestClient(create_app(FakeControl()))
-
-    res = client.get("/v1/handled-alerts")
+    res = _request(create_app(FakeControl()), "GET", "/v1/handled-alerts")
 
     assert res.status_code == 200
     assert res.headers["content-type"].startswith("application/json")
@@ -59,9 +74,7 @@ def test_api_errors_are_problem_details() -> None:
         return ApiPrincipal(subject="test", scopes=frozenset({"*"}), client_host="testclient")
 
     app.dependency_overrides[get_api_principal] = fake_principal
-    client = TestClient(app)
-
-    res = client.post("/v1/cycle/rebuild", json={"reason": "test"})
+    res = _request(app, "POST", "/v1/cycle/rebuild", json={"reason": "test"})
 
     assert res.status_code == 400
     assert res.headers["content-type"].startswith("application/problem+json")

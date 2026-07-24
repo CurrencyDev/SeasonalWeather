@@ -5,6 +5,8 @@ from typing import Any
 from fastapi import FastAPI
 from fastapi.openapi.utils import get_openapi
 
+from .auth import ROUTE_AUTH_POLICIES
+
 
 API_VERSION = "1.1.0"
 PROBLEM_JSON = "application/problem+json"
@@ -144,7 +146,16 @@ STATION_FEED_SCHEMA: dict[str, Any] = {
 CONFIG_SUMMARY_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": True,
-    "required": ["config_path", "station", "cycle", "observations", "nwws", "policy", "tts"],
+    "required": [
+        "config_path",
+        "station",
+        "cycle",
+        "observations",
+        "nwws",
+        "policy",
+        "api",
+        "tts",
+    ],
     "properties": {
         "config_path": {"type": "string"},
         "config_sha256": {"type": ["string", "null"]},
@@ -153,6 +164,7 @@ CONFIG_SUMMARY_SCHEMA: dict[str, Any] = {
         "observations": {"type": "object", "additionalProperties": True},
         "nwws": {"type": "object", "additionalProperties": True},
         "policy": {"type": "object", "additionalProperties": True},
+        "api": {"type": "object", "additionalProperties": True},
         "tts": {"type": "object", "additionalProperties": True},
     },
 }
@@ -226,6 +238,10 @@ def install_openapi(app: FastAPI) -> None:
         schema["jsonSchemaDialect"] = "https://json-schema.org/draft/2020-12/schema"
         components = schema.setdefault("components", {})
         schemas = components.setdefault("schemas", {})
+        components.setdefault("securitySchemes", {})["BearerAuth"] = {
+            "type": "http",
+            "scheme": "bearer",
+        }
         schemas.update(
             {
                 "ProblemDetails": PROBLEM_DETAILS_SCHEMA,
@@ -236,6 +252,14 @@ def install_openapi(app: FastAPI) -> None:
                 "ConfigSummary": CONFIG_SUMMARY_SCHEMA,
             }
         )
+        for path, path_item in schema.get("paths", {}).items():
+            for method, operation in path_item.items():
+                if not isinstance(operation, dict):
+                    continue
+                policy = ROUTE_AUTH_POLICIES.get((method.upper(), path))
+                if policy is None:
+                    continue
+                operation["security"] = [] if policy.public else [{"BearerAuth": []}]
         app.openapi_schema = schema
         return app.openapi_schema
 
