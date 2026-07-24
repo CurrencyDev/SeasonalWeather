@@ -1,0 +1,60 @@
+version = 1
+
+controller_roots = ["seasonalweather"]
+worker_roots = ["seasonalweather.worker", "seasonalweather.workers"]
+
+worker_only_imports = [
+  "seasonalweather.worker",
+  "seasonalweather.workers",
+]
+
+controller_authority_imports = [
+  "seasonalweather.alerts",
+  "seasonalweather.broadcast",
+  "seasonalweather.config",
+  "seasonalweather.database",
+  "seasonalweather.liquidsoap_telnet",
+]
+
+api_roots = ["seasonalweather/api"]
+api_forbidden_imports = [
+  "seasonalweather.database",
+  "seasonalweather.liquidsoap_telnet",
+  "seasonalweather.tts",
+  "sqlite3",
+  "sqlalchemy",
+]
+
+domain_roots = [
+  "seasonalweather/domain",
+  "seasonalweather/validation",
+]
+domain_forbidden_imports = [
+  "fastapi",
+  "starlette",
+  "uvicorn",
+  "sqlalchemy",
+  "pymysql",
+]
+
+script_roots = ["scripts"]
+script_forbidden_imports = [
+  "seasonalweather.alerts",
+  "seasonalweather.broadcast",
+  "seasonalweather.config",
+  "seasonalweather.database",
+  "seasonalweather.tts",
+]
+script_forbidden_shell_terms = [
+  "from seasonalweather.config import",
+  "import seasonalweather.config",
+  "sqlite3 ",
+  "sqlalchemy",
+  "pymysql",
+  "yaml.safe_load",
+]
+
+compatibility_default_terms = [
+  "embedded_executor",
+  "embedded_worker",
+]

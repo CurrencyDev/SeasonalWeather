@@ -87,6 +87,25 @@ Before considering a change complete, verify:
 - generated-audio housekeeping does not delete DB-referenced active/cycle audio
 - no new absolute paths or local environment assumptions were introduced
 
+## Architecture and quality controls
+
+- Activate the repository virtual environment and run `make quality` before
+  declaring a code change complete. CI uses the same target.
+- Keep API routes behind application/control services; do not add direct
+  database, TTS, Liquidsoap, or filesystem mutation to route modules.
+- Controller code must not import worker-only handlers. Future worker handlers
+  must not import controller-owned configuration commit, persistence, alert
+  lifecycle, Liquidsoap, or publication authorities.
+- Register long-running tasks with lifecycle supervision. Do not discard the
+  task returned by `asyncio.create_task()` or `asyncio.ensure_future()`.
+- Keep scripts as orchestration entrypoints; shared configuration, domain,
+  persistence, and service behavior belongs in importable application code.
+- Update a quality ratchet downward when debt is removed. Any new exception
+  must use `quality/exceptions.toml` and include the rule, rationale, owner,
+  scope, review date, and removal condition.
+- Image boundaries are currently declared not applicable. The first packet
+  that adds image definitions must replace that declaration with content rules.
+
 ## Avoid
 - hardcoding deployment-only paths into repo code unless already established by project convention
 - changing unrelated alert semantics while fixing UI or logging presentation

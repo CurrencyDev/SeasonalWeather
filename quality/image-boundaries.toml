@@ -1,0 +1,6 @@
+version = 1
+status = "not_applicable"
+reason = "P1-01 does not introduce controller or worker images; no Dockerfile or Compose file exists at v0.17.0."
+owner = "SeasonalWeather maintainers"
+review_date = "2026-10-23"
+activation_condition = "Replace this declaration with per-image content rules in the packet that first adds image definitions."

@@ -185,6 +185,13 @@ For the wrapper install/runtime contract, see `docs/runtime-wrappers.md`.
 
 ---
 
+## Contributing
+
+Development setup, change standards, architecture ownership, and required
+quality checks are documented in [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+---
+
 ## Quick start
 
 ### 1) Clone to a staging path
