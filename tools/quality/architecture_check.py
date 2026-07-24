@@ -214,6 +214,36 @@ def scan(root: Path, config: dict[str, Any], exceptions: list[dict[str, Any]] | 
                         )
                     )
 
+        if relative.startswith("seasonalweather/") and not _under(
+            relative,
+            config.get("sqlite_owner_roots", []),
+        ):
+            for imported, line in imports:
+                if imported == "sqlite3":
+                    findings.append(
+                        Finding(
+                            relative,
+                            line,
+                            "SWARCH009",
+                            "SQLite access must remain in an owned database/repository module",
+                        )
+                    )
+
+        if _under(relative, config.get("job_store_roots", [])):
+            for imported, line in imports:
+                if _matches_prefix(
+                    imported,
+                    config.get("job_store_forbidden_imports", []),
+                ):
+                    findings.append(
+                        Finding(
+                            relative,
+                            line,
+                            "SWARCH010",
+                            f"job repository imports execution/publication authority {imported}",
+                        )
+                    )
+
         if _under(relative, config["script_roots"]):
             for imported, line in imports:
                 if _matches_prefix(imported, config["script_forbidden_imports"]):

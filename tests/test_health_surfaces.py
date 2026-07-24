@@ -407,6 +407,7 @@ def test_runtime_report_is_truthful_bounded_and_secret_free(
     runtime = SimpleNamespace(
         cfg=SimpleNamespace(
             database=SimpleNamespace(enabled=False),
+            jobs=SimpleNamespace(enabled=True, required=True),
             api=SimpleNamespace(auth=SimpleNamespace(mode=SimpleNamespace(value="static"))),
             ipaws=SimpleNamespace(enabled=False),
             ern=SimpleNamespace(enabled=False),
@@ -431,6 +432,24 @@ def test_runtime_report_is_truthful_bounded_and_secret_free(
         runtime,
         command_store=CommandStore(),
         auth_service=None,
+        job_service=SimpleNamespace(
+            health=lambda: SimpleNamespace(
+                initialized=True,
+                wal=True,
+                schema_version=1,
+                reconciliation_required=0,
+                details=lambda: {
+                    "initialized": True,
+                    "schema_version": 1,
+                    "wal": True,
+                    "admission_open": True,
+                    "active_leases": 0,
+                    "overdue_jobs": 0,
+                    "cancellation_backlog": 0,
+                    "reconciliation_required": 0,
+                },
+            )
+        ),
     )
 
     async def collect_with_conductor() -> dict[str, Any]:
@@ -457,6 +476,8 @@ def test_runtime_report_is_truthful_bounded_and_secret_free(
     assert components["tts"]["state"] == "healthy"
     assert components["segments"]["state"] == "degraded"
     assert components["segments"]["details"]["stale_count"] == 1
+    assert components["job_repository"]["state"] == "healthy"
+    assert components["job_repository"]["required"] is True
     assert components["workers"]["state"] == "not_applicable"
     assert components["postgresql"]["state"] == "not_applicable"
     assert components["redis"]["state"] == "not_applicable"

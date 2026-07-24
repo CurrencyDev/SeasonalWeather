@@ -13,7 +13,24 @@ controller_authority_imports = [
   "seasonalweather.broadcast",
   "seasonalweather.config",
   "seasonalweather.database",
+  "seasonalweather.job_store",
   "seasonalweather.liquidsoap_telnet",
+]
+
+sqlite_owner_roots = [
+  "seasonalweather/database",
+  "seasonalweather/job_store",
+]
+
+job_store_roots = ["seasonalweather/job_store"]
+job_store_forbidden_imports = [
+  "seasonalweather.api",
+  "seasonalweather.broadcast",
+  "seasonalweather.liquidsoap_telnet",
+  "seasonalweather.nwws",
+  "seasonalweather.tts",
+  "seasonalweather.worker",
+  "seasonalweather.workers",
 ]
 
 api_roots = ["seasonalweather/api"]

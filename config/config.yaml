@@ -582,6 +582,24 @@ database:
     tmp_file_grace_seconds: 900               # prune stale temp files after 15m
     wal_checkpoint: true
 
+# Controller-only durable bounded jobs. This database is deliberately separate
+# from database.path and must be on a local filesystem (NFS/SMB are unsupported).
+# Disabled until a deployment explicitly provisions the path and future
+# consumers; P1-07 adds repository/scheduler authority, not worker execution.
+jobs:
+  enabled: false
+  required: false
+  path: "/var/lib/seasonalweather/jobs.sqlite3"
+  busy_timeout_ms: 5000
+  lease_seconds: 60
+  assignment_ack_seconds: 10
+  progress_retention: 100
+  event_retention: 500
+  reconciliation_batch_size: 100
+  payload_max_bytes: 65536
+  result_max_bytes: 65536
+  shutdown_reconciliation_seconds: 5.0
+
 # Service area = union of these 4 KLWX transmitters
 # Source: https://www.weather.gov/lwx/nwrtables (transmitter county SAME/FIPS lists)
 service_area:

@@ -12,9 +12,10 @@ SeasonalWeather distinguishes requested outcomes from bounded execution:
   supervised services. They are not jobs.
 
 The contracts under `seasonalweather.commands` and `seasonalweather.jobs` are
-persistence-neutral. The existing command application service adapts typed
-commands to the controller database. P1-06 does not add job persistence,
-scheduling, leases, workers, or handlers.
+persistence-neutral. The command application service adapts typed commands to
+the operational controller database. The separate controller-owned durable job
+repository and non-executing scheduler are documented in
+[`durable-job-repository.md`](durable-job-repository.md).
 
 ## Command contract
 
@@ -72,8 +73,8 @@ pending -> leased -> running -> succeeded
    +----------+---------+----> superseded
 ```
 
-P1-06 models lease identity only so later persistence can reject stale attempt
-updates. It does not implement acquisition, renewal, or recovery. An actual
+The durable repository uses this lease identity to reject stale attempt
+updates and implements acquisition, renewal, and recovery. An actual
 attempt receives a positive, monotonically increasing attempt number and a new
 attempt identity. Lease owner, attempt identity, lease expiry, deadline, and
 state must all match before start or completion.
@@ -151,8 +152,9 @@ parameters; they describe requirements only and do not qualify workers.
 refresher/conductor and therefore returns `202 Accepted`. The response contains
 the stable command ID, `accepted` state, request ID, and
 `/v1/commands/{command_id}` status URL. It does not claim the cycle was rebuilt.
-Until durable job/finalization integration exists, this transitional command
-remains accepted rather than fabricating completion.
+Until the cycle-rebuild consumer and controller-finalization path are connected
+to the durable repository, this transitional command remains accepted rather
+than fabricating completion.
 
 Operations that await their full declared controller mutation retain their
 current synchronous status. Authentication, route policy, idempotency, RFC
@@ -167,11 +169,9 @@ lifecycle transitions.
 
 The following are deliberately not implemented here:
 
-- P1-07: durable job/attempt storage, transactional scheduling, leases, retry
-  scheduling, crash reconciliation, and result commitment;
 - P1-08: SWWP messages, connections, sessions, and peers;
 - P1-09: dynamic worker capability, health, capacity, epoch, and qualification;
 - P1-10: artifact staging, validation, promotion, and stale-result acceptance.
 
-No embedded executor is a production fallback. A deterministic executor may be
-used by future tests, but P1-06 adds no executor or worker runtime.
+No embedded executor is a production fallback. The P1-07 scheduler returns
+typed assignments but adds no executor or worker runtime.

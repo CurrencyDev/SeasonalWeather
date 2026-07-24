@@ -84,9 +84,10 @@ Admission is open only in `running`.
 - Source tasks cannot be started or reconnected. NWWS receives a permanent
   shutdown request before cancellation, so its normal reconnect loop cannot
   create another XMPP worker.
-- A typed `job_lease` admission class exists only as a future lifecycle hook.
-  No job, scheduler, repository, lease, retry, or reconciliation model is
-  implemented here.
+- Durable job admission and the typed `job_lease` admission class close at
+  drain. The controller-owned scheduler stops returning assignments, active
+  leases are reconciled within the configured shutdown bound, and the separate
+  job database is checkpointed.
 
 The alert Liquidsoap push is the current atomic publication boundary. A push
 that entered before drain may finish within `publication_seconds`. New entry
@@ -154,9 +155,8 @@ sum multiplied by the number of components.
 
 ## Current limits and future integration
 
-SeasonalWeather currently has no typed durable job repository or leases, so
-shutdown closes only the typed future admission hook and does not claim durable
-lease reconciliation. There are no remote workers or SWWP sessions to drain.
-Later job, worker, diagnostics, TTS-adapter, artifact-fencing, and normalized
-NWWS-source packets must integrate through these lifecycle and supervision
-boundaries without moving lifecycle authority into those subsystems.
+SeasonalWeather has a typed durable job repository and lease state, but no
+remote workers or SWWP sessions to drain. Later worker, diagnostics,
+TTS-adapter, artifact-fencing, and normalized NWWS-source packets must
+integrate through these lifecycle and supervision boundaries without moving
+lifecycle authority into those subsystems.

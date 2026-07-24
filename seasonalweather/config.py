@@ -776,6 +776,63 @@ class DatabaseConfig:
 
 
 @dataclass(frozen=True)
+class JobRepositoryConfig:
+    enabled: bool
+    required: bool
+    path: str
+    busy_timeout_ms: int
+    lease_seconds: int
+    assignment_ack_seconds: int
+    progress_retention: int
+    event_retention: int
+    reconciliation_batch_size: int
+    payload_max_bytes: int
+    result_max_bytes: int
+    shutdown_reconciliation_seconds: float
+
+    def validate(self, *, operational_database_path: str) -> None:
+        _validate_job_repository_identity(self, operational_database_path)
+        _validate_job_repository_timing(self)
+        _validate_job_repository_retention(self)
+        _validate_job_repository_sizes(self)
+
+
+def _validate_job_repository_identity(
+    cfg: JobRepositoryConfig,
+    operational_database_path: str,
+) -> None:
+    if cfg.enabled and not cfg.path.strip():
+        raise ValueError("jobs.path must be explicitly configured when jobs are enabled")
+    if cfg.enabled and Path(cfg.path).resolve() == Path(operational_database_path).resolve():
+        raise ValueError("jobs.path must be separate from database.path")
+    if cfg.required and not cfg.enabled:
+        raise ValueError("jobs.required cannot be true when jobs are disabled")
+
+
+def _validate_job_repository_timing(cfg: JobRepositoryConfig) -> None:
+    if not 100 <= cfg.busy_timeout_ms <= 30_000:
+        raise ValueError("jobs.busy_timeout_ms must be between 100 and 30000")
+    if not 1 <= cfg.assignment_ack_seconds < cfg.lease_seconds <= 3600:
+        raise ValueError("jobs lease timing must satisfy 1 <= assignment_ack_seconds < lease_seconds <= 3600")
+    if not 0.1 <= cfg.shutdown_reconciliation_seconds <= 30.0:
+        raise ValueError("jobs.shutdown_reconciliation_seconds must be between 0.1 and 30")
+
+
+def _validate_job_repository_retention(cfg: JobRepositoryConfig) -> None:
+    if not 1 <= cfg.progress_retention <= 1000 or not 1 <= cfg.event_retention <= 5000:
+        raise ValueError("jobs progress and event retention values are out of bounds")
+    if not 1 <= cfg.reconciliation_batch_size <= 1000:
+        raise ValueError("jobs.reconciliation_batch_size must be between 1 and 1000")
+
+
+def _validate_job_repository_sizes(cfg: JobRepositoryConfig) -> None:
+    if not 256 <= cfg.payload_max_bytes <= 1_048_576:
+        raise ValueError("jobs.payload_max_bytes must be between 256 and 1048576")
+    if not 256 <= cfg.result_max_bytes <= 1_048_576:
+        raise ValueError("jobs.result_max_bytes must be between 256 and 1048576")
+
+
+@dataclass(frozen=True)
 class ServiceAreaConfig:
     same_fips_all: List[str]
     transmitters: Dict[str, List[Dict[str, str]]]
@@ -825,6 +882,7 @@ class AppConfig:
     paths: PathsConfig
     lifecycle: LifecycleTimeouts
     database: DatabaseConfig
+    jobs: JobRepositoryConfig
     service_area: ServiceAreaConfig
 
     # subsystems
@@ -1962,6 +2020,24 @@ def load_config(path: str) -> AppConfig:
             wal_checkpoint=bool(db_hk_raw.get("wal_checkpoint", True)),
         ),
     )
+    jobs_raw = raw.get("jobs", {}) or {}
+    jobs = JobRepositoryConfig(
+        enabled=bool(jobs_raw.get("enabled", False)),
+        required=bool(jobs_raw.get("required", False)),
+        path=str(jobs_raw.get("path", "")).strip(),
+        busy_timeout_ms=int(jobs_raw.get("busy_timeout_ms", 5000)),
+        lease_seconds=int(jobs_raw.get("lease_seconds", 60)),
+        assignment_ack_seconds=int(jobs_raw.get("assignment_ack_seconds", 10)),
+        progress_retention=int(jobs_raw.get("progress_retention", 100)),
+        event_retention=int(jobs_raw.get("event_retention", 500)),
+        reconciliation_batch_size=int(jobs_raw.get("reconciliation_batch_size", 100)),
+        payload_max_bytes=int(jobs_raw.get("payload_max_bytes", 65536)),
+        result_max_bytes=int(jobs_raw.get("result_max_bytes", 65536)),
+        shutdown_reconciliation_seconds=float(
+            jobs_raw.get("shutdown_reconciliation_seconds", 5.0)
+        ),
+    )
+    jobs.validate(operational_database_path=database.path)
 
     # ------------------------------------------------------------------
     # service_area
@@ -2059,6 +2135,7 @@ def load_config(path: str) -> AppConfig:
         paths=paths,
         lifecycle=lifecycle,
         database=database,
+        jobs=jobs,
         service_area=service_area,
         same=same,
         cap=cap,

@@ -75,8 +75,11 @@ Freeze products are supported natively. `FZ.W` maps to SAME `FZW` (**Freeze Warn
 - OpenAPI 3.1 API document at `/openapi.json`; Swagger UI remains available at `/docs`.
 - RFC 9457 Problem Details error responses (`application/problem+json`) with `code`, `details`, and `request_id` extensions for operator/debug use.
 - Typed command and bounded-job contracts are documented in
-  [`docs/command-job-contracts.md`](docs/command-job-contracts.md); durable job
-  scheduling and external workers are not yet implemented.
+  [`docs/command-job-contracts.md`](docs/command-job-contracts.md). A separate
+  controller-owned WAL job database and non-executing durable scheduler are
+  documented in
+  [`docs/durable-job-repository.md`](docs/durable-job-repository.md); external
+  workers are not yet implemented.
 - Public handled-alerts feed API (`/v1/handled-alerts`) for external UI consumption, backed by SQLite.
   Persisted station-feed rows remain authoritative across restarts; startup does not synthesize degraded public records from AlertTracker state.
 

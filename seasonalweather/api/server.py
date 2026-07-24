@@ -15,6 +15,12 @@ from ..config import AuthMode, load_config
 from ..control import OrchestratorControl
 from ..database.bootstrap import bootstrap_database_from_config
 from ..health_service import build_runtime_health_service
+from ..job_store import (
+    CommandJobCoordinator,
+    DurableJobService,
+    JobDatabase,
+    JobRepository,
+)
 from ..lifecycle import Lifecycle, LifecycleState, TaskSupervisor
 from ..main import Orchestrator, _setup_logging
 from .api import create_app
@@ -25,6 +31,44 @@ log = logging.getLogger("seasonalweather.api")
 class _ControllerOwnedUvicornServer(uvicorn.Server):
     def install_signal_handlers(self) -> None:
         """The SeasonalWeather controller is the sole signal owner."""
+
+
+def _build_job_service(cfg: Any, lifecycle: Lifecycle) -> DurableJobService | None:
+    if not cfg.jobs.enabled:
+        return None
+    job_database = JobDatabase(
+        path=cfg.jobs.path,
+        busy_timeout_ms=cfg.jobs.busy_timeout_ms,
+    )
+    job_repository = JobRepository(
+        job_database,
+        payload_max_bytes=cfg.jobs.payload_max_bytes,
+        result_max_bytes=cfg.jobs.result_max_bytes,
+        progress_retention=cfg.jobs.progress_retention,
+        event_retention=cfg.jobs.event_retention,
+    )
+    return DurableJobService(
+        job_repository,
+        lifecycle,
+        reconciliation_batch_size=cfg.jobs.reconciliation_batch_size,
+    )
+
+
+async def _initialize_job_service(
+    job_service: DurableJobService | None,
+    command_store: CommandStore,
+    *,
+    database_available: bool,
+    reconciliation_batch_size: int,
+) -> None:
+    if job_service is None:
+        return
+    await asyncio.to_thread(job_service.initialize)
+    if database_available:
+        await CommandJobCoordinator(
+            job_service.repository,
+            command_store,
+        ).repair(limit=reconciliation_batch_size)
 
 
 def _install_signal_handlers(
@@ -55,6 +99,7 @@ async def run_api_server(*, config_path: str, host: str, port: int) -> None:
     )
     control = OrchestratorControl(orch, config_path=config_path)
     db = bootstrap_database_from_config(cfg) if getattr(cfg.database, "enabled", True) else None
+    job_service = _build_job_service(cfg, lifecycle)
     if cfg.api.auth.mode in {AuthMode.EXCHANGE, AuthMode.HYBRID} and db is None:
         raise RuntimeError("Exchange authentication requires the controller SQLite database.")
     auth_service = (
@@ -69,10 +114,17 @@ async def run_api_server(*, config_path: str, host: str, port: int) -> None:
         database=db,
         lifecycle=lifecycle,
     )
+    await _initialize_job_service(
+        job_service,
+        command_store,
+        database_available=db is not None,
+        reconciliation_batch_size=cfg.jobs.reconciliation_batch_size,
+    )
     health_service = build_runtime_health_service(
         orch,
         command_store=command_store,
         auth_service=auth_service,
+        job_service=job_service,
     )
     app = create_app(
         control,
@@ -153,6 +205,8 @@ async def run_api_server(*, config_path: str, host: str, port: int) -> None:
             await _close_resources(
                 orch=orch,
                 database=db,
+                job_service=job_service,
+                job_close_timeout_seconds=cfg.jobs.shutdown_reconciliation_seconds,
                 timeout_seconds=cfg.lifecycle.resource_close_seconds,
                 tts_timeout_seconds=cfg.lifecycle.tts_stop_seconds,
             )
@@ -264,6 +318,8 @@ async def _close_resources(
     *,
     orch: Orchestrator,
     database,
+    job_service,
+    job_close_timeout_seconds: float,
     timeout_seconds: float,
     tts_timeout_seconds: float,
 ) -> None:
@@ -274,6 +330,14 @@ async def _close_resources(
         )
     except Exception:
         log.warning("controller_resource_close_failed resource=nws_api")
+    if job_service is not None:
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(job_service.close),
+                timeout=job_close_timeout_seconds,
+            )
+        except Exception:
+            log.warning("controller_resource_close_failed resource=job_repository")
     if database is not None:
         try:
             await asyncio.wait_for(

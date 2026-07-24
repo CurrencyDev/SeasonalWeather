@@ -182,8 +182,7 @@ class HealthService:
         )
         lifecycle_state = str(self._lifecycle_state())
         ready = lifecycle_state == "running" and not any(
-            component.required and component.state in _UNREADY_STATES
-            for component in components
+            component.required and component.state in _UNREADY_STATES for component in components
         )
         if not ready:
             state = ComponentState.UNAVAILABLE
@@ -260,6 +259,7 @@ def build_runtime_health_service(
     *,
     command_store: Any,
     auth_service: Any,
+    job_service: Any = None,
     timeout_seconds: float = 1.0,
 ) -> HealthService:
     """Build probes from current controller-owned runtime capabilities."""
@@ -412,6 +412,45 @@ def build_runtime_health_service(
         )
 
     probes.append(ComponentProbe("command_admission", True, command_admission_probe))
+
+    jobs_cfg = getattr(cfg, "jobs", None)
+    jobs_enabled = bool(getattr(jobs_cfg, "enabled", False))
+    jobs_required = bool(getattr(jobs_cfg, "required", False))
+
+    async def job_repository_probe() -> HealthComponent:
+        if not jobs_enabled:
+            return _component(
+                "job_repository",
+                ComponentState.DISABLED,
+                False,
+                "disabled_by_configuration",
+            )
+        if job_service is None:
+            return _component(
+                "job_repository",
+                ComponentState.UNAVAILABLE,
+                jobs_required,
+                "repository_unavailable",
+            )
+        summary = job_service.health()
+        healthy = (
+            summary.initialized and summary.wal and summary.schema_version > 0 and summary.reconciliation_required == 0
+        )
+        return _component(
+            "job_repository",
+            ComponentState.HEALTHY if healthy else ComponentState.DEGRADED,
+            jobs_required,
+            "repository_operational" if healthy else "reconciliation_required",
+            details=summary.details(),
+        )
+
+    probes.append(
+        ComponentProbe(
+            "job_repository",
+            jobs_enabled and jobs_required,
+            job_repository_probe,
+        )
+    )
 
     auth_mode = str(getattr(cfg.api.auth.mode, "value", cfg.api.auth.mode))
     exchange_required = auth_mode in {"exchange", "hybrid"}
