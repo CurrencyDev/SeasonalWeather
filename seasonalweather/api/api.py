@@ -13,6 +13,14 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from ..auth.service import AuthenticationError, AuthenticationService
+from ..control import ControlError, OrchestratorControl
+from ..health_service import (
+    ComponentProbe,
+    ComponentState,
+    HealthComponent,
+    HealthService,
+)
 from .auth import ApiPrincipal, get_client_authentication, require_route_policy
 from .commands import CommandNotFoundError, CommandStore, IdempotencyConflictError
 from .models import (
@@ -44,9 +52,6 @@ from .openapi import (
     install_openapi,
     json_response,
 )
-from ..control import ControlError, OrchestratorControl
-from ..auth.service import AuthenticationError, AuthenticationService
-
 
 _CODE_RE = re.compile(r"[^a-z0-9_-]+")
 
@@ -188,8 +193,21 @@ def create_app(
     *,
     store: CommandStore | None = None,
     auth_service: AuthenticationService | None = None,
+    health_service: HealthService | None = None,
 ) -> FastAPI:
     command_store = store or CommandStore()
+    if health_service is None:
+        async def runtime_unavailable() -> HealthComponent:
+            return HealthComponent(
+                "runtime",
+                ComponentState.UNAVAILABLE,
+                True,
+                "health_service_unavailable",
+            )
+
+        health_service = HealthService(
+            [ComponentProbe("runtime", True, runtime_unavailable)]
+        )
     app = FastAPI(
         title="SeasonalWeather API",
         version=API_VERSION,
@@ -201,6 +219,7 @@ def create_app(
     app.state.control = control
     app.state.command_store = command_store
     app.state.auth_service = auth_service
+    app.state.health_service = health_service
     install_openapi(app)
 
     @app.exception_handler(RequestValidationError)
@@ -319,30 +338,62 @@ def create_app(
     @app.get(
         "/healthz",
         tags=["status"],
-        summary="Return API and Liquidsoap health.",
+        summary="Return minimal process liveness.",
         responses={
-            200: json_response("Health payload.", {"$ref": "#/components/schemas/Health"}),
-            **STANDARD_PROBLEM_RESPONSES,
+            200: json_response(
+                "The ASGI application can answer requests.",
+                {"$ref": "#/components/schemas/Liveness"},
+            ),
+            **PUBLIC_PROBLEM_RESPONSES,
         },
     )
-    async def healthz(
-        principal: ApiPrincipal = Depends(require_route_policy("GET", "/healthz")),
-    ) -> dict[str, Any]:
-        return await control.get_health()
+    async def healthz(response: Response) -> dict[str, str]:
+        response.headers["Cache-Control"] = "no-store"
+        return {"status": "alive"}
+
+    @app.get(
+        "/readyz",
+        tags=["status"],
+        summary="Return broadcast-critical operational readiness.",
+        responses={
+            200: json_response(
+                "The configured runtime is ready.",
+                {"$ref": "#/components/schemas/Readiness"},
+            ),
+            503: json_response(
+                "One or more required components are unavailable.",
+                {"$ref": "#/components/schemas/Readiness"},
+            ),
+            **PUBLIC_PROBLEM_RESPONSES,
+        },
+    )
+    async def readyz() -> JSONResponse:
+        report = await health_service.collect()
+        return JSONResponse(
+            status_code=200 if report.ready else 503,
+            content=report.to_dict(detailed=False),
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.get(
         "/v1/health",
         tags=["status"],
-        summary="Return API and Liquidsoap health.",
+        summary="Return bounded detailed runtime health.",
         responses={
-            200: json_response("Health payload.", {"$ref": "#/components/schemas/Health"}),
+            200: json_response(
+                "Detailed health report.",
+                {"$ref": "#/components/schemas/DetailedHealth"},
+            ),
             **STANDARD_PROBLEM_RESPONSES,
         },
     )
     async def v1_health(
+        response: Response,
         principal: ApiPrincipal = Depends(require_route_policy("GET", "/v1/health")),
     ) -> dict[str, Any]:
-        return await control.get_health()
+        response.headers["Cache-Control"] = "no-store"
+        report = await health_service.collect()
+        return report.to_dict(detailed=True)
 
     @app.get(
         "/v1/status",

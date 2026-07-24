@@ -64,6 +64,27 @@ class _SourceState:
         return bool(self.cfg.enabled) and not self.disabled_reason
 
 
+def _source_status(
+    st: _SourceState,
+    now: dt.datetime,
+) -> tuple[str, str]:
+    if not st.enabled:
+        return "disabled", "disabled_by_configuration"
+    reference = st.last_success or st.observed_since
+    if (now - reference).total_seconds() > max(
+        1,
+        st.cfg.stale_after_seconds,
+    ):
+        return "degraded", "source_stale"
+    if st.consecutive_failures >= max(1, st.cfg.failure_threshold):
+        return "degraded", "failure_threshold_reached"
+    if st.last_success is None:
+        return "unknown", "awaiting_first_success"
+    if st.last_failure is not None and st.last_failure > st.last_success:
+        return "degraded", "recent_source_failure"
+    return "healthy", "source_current"
+
+
 def default_health_sources() -> tuple[HealthSourceConfig, ...]:
     return (
         HealthSourceConfig(name="nwws_oi", role="alert_redundant", stale_after_seconds=600, failure_threshold=2),
@@ -151,6 +172,28 @@ class HealthStateMachine:
 
     def context(self) -> HealthCycleContext:
         return self._last_snapshot
+
+    def source_snapshot(self, source: str) -> dict[str, object] | None:
+        """Return bounded, non-secret current state for a configured source."""
+        st = self._sources.get(source)
+        if st is None:
+            return None
+        now = dt.datetime.now(dt.timezone.utc)
+        observed_at = st.last_success or st.last_failure
+        age_seconds = (
+            max(0.0, (now - observed_at).total_seconds())
+            if observed_at is not None
+            else max(0.0, (now - st.observed_since).total_seconds())
+        )
+        state, reason = _source_status(st, now)
+        return {
+            "state": state,
+            "reason": reason,
+            "role": st.cfg.role,
+            "observed_at": observed_at,
+            "age_seconds": age_seconds,
+            "consecutive_failures": st.consecutive_failures,
+        }
 
     def _impaired_sources(self, now: dt.datetime) -> list[_SourceState]:
         impaired: list[_SourceState] = []

@@ -256,14 +256,17 @@ The SeasonalWeather API publishes an OpenAPI 3.1 document at `/openapi.json` and
 
 Successful JSON endpoints use `application/json`. API errors use RFC 9457 Problem Details with `application/problem+json`; callers should read the standard `type`, `title`, `status`, `detail`, and `instance` members and may also use the SeasonalWeather extensions `code`, `details`, `errors`, and `request_id`. The same request identifier is returned in the `X-Request-ID` response header.
 
-`/openapi.json`, `/docs`, `/docs/oauth2-redirect`, `/redoc`, and
-`/v1/handled-alerts` are public; the handled-alerts route remains cacheable for
-SPA/radio clients. All other current application routes, including `/healthz`,
-require a Bearer token and their declared scope. Mutating JSON routes also
-require an `Idempotency-Key` header. Scheduled broadcast inserts live under
+`/openapi.json`, `/docs`, `/docs/oauth2-redirect`, `/redoc`, `/healthz`,
+`/readyz`, and `/v1/handled-alerts` are public; the handled-alerts route remains
+cacheable for SPA/radio clients. Other application routes require a Bearer
+token and their declared scope. Mutating JSON routes also require an
+`Idempotency-Key` header. Scheduled broadcast inserts live under
 `/v1/inserts/*` and require the `control:inserts` scope; they add bounded,
-non-SAME text or uploaded-audio segments into the normal cycle without flushing
-the Liquidsoap cycle queue.
+non-SAME text or uploaded-audio segments into the normal cycle without
+flushing the Liquidsoap cycle queue.
+
+Health endpoint contracts and readiness aggregation are documented in
+[`docs/health-readiness.md`](docs/health-readiness.md).
 
 `POST /v1/auth/token` and `POST /v1/auth/revoke` are available only in
 `exchange` and `hybrid`. Both authenticate the client with

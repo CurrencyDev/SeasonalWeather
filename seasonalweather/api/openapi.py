@@ -7,8 +7,7 @@ from fastapi.openapi.utils import get_openapi
 
 from .auth import ROUTE_AUTH_POLICIES
 
-
-API_VERSION = "1.1.0"
+API_VERSION = "1.2.0"
 PROBLEM_JSON = "application/problem+json"
 
 PROBLEM_DETAILS_SCHEMA: dict[str, Any] = {
@@ -46,24 +45,73 @@ PROBLEM_DETAILS_SCHEMA: dict[str, Any] = {
     },
 }
 
-HEALTH_SCHEMA: dict[str, Any] = {
+HEALTH_STATES = [
+    "healthy",
+    "degraded",
+    "unavailable",
+    "disabled",
+    "unknown",
+    "not_applicable",
+]
+
+LIVENESS_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "additionalProperties": True,
-    "required": ["ok", "liquidsoap_telnet", "api"],
+    "additionalProperties": False,
+    "required": ["status"],
     "properties": {
-        "ok": {"type": "boolean"},
-        "liquidsoap_telnet": {
-            "type": "object",
-            "additionalProperties": True,
-            "properties": {"reachable": {"type": "boolean"}},
+        "status": {"type": "string", "const": "alive"},
+    },
+}
+
+HEALTH_COMPONENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["name", "state", "required", "reason"],
+    "properties": {
+        "name": {"type": "string", "maxLength": 64},
+        "state": {"type": "string", "enum": HEALTH_STATES},
+        "required": {"type": "boolean"},
+        "reason": {"type": "string", "maxLength": 64},
+        "observed_at": {"type": "string", "format": "date-time"},
+        "age_seconds": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 31_536_000,
         },
-        "api": {
+        "details": {
             "type": "object",
-            "additionalProperties": True,
-            "properties": {"version": {"type": "string"}},
+            "additionalProperties": {
+                "type": ["boolean", "integer", "number", "string"],
+            },
+            "maxProperties": 8,
         },
     },
 }
+
+READINESS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "state",
+        "ready",
+        "checked_at",
+        "duration_ms",
+        "components",
+    ],
+    "properties": {
+        "state": {"type": "string", "enum": HEALTH_STATES},
+        "ready": {"type": "boolean"},
+        "checked_at": {"type": "string", "format": "date-time"},
+        "duration_ms": {"type": "number", "minimum": 0, "maximum": 60_000},
+        "components": {
+            "type": "array",
+            "maxItems": 24,
+            "items": {"$ref": "#/components/schemas/HealthComponent"},
+        },
+    },
+}
+
+DETAILED_HEALTH_SCHEMA: dict[str, Any] = READINESS_SCHEMA
 
 STATUS_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -252,7 +300,10 @@ def install_openapi(app: FastAPI) -> None:
         schemas.update(
             {
                 "ProblemDetails": PROBLEM_DETAILS_SCHEMA,
-                "Health": HEALTH_SCHEMA,
+                "Liveness": LIVENESS_SCHEMA,
+                "HealthComponent": HEALTH_COMPONENT_SCHEMA,
+                "Readiness": READINESS_SCHEMA,
+                "DetailedHealth": DETAILED_HEALTH_SCHEMA,
                 "RuntimeStatus": STATUS_SCHEMA,
                 "StationFeedAlert": STATION_FEED_ALERT_SCHEMA,
                 "StationFeed": STATION_FEED_SCHEMA,

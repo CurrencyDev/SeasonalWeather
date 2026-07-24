@@ -34,6 +34,25 @@ class SeasonalDatabase:
             conn.commit()
         self._bootstrapped = True
 
+    def is_operational(self) -> bool:
+        """Perform a non-bootstrapping probe against the existing database."""
+        if not self._bootstrapped or not Path(self.path).is_file():
+            return False
+        try:
+            database_uri = f"{Path(self.path).resolve().as_uri()}?mode=rw"
+            with sqlite3.connect(
+                database_uri,
+                uri=True,
+                timeout=max(
+                    0.1,
+                    min(1.0, self.busy_timeout_ms / 1000.0),
+                ),
+            ) as conn:
+                row = conn.execute("SELECT 1").fetchone()
+            return row is not None and int(row[0]) == 1
+        except Exception:
+            return False
+
     @contextmanager
     def connect(self):
         self.bootstrap()

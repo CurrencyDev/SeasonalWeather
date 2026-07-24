@@ -54,3 +54,32 @@ def test_health_state_source_impaired_for_redundant_alert_feed_only() -> None:
     assert ctx.mode == "source_impaired"
     assert ctx.notice == "reduced redundancy"
     assert ctx.detached_loop_only is False
+
+
+def test_health_source_snapshot_does_not_expose_raw_error() -> None:
+    cfg = SimpleNamespace(
+        enabled=True,
+        check_interval_seconds=30,
+        min_hold_seconds=0,
+        detached_loop_only=True,
+        sources=[
+            SimpleNamespace(
+                name="nwws_oi",
+                enabled=True,
+                role="alert_redundant",
+                stale_after_seconds=600,
+                failure_threshold=1,
+                critical=False,
+            )
+        ],
+    )
+    health = HealthStateMachine(cfg)
+    sentinel = "SENTINEL-RAW-SOURCE-ERROR"
+    health.mark_failure("nwws_oi", sentinel)
+
+    snapshot = health.source_snapshot("nwws_oi")
+
+    assert snapshot is not None
+    assert snapshot["state"] == "degraded"
+    assert snapshot["reason"] == "failure_threshold_reached"
+    assert sentinel not in repr(snapshot)

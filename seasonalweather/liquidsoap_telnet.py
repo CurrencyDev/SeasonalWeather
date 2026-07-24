@@ -127,12 +127,23 @@ class LiquidsoapTelnet:
                 pass
         return buf.decode("utf-8", "replace")
 
-    def _send(self, command: str, *, read_deadline: Optional[float] = None) -> str:
+    def _send(
+        self,
+        command: str,
+        *,
+        read_deadline: Optional[float] = None,
+        connect_timeout: Optional[float] = None,
+    ) -> str:
         cmd = (command or "").strip()
         if not cmd:
             return ""
 
-        with socket.create_connection((self.host, self.port), timeout=self.timeout) as s:
+        timeout = (
+            self.timeout
+            if connect_timeout is None
+            else max(0.05, min(float(connect_timeout), self.timeout))
+        )
+        with socket.create_connection((self.host, self.port), timeout=timeout) as s:
             # banner/prompt might exist; ignore
             _ = self._recv_until_end(s, deadline=0.6)
 
@@ -460,10 +471,19 @@ class LiquidsoapTelnet:
         if self._voice_alert_prefix != self._full_alert_prefix:
             self.skip_voice_alert()
 
-    def ping(self) -> bool:
+    def ping(self, *, timeout_seconds: float | None = None) -> bool:
         try:
             # Short response, good liveness probe
-            self._send("version", read_deadline=2.0)
+            timeout = (
+                2.0
+                if timeout_seconds is None
+                else max(0.05, min(float(timeout_seconds), 2.0))
+            )
+            self._send(
+                "version",
+                read_deadline=timeout,
+                connect_timeout=timeout,
+            )
             return True
         except Exception:
             return False

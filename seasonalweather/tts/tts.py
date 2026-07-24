@@ -491,6 +491,67 @@ class TTS:
     text_overrides: list[dict] | None = None
     vtp_cfg: object = None  # VoiceTextPaulConfig | None
 
+    def _voicetext_available(self) -> bool:
+        state_base = Path(
+            os.getenv(
+                "SEASONALWEATHER_DATA_BASE",
+                "/var/lib/seasonalweather",
+            )
+        )
+        engine_root = Path(
+            os.getenv(
+                "VOICETEXT_PAUL_ENGINE_ROOT",
+                str(
+                    state_base
+                    / "voices/voicetext_paul/WeatherRadioSuite-LIB"
+                ),
+            )
+        )
+        engine_dir = Path(
+            os.getenv(
+                "VOICETEXT_PAUL_BIN_DIR",
+                str(engine_root / "binary"),
+            )
+        )
+        return (
+            (engine_dir / "voicetext_paul.exe").is_file()
+            and Path("/usr/local/bin/voicetext_paul_synth").is_file()
+            and bool(shutil.which("sudo"))
+        )
+
+    def availability(self) -> tuple[bool, str]:
+        """Check required local artifacts without synthesizing or mutating state."""
+        if not shutil.which("ffmpeg"):
+            return False, "ffmpeg_unavailable"
+        required_binary = {
+            "piper": "piper",
+            "festival": "text2wave",
+            "espeak-ng": "espeak-ng",
+            "espeak_ng": "espeak-ng",
+            "espeak": "espeak-ng",
+        }.get(self.backend)
+        if required_binary is not None:
+            return (
+                (True, "tts_available")
+                if shutil.which(required_binary)
+                else (False, "backend_unavailable")
+            )
+        if self.backend == "dectalk":
+            say_bin = Path("/opt/dectalk/dectalk/dist/say")
+            available = say_bin.is_file() and bool(shutil.which("dectalk-env"))
+            return (
+                (True, "tts_available")
+                if available
+                else (False, "backend_unavailable")
+            )
+        if self.backend == "voicetext_paul":
+            return (
+                (True, "tts_available")
+                if self._voicetext_available()
+                else (False, "backend_unavailable")
+            )
+        return False, "backend_unsupported"
+
     def synth_to_wav(self, text: str, out_wav: Path) -> None:
         out_wav.parent.mkdir(parents=True, exist_ok=True)
 

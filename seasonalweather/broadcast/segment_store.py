@@ -235,6 +235,25 @@ class SegmentStore:
             return False
         return Path(e.audio_path).exists()
 
+    def health_snapshot(self) -> Dict[str, int | float]:
+        """Return bounded freshness counts without exposing text or paths."""
+        entries = tuple(self._entries.values())
+        now = time.time()
+        ages = [
+            max(0.0, now - entry.last_updated_ts)
+            for entry in entries
+            if entry.last_updated_ts > 0
+        ]
+        return {
+            "count": len(entries),
+            "ready_count": sum(self.is_ready(entry.key) for entry in entries),
+            "stale_count": sum(entry.is_stale() for entry in entries),
+            "placeholder_count": sum(
+                entry.is_placeholder for entry in entries
+            ),
+            "oldest_age_seconds": max(ages, default=0.0),
+        }
+
     # ------------------------------------------------------------------
     #  Write API  (async, takes lock)
     # ------------------------------------------------------------------

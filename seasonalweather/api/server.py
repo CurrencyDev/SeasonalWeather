@@ -6,15 +6,14 @@ import logging
 
 import uvicorn
 
-from .api import create_app
-from .commands import CommandStore
-from ..config import load_config
+from ..auth import AuthenticationRepository, AuthenticationService
+from ..config import AuthMode, load_config
 from ..control import OrchestratorControl
 from ..database.bootstrap import bootstrap_database_from_config
-from ..auth import AuthenticationRepository, AuthenticationService
-from ..config import AuthMode
+from ..health_service import build_runtime_health_service
 from ..main import Orchestrator, _setup_logging
-
+from .api import create_app
+from .commands import CommandStore
 
 log = logging.getLogger("seasonalweather.api")
 
@@ -32,7 +31,18 @@ async def run_api_server(*, config_path: str, host: str, port: int) -> None:
         if db is not None and cfg.api.auth.mode in {AuthMode.EXCHANGE, AuthMode.HYBRID}
         else None
     )
-    app = create_app(control, store=CommandStore(database=db), auth_service=auth_service)
+    command_store = CommandStore(database=db)
+    health_service = build_runtime_health_service(
+        orch,
+        command_store=command_store,
+        auth_service=auth_service,
+    )
+    app = create_app(
+        control,
+        store=command_store,
+        auth_service=auth_service,
+        health_service=health_service,
+    )
 
     server = uvicorn.Server(
         uvicorn.Config(
