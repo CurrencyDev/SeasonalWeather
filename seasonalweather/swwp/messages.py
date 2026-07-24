@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+from enum import StrEnum
 from typing import Any, ClassVar, Self
 
+from ..capabilities.models import normalize_parameters
 from ..jobs.contracts import AttemptOutcome
 from ..jobs.policies import ExecutorClass, FailureCategory, JobType, QueueClass
 from ..validation.modeling import (
@@ -37,6 +39,12 @@ def _identifier(value: str, name: str) -> str:
 def _key(value: str, name: str) -> str:
     if not _KEY_RE.fullmatch(value):
         raise ValueError(f"{name} must be a bounded declared key")
+    return value
+
+
+def _digest(value: str) -> str:
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+        raise ValueError("capability digest must use lowercase sha256")
     return value
 
 
@@ -92,23 +100,116 @@ class SelectedVersions(WireModel):
     configuration_schema: int = Field(ge=1, le=255)
 
 
+class CapabilityOperationalState(StrEnum):
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    UNAVAILABLE = "unavailable"
+    DRAINING = "draining"
+    DISABLED = "disabled"
+    UNKNOWN = "unknown"
+
+
+class CapabilityDependencyState(StrEnum):
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    UNAVAILABLE = "unavailable"
+    UNKNOWN = "unknown"
+
+
+CapabilityParameter = (
+    str | int | float | bool | tuple[str, ...] | tuple[int, ...] | tuple[float, ...] | tuple[bool, ...]
+)
+
+
+class CapabilityRecordPayload(WireModel):
+    name: str
+    implemented: bool
+    operational_state: CapabilityOperationalState
+    accepting_new_jobs: bool
+    total_capacity: int = Field(ge=0, le=128)
+    reported_available: int = Field(ge=0, le=128)
+    job_restrictions: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
+    parameters: dict[str, CapabilityParameter] = Field(default_factory=dict, max_length=16)
+    validity_seconds: int = Field(ge=1, le=900)
+    observed_at: dt.datetime
+    published_at: dt.datetime
+    dependency_health: dict[str, CapabilityDependencyState] = Field(
+        default_factory=dict,
+        max_length=8,
+    )
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        return _key(value, "capability name")
+
+    @field_validator("observed_at", "published_at")
+    @classmethod
+    def validate_times(cls, value: dt.datetime, info: Any) -> dt.datetime:
+        return _utc(value, info.field_name)
+
+    @field_validator("job_restrictions")
+    @classmethod
+    def validate_restrictions(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(sorted({_key(item, "job restriction") for item in value}))
+
+    @field_validator("parameters")
+    @classmethod
+    def validate_parameters(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return normalize_parameters(value)
+
+    @field_validator("dependency_health")
+    @classmethod
+    def validate_dependencies(
+        cls,
+        value: dict[str, CapabilityDependencyState],
+    ) -> dict[str, CapabilityDependencyState]:
+        return dict(sorted((_key(key, "dependency name"), state) for key, state in value.items()))
+
+    @model_validator(mode="after")
+    def validate_capacity(self) -> Self:
+        if self.reported_available > self.total_capacity:
+            raise ValueError("available capability capacity exceeds total")
+        inactive = {
+            CapabilityOperationalState.UNAVAILABLE,
+            CapabilityOperationalState.DRAINING,
+            CapabilityOperationalState.DISABLED,
+            CapabilityOperationalState.UNKNOWN,
+        }
+        if self.operational_state in inactive and self.accepting_new_jobs:
+            raise ValueError("inactive capability cannot accept jobs")
+        if not self.implemented and (self.accepting_new_jobs or self.total_capacity or self.reported_available):
+            raise ValueError("unimplemented capability cannot report capacity")
+        if self.observed_at > self.published_at:
+            raise ValueError("capability observation cannot follow publication")
+        return self
+
+
 class CapabilityManifest(WireModel):
     schema_version: int = Field(ge=1, le=255)
-    epoch: int = Field(ge=0)
-    digest: str = Field(min_length=3, max_length=128)
-    names: tuple[str, ...] = Field(default_factory=tuple, max_length=64)
+    epoch: int = Field(ge=1)
+    digest: str = Field(min_length=71, max_length=71)
+    records: tuple[CapabilityRecordPayload, ...] = Field(max_length=64)
 
     @field_validator("digest")
     @classmethod
     def validate_digest(cls, value: str) -> str:
-        return _identifier(value, "capability digest")
+        return _digest(value)
 
-    @field_validator("names")
+    @field_validator("records")
     @classmethod
-    def validate_names(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if any(not _KEY_RE.fullmatch(item) for item in value):
-            raise ValueError("capability names must be bounded declared keys")
-        return tuple(sorted(set(value)))
+    def validate_records(
+        cls,
+        value: tuple[CapabilityRecordPayload, ...],
+    ) -> tuple[CapabilityRecordPayload, ...]:
+        names = tuple(item.name for item in value)
+        if names != tuple(sorted(set(names))):
+            raise ValueError("capability records must be unique and sorted")
+        return value
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(record.name for record in self.records)
 
 
 class LeaseRef(WireModel):
@@ -156,11 +257,17 @@ class Registered(Payload):
     selected_versions: SelectedVersions
     max_message_bytes: int = Field(ge=1024, le=16_777_216)
     max_active_assignments: int = Field(ge=1, le=128)
+    effective_capabilities: tuple[str, ...] = Field(default_factory=tuple, max_length=64)
+    capability_epoch: int = Field(ge=1)
+    capability_digest: str = Field(min_length=71, max_length=71)
+    qualification_required: bool = False
 
     @field_validator("session_id")
     @classmethod
     def validate_session(cls, value: str) -> str:
         return _identifier(value, "session_id")
+
+    _capability_digest = field_validator("capability_digest")(_digest)
 
 
 class RegistrationRejected(Payload):
@@ -174,8 +281,18 @@ class RegistrationRejected(Payload):
 class Heartbeat(Payload):
     message_type = "heartbeat"
     active_leases: tuple[LeaseRef, ...] = Field(default_factory=tuple, max_length=32)
-    capability_epoch: int | None = Field(default=None, ge=0)
-    capability_digest: str | None = Field(default=None, max_length=128)
+    capability_epoch: int | None = Field(default=None, ge=1)
+    capability_digest: str | None = Field(default=None, min_length=71, max_length=71)
+
+    @model_validator(mode="after")
+    def validate_capability_identity(self) -> Self:
+        if (self.capability_epoch is None) != (self.capability_digest is None):
+            raise ValueError("heartbeat capability epoch and digest must appear together")
+        return self
+
+    _capability_digest = field_validator("capability_digest")(
+        lambda value: _digest(value) if value is not None else None
+    )
 
 
 class HeartbeatAck(Payload):
@@ -186,30 +303,98 @@ class HeartbeatAck(Payload):
 
 class CapabilityUpdate(Payload):
     message_type = "capability_update"
-    manifest: CapabilityManifest
+    epoch: int = Field(ge=1)
+    changed: tuple[CapabilityRecordPayload, ...] = Field(default_factory=tuple, max_length=64)
+    removed: tuple[str, ...] = Field(default_factory=tuple, max_length=64)
+    full_digest: str = Field(min_length=71, max_length=71)
+    validity_seconds: int = Field(ge=1, le=900)
+
+    @field_validator("removed")
+    @classmethod
+    def validate_removed(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(sorted({_key(item, "removed capability") for item in value}))
+        if normalized != value:
+            raise ValueError("removed capabilities must be unique and sorted")
+        return value
+
+    @model_validator(mode="after")
+    def validate_changes(self) -> Self:
+        changed = tuple(item.name for item in self.changed)
+        if changed != tuple(sorted(set(changed))):
+            raise ValueError("changed capabilities must be unique and sorted")
+        if set(changed).intersection(self.removed):
+            raise ValueError("capability cannot be changed and removed")
+        return self
+
+    _full_digest = field_validator("full_digest")(_digest)
+
+
+class CapabilityRecoveryAction(StrEnum):
+    NONE = "none"
+    FULL_REPORT_REQUIRED = "full_report_required"
+    STALE_IGNORED = "stale_ignored"
 
 
 class CapabilityUpdateAck(Payload):
     message_type = "capability_update_ack"
-    epoch: int = Field(ge=0)
-    digest: str = Field(min_length=3, max_length=128)
+    epoch: int = Field(ge=1)
+    digest: str = Field(min_length=71, max_length=71)
+    recovery_action: CapabilityRecoveryAction = CapabilityRecoveryAction.NONE
+
+    _digest = field_validator("digest")(_digest)
 
 
 class CapabilityProbe(Payload):
     message_type = "capability_probe"
     probe_id: str
+    full: bool
     names: tuple[str, ...] = Field(default_factory=tuple, max_length=64)
+    reason: str = Field(min_length=2, max_length=64)
+    deadline_at: dt.datetime
 
     _probe_id = field_validator("probe_id")(lambda value: _identifier(value, "probe_id"))
+    _reason = field_validator("reason")(lambda value: _key(value, "probe reason"))
+    _deadline = field_validator("deadline_at")(lambda value: _utc(value, "deadline_at"))
+
+    @model_validator(mode="after")
+    def validate_mode(self) -> Self:
+        if self.full == bool(self.names):
+            raise ValueError("full probe has no targets; targeted probe requires targets")
+        return self
 
 
 class CapabilityReport(Payload):
     message_type = "capability_report"
     probe_id: str
-    manifest: CapabilityManifest
-    evidence: dict[str, str | int | float | bool] = Field(default_factory=dict, max_length=32)
+    schema_version: int = Field(ge=1, le=255)
+    epoch: int = Field(ge=1)
+    records: tuple[CapabilityRecordPayload, ...] = Field(default_factory=tuple, max_length=64)
+    full_digest: str = Field(min_length=71, max_length=71)
+    validity_seconds: int = Field(ge=1, le=900)
 
     _probe_id = field_validator("probe_id")(lambda value: _identifier(value, "probe_id"))
+    _full_digest = field_validator("full_digest")(_digest)
+
+    @field_validator("records")
+    @classmethod
+    def validate_records(
+        cls,
+        value: tuple[CapabilityRecordPayload, ...],
+    ) -> tuple[CapabilityRecordPayload, ...]:
+        names = tuple(item.name for item in value)
+        if names != tuple(sorted(set(names))):
+            raise ValueError("capability report records must be unique and sorted")
+        return value
+
+
+class CapabilityRejectionCategory(StrEnum):
+    CAPACITY_UNAVAILABLE = "capacity_unavailable"
+    CAPABILITY_UNAVAILABLE = "capability_unavailable"
+    CAPABILITY_STALE = "capability_stale"
+    PARAMETER_MISMATCH = "parameter_mismatch"
+    SCHEMA_MISMATCH = "schema_mismatch"
+    DRAINING = "draining"
+    DISABLED = "disabled"
 
 
 class JobAssignmentPayload(Payload):
@@ -247,10 +432,17 @@ class JobAccepted(Payload):
 class JobRejected(Payload):
     message_type = "job_rejected"
     lease: LeaseRef
-    category: str = Field(min_length=2, max_length=64)
+    category: CapabilityRejectionCategory
     summary: str = Field(min_length=1, max_length=256)
+    capabilities: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
 
-    _category = field_validator("category")(lambda value: _key(value, "category"))
+    @field_validator("capabilities")
+    @classmethod
+    def validate_capabilities(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(sorted({_key(item, "rejected capability") for item in value}))
+        if normalized != value:
+            raise ValueError("rejected capabilities must be unique and sorted")
+        return value
 
 
 class JobProgress(Payload):

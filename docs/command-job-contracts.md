@@ -144,7 +144,8 @@ Payload and result schemas are version `1`. They use bounded identifiers and
 artifact/content references. Audio, products, synthesis prose, request objects,
 database handles, Python exceptions, and binary data are not embedded.
 Capability requirements use a closed, bounded namespace and normalized
-parameters; they describe requirements only and do not qualify workers.
+parameters. P1-09 maps them to pure dynamic worker qualification as documented
+in [`worker-capabilities.md`](worker-capabilities.md).
 
 ## API acceptance and lifecycle
 
@@ -173,7 +174,8 @@ layer:
 - P1-08 now supplies separate SWWP/1 schemas, session machines, and
   simulated-only peers under [`swwp.md`](swwp.md); it does not change these
   contracts or add a live connection;
-- P1-09: dynamic worker capability, health, capacity, epoch, and qualification;
+- P1-09 supplies simulated dynamic worker capability, health, capacity, epoch,
+  qualification, and reservation behavior without a live worker;
 - P1-10: artifact staging, validation, promotion, and stale-result acceptance.
 
 No embedded executor is a production fallback. The P1-07 scheduler returns

@@ -4,16 +4,21 @@ from __future__ import annotations
 
 import datetime as dt
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Protocol
 
+from ..capabilities.probes import CapabilityProbe as DomainCapabilityProbe
+from ..capabilities.probes import ProbeMode, ProbeReason
+from ..capabilities.registry import WorkerCapabilitySnapshot
 from ..jobs.policies import JobType, QueueClass
 from .adapter import DurableSwwpPort, remote_executors
 from .auth import (
+    AuthenticatedPrincipal,
     ControllerVersionSupport,
     RegistrationPolicy,
     negotiate_subprotocol,
     negotiate_versions,
 )
+from .capability_adapter import manifest_from_wire, record_from_wire, update_from_wire
 from .constants import (
     DEFAULT_LIMITS,
     SUBPROTOCOL,
@@ -24,6 +29,8 @@ from .constants import (
 from .messages import (
     Cancel,
     CancelAcknowledged,
+    CapabilityProbe,
+    CapabilityRecoveryAction,
     CapabilityReport,
     CapabilityUpdate,
     CapabilityUpdateAck,
@@ -55,6 +62,57 @@ class StaleSessionError(PermissionError):
     pass
 
 
+class CapabilityControllerPort(Protocol):
+    def register(self, **kwargs: Any) -> WorkerCapabilitySnapshot: ...
+
+    def update(self, worker_id: str, **kwargs: Any): ...
+
+    def heartbeat(self, worker_id: str, **kwargs: Any): ...
+
+    def report(self, worker_id: str, **kwargs: Any): ...
+
+    def request_probe(
+        self,
+        worker_id: str,
+        *,
+        mode: ProbeMode,
+        reason: ProbeReason,
+        names: tuple[str, ...] = (),
+    ) -> DomainCapabilityProbe: ...
+
+    def take_probes(self, worker_id: str) -> tuple[DomainCapabilityProbe, ...]: ...
+
+    def reject_unacknowledged(
+        self,
+        lease: LeaseRef,
+        *,
+        category: str,
+        capability_names: tuple[str, ...],
+    ) -> object: ...
+
+    def disconnect(self, worker_id: str, *, session_id: str) -> None: ...
+
+    def drain(self, worker_id: str) -> None: ...
+
+    def acquire(self, **kwargs: Any): ...
+
+    def acknowledge(self, lease: LeaseRef) -> object: ...
+
+    def renew(self, lease: LeaseRef) -> object: ...
+
+    def progress(self, progress: JobProgress) -> None: ...
+
+    def result(self, result: JobResult): ...
+
+    def failure(self, failure: JobFailed): ...
+
+    def request_cancellation(self, job_id: str) -> object: ...
+
+    def reconcile(self, item: Any): ...
+
+    def reconcile_repository(self) -> None: ...
+
+
 class ControllerSession(SessionMachine):
     def __init__(
         self,
@@ -71,6 +129,7 @@ class ControllerSession(SessionMachine):
         heartbeat_timeout_seconds: int = 45,
         lease_seconds: int = 60,
         assignment_ack_seconds: int = 10,
+        capabilities: CapabilityControllerPort | None = None,
     ) -> None:
         super().__init__(clock=clock, id_factory=id_factory, limits=limits)
         if controller_epoch < 1:
@@ -84,6 +143,7 @@ class ControllerSession(SessionMachine):
         self.heartbeat_timeout_seconds = heartbeat_timeout_seconds
         self.lease_seconds = lease_seconds
         self.assignment_ack_seconds = assignment_ack_seconds
+        self.capabilities = capabilities
         self.state = ControllerState.AWAITING_REGISTRATION
         self.session_id: str | None = None
         self.worker_id: str | None = None
@@ -105,6 +165,9 @@ class ControllerSession(SessionMachine):
             controller_epoch=self.controller_epoch,
             worker_epoch=self.worker_epoch,
         )
+
+    def _work_port(self) -> Any:
+        return self.capabilities or self.durable
 
     def receive(self, incoming: Envelope) -> tuple[Envelope, ...]:
         if self.state in _TERMINAL:
@@ -187,16 +250,27 @@ class ControllerSession(SessionMachine):
                 ProtocolErrorCategory.UNSUPPORTED_VERSION,
                 "SWWP subprotocol or required schema versions are incompatible",
             )
-        requested_queues = set(registration.requested_queues)
-        queues = requested_queues.intersection(principal.queues) - {QueueClass.CONTROL}
-        advertised_jobs = set(selected.job_payloads).intersection(selected.job_results)
-        authorized_jobs = {
-            job_type
-            for job_type in principal.job_types.intersection(advertised_jobs)
-            if not job_type.value.startswith("control.")
-        }
-        capabilities = set(registration.capability_manifest.names).intersection(principal.capabilities)
-        self.session_id = self.id_factory("session")
+        queues, authorized_jobs, capabilities = self._registration_grants(
+            registration,
+            principal,
+            selected,
+        )
+        session_id = self.id_factory("session")
+        try:
+            capability_snapshot = self._register_capabilities(
+                registration,
+                session_id,
+                capabilities,
+                authorized_jobs,
+                selected,
+            )
+        except (PermissionError, ValueError):
+            return self._reject_registration(
+                incoming,
+                ProtocolErrorCategory.UNAUTHORIZED,
+                "capability manifest is unauthorized or invalid",
+            )
+        self.session_id = session_id
         self.worker_id = registration.worker_id
         self.worker_instance_id = registration.worker_instance_id
         self.worker_epoch = registration.worker_epoch
@@ -219,8 +293,53 @@ class ControllerSession(SessionMachine):
             selected_versions=selected,
             max_message_bytes=self.limits.max_message_bytes,
             max_active_assignments=registration.requested_slots,
+            effective_capabilities=(
+                tuple(record.name for record in capability_snapshot.records if record.implemented)
+                if capability_snapshot is not None
+                else self.authorized_capabilities
+            ),
+            capability_epoch=registration.capability_manifest.epoch,
+            capability_digest=registration.capability_manifest.digest,
+            qualification_required=(capability_snapshot.probe_required if capability_snapshot is not None else False),
         )
-        return (self._out(response),)
+        return (self._out(response), *self._capability_probe_frames())
+
+    @staticmethod
+    def _registration_grants(
+        registration: Register,
+        principal: AuthenticatedPrincipal,
+        selected: SelectedVersions,
+    ) -> tuple[set[QueueClass], set[JobType], set[str]]:
+        queues = set(registration.requested_queues).intersection(principal.queues) - {QueueClass.CONTROL}
+        advertised_jobs = set(selected.job_payloads).intersection(selected.job_results)
+        authorized_jobs = {
+            job_type
+            for job_type in principal.job_types.intersection(advertised_jobs)
+            if not job_type.value.startswith("control.")
+        }
+        capabilities = set(registration.capability_manifest.names).intersection(principal.capabilities)
+        return queues, authorized_jobs, capabilities
+
+    def _register_capabilities(
+        self,
+        registration: Register,
+        session_id: str,
+        capabilities: set[str],
+        authorized_jobs: set[JobType],
+        selected: SelectedVersions,
+    ) -> WorkerCapabilitySnapshot | None:
+        if self.capabilities is None:
+            return None
+        return self.capabilities.register(
+            worker_id=registration.worker_id,
+            worker_instance_id=registration.worker_instance_id,
+            session_id=session_id,
+            manifest=manifest_from_wire(registration.capability_manifest),
+            authorized_capabilities=frozenset(capabilities),
+            authorized_job_types=frozenset(authorized_jobs),
+            payload_versions=selected.job_payloads,
+            result_versions=selected.job_results,
+        )
 
     @staticmethod
     def _registration_identity_matches(incoming: Envelope, registration: Register) -> bool:
@@ -316,7 +435,7 @@ class ControllerSession(SessionMachine):
             Drained: self._drained,
             Reconcile: self._reconcile,
             CapabilityUpdate: self._capability_update,
-            CapabilityReport: self._no_response,
+            CapabilityReport: self._capability_report,
         }
         handler = handlers.get(type(payload))
         if handler is None:
@@ -331,12 +450,30 @@ class ControllerSession(SessionMachine):
                 reconcile.append(lease)
                 continue
             try:
-                self.durable.renew(lease)
+                self._work_port().renew(lease)
                 renewed.append(lease)
             except (KeyError, ValueError, RuntimeError):
                 reconcile.append(lease)
         self.last_heartbeat_at = self.clock()
-        return (self._out(HeartbeatAck(renewed=tuple(renewed), reconcile=tuple(reconcile))),)
+        if (
+            self.capabilities is not None
+            and self.worker_id is not None
+            and self.session_id is not None
+            and self.worker_instance_id is not None
+            and payload.capability_epoch is not None
+            and payload.capability_digest is not None
+        ):
+            self.capabilities.heartbeat(
+                self.worker_id,
+                session_id=self.session_id,
+                worker_instance_id=self.worker_instance_id,
+                epoch=payload.capability_epoch,
+                digest=payload.capability_digest,
+            )
+        return (
+            self._out(HeartbeatAck(renewed=tuple(renewed), reconcile=tuple(reconcile))),
+            *self._capability_probe_frames(),
+        )
 
     def _job_accepted(self, payload: JobAccepted) -> tuple[Envelope, ...]:
         key = self._lease_key(payload.lease)
@@ -344,7 +481,7 @@ class ControllerSession(SessionMachine):
         if prior == "rejected":
             raise ValueError("conflicting assignment decision")
         if prior != "accepted":
-            self.durable.acknowledge(payload.lease)
+            self._work_port().acknowledge(payload.lease)
             self.assignments[key] = "accepted"
         return ()
 
@@ -352,17 +489,27 @@ class ControllerSession(SessionMachine):
         key = self._lease_key(payload.lease)
         if self.assignments.get(key) == "accepted":
             raise ValueError("conflicting assignment decision")
+        if self.assignments.get(key) != "delivered":
+            raise ValueError("rejection requires a delivered assignment")
+        if self.capabilities is not None:
+            self.capabilities.reject_unacknowledged(
+                payload.lease,
+                category=payload.category.value,
+                capability_names=payload.capabilities,
+            )
+        else:
+            self.durable.reject_unacknowledged(payload.lease)
         self.assignments[key] = "rejected"
-        return ()
+        return self._capability_probe_frames()
 
     def _job_progress(self, payload: JobProgress) -> tuple[Envelope, ...]:
         self._require_accepted(payload.lease)
-        self.durable.progress(payload)
+        self._work_port().progress(payload)
         return ()
 
     def _job_result(self, payload: JobResult) -> tuple[Envelope, ...]:
         self._require_accepted(payload.lease)
-        receipt = self.durable.result(payload)
+        receipt = self._work_port().result(payload)
         return (
             self._out(
                 ResultCommitted(
@@ -376,7 +523,7 @@ class ControllerSession(SessionMachine):
 
     def _job_failed(self, payload: JobFailed) -> tuple[Envelope, ...]:
         self._require_accepted(payload.lease)
-        self.durable.failure(payload)
+        self._work_port().failure(payload)
         return ()
 
     @staticmethod
@@ -391,17 +538,73 @@ class ControllerSession(SessionMachine):
         return ()
 
     def _reconcile(self, payload: Reconcile) -> tuple[Envelope, ...]:
-        decisions = tuple(self.durable.reconcile(item) for item in payload.items)
+        decisions = tuple(self._work_port().reconcile(item) for item in payload.items)
         return (self._out(ReconcileResult(decisions=decisions)),)
 
     def _capability_update(self, payload: CapabilityUpdate) -> tuple[Envelope, ...]:
+        recovery = CapabilityRecoveryAction.NONE
+        if (
+            self.capabilities is not None
+            and self.worker_id is not None
+            and self.session_id is not None
+            and self.worker_instance_id is not None
+        ):
+            disposition = self.capabilities.update(
+                self.worker_id,
+                session_id=self.session_id,
+                worker_instance_id=self.worker_instance_id,
+                update=update_from_wire(payload),
+            )
+            if disposition.value in {"conflict", "gap"}:
+                recovery = CapabilityRecoveryAction.FULL_REPORT_REQUIRED
+            elif disposition.value == "stale":
+                recovery = CapabilityRecoveryAction.STALE_IGNORED
         return (
             self._out(
                 CapabilityUpdateAck(
-                    epoch=payload.manifest.epoch,
-                    digest=payload.manifest.digest,
+                    epoch=payload.epoch,
+                    digest=payload.full_digest,
+                    recovery_action=recovery,
                 )
             ),
+            *self._capability_probe_frames(),
+        )
+
+    def _capability_report(self, payload: CapabilityReport) -> tuple[Envelope, ...]:
+        if (
+            self.capabilities is None
+            or self.worker_id is None
+            or self.session_id is None
+            or self.worker_instance_id is None
+        ):
+            return ()
+        self.capabilities.report(
+            self.worker_id,
+            session_id=self.session_id,
+            worker_instance_id=self.worker_instance_id,
+            probe_id=payload.probe_id,
+            schema_version=payload.schema_version,
+            epoch=payload.epoch,
+            records=tuple(record_from_wire(item) for item in payload.records),
+            full_digest=payload.full_digest,
+            validity_seconds=payload.validity_seconds,
+        )
+        return ()
+
+    def _capability_probe_frames(self) -> tuple[Envelope, ...]:
+        if self.capabilities is None or self.worker_id is None:
+            return ()
+        return tuple(
+            self._out(
+                CapabilityProbe(
+                    probe_id=probe.probe_id,
+                    full=probe.mode is ProbeMode.FULL,
+                    names=probe.target_names,
+                    reason=probe.reason.value,
+                    deadline_at=probe.deadline_at,
+                )
+            )
+            for probe in self.capabilities.take_probes(self.worker_id)
         )
 
     @staticmethod
@@ -415,7 +618,8 @@ class ControllerSession(SessionMachine):
     def assign_next(self) -> Envelope | None:
         if self.state is not ControllerState.ACTIVE or self.worker_id is None:
             return None
-        assignment = self.durable.acquire(
+        scheduler = self.capabilities or self.durable
+        assignment = scheduler.acquire(
             owner=self.worker_id,
             queues=self.accepted_queues,
             executors=remote_executors(self.authorized_job_types),
@@ -431,6 +635,8 @@ class ControllerSession(SessionMachine):
         if self.state is not ControllerState.ACTIVE:
             raise ValueError("only an active session may drain")
         self.state = ControllerState.DRAINING
+        if self.capabilities is not None and self.worker_id is not None:
+            self.capabilities.drain(self.worker_id)
         return self._out(Drain(deadline_at=deadline_at, reason=reason))
 
     def request_cancel(
@@ -444,11 +650,11 @@ class ControllerSession(SessionMachine):
             raise ValueError("only a live session may carry cancellation")
         if self.assignments.get(self._lease_key(lease)) not in {"delivered", "accepted"}:
             raise ValueError("cancellation requires a current session assignment")
-        self.durable.request_cancellation(lease.job_id)
+        self._work_port().request_cancellation(lease.job_id)
         return self._out(Cancel(lease=lease, deadline_at=deadline_at, reason=reason))
 
     def reconcile_missed_acknowledgments(self) -> None:
-        self.durable.reconcile_repository()
+        self._work_port().reconcile_repository()
 
     def timed_out(self) -> bool:
         if self.state not in {ControllerState.ACTIVE, ControllerState.DRAINING}:
@@ -462,4 +668,6 @@ class ControllerSession(SessionMachine):
 
     def transport_lost(self) -> None:
         if self.state not in _TERMINAL:
+            if self.capabilities is not None and self.worker_id is not None and self.session_id is not None:
+                self.capabilities.disconnect(self.worker_id, session_id=self.session_id)
             self.state = ControllerState.CLOSED

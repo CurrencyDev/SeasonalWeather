@@ -20,6 +20,8 @@ def test_invalid_architecture_fixture_proves_rules_fail_closed():
         "SWARCH010",
         "SWARCH011",
         "SWARCH012",
+        "SWARCH013",
+        "SWARCH014",
     }
     assert any("filesystem mutation" in finding.message for finding in findings)
 
@@ -41,3 +43,14 @@ def test_control_and_api_have_no_swwp_or_simulation_authority():
         assert "seasonalweather.swwp" not in source
         assert "swwp_simulation" not in source
         assert "SimulatedPeers" not in source
+
+
+def test_control_and_api_have_no_capability_scheduler_authority():
+    control = (ROOT / "seasonalweather/control.py").read_text(encoding="utf-8")
+    api = "\n".join(path.read_text(encoding="utf-8") for path in (ROOT / "seasonalweather/api").glob("*.py"))
+
+    for source in (control, api):
+        assert "CapabilityRegistry" not in source
+        assert "CapabilitySchedulerService" not in source
+        assert "QualificationReason" not in source
+        assert "reserve(" not in source

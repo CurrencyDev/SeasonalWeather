@@ -6,6 +6,11 @@ import datetime as dt
 from collections import deque
 from dataclasses import dataclass, field
 
+from seasonalweather.capabilities.hysteresis import (
+    CapabilityHysteresis,
+    CapabilityObservation,
+)
+from seasonalweather.swwp.capability_adapter import record_to_wire
 from seasonalweather.swwp.controller import ControllerSession
 from seasonalweather.swwp.messages import Envelope
 from seasonalweather.swwp.worker import WorkerSession
@@ -118,3 +123,23 @@ class SimulatedPeers:
         self.transport.disconnect()
         self.controller.transport_lost()
         self.worker.transport_lost()
+
+
+@dataclass
+class SimulatedCapabilityObserver:
+    worker: WorkerSession
+    machines: dict[str, CapabilityHysteresis]
+    validity_seconds: int = 60
+
+    def observe(
+        self,
+        name: str,
+        observation: CapabilityObservation,
+    ) -> Envelope | None:
+        published = self.machines[name].observe(observation)
+        if published is None:
+            return None
+        return self.worker.capability_update(
+            changed=(record_to_wire(published),),
+            validity_seconds=self.validity_seconds,
+        )

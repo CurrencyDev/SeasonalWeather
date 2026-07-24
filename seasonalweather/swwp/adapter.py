@@ -47,6 +47,8 @@ class DurableSwwpPort(Protocol):
 
     def reconcile_repository(self) -> None: ...
 
+    def reject_unacknowledged(self, lease: LeaseRef) -> JobRecord: ...
+
 
 @dataclass
 class JobStoreSwwpAdapter:
@@ -78,6 +80,30 @@ class JobStoreSwwpAdapter:
         )
         if assignment is None:
             return None
+        return self.payload_for_assignment(assignment)
+
+    def acquire_job(
+        self,
+        *,
+        owner: str,
+        queues: tuple[QueueClass, ...],
+        executors: tuple[ExecutorClass, ...],
+        capabilities: tuple[str, ...],
+        job_id: str,
+    ) -> JobAssignmentPayload | None:
+        assignment = self.scheduler.assign(
+            owner=owner,
+            queues=queues,
+            executors=executors,
+            capabilities=capabilities,
+            candidate_job_ids=(job_id,),
+        )
+        return self.payload_for_assignment(assignment) if assignment is not None else None
+
+    def payload_for_assignment(
+        self,
+        assignment: JobAssignment,
+    ) -> JobAssignmentPayload:
         lease = LeaseRef(
             job_id=assignment.job.job_id,
             lease_id=assignment.lease_id,
@@ -108,6 +134,12 @@ class JobStoreSwwpAdapter:
 
     def acknowledge(self, lease: LeaseRef) -> JobRecord:
         return self.scheduler.acknowledge(self._assignment(lease))
+
+    def reject_unacknowledged(self, lease: LeaseRef) -> JobRecord:
+        assignment = self._assignment(lease)
+        result = self.scheduler.reject_unacknowledged(assignment)
+        self._assignments.pop(self._key(lease), None)
+        return result
 
     def renew(self, lease: LeaseRef) -> JobRecord:
         return self.scheduler.renew(self._assignment(lease))

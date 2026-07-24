@@ -91,9 +91,11 @@ absolute deadline, lease expiry, acknowledgment deadline, job/queue/executor,
 payload and result schema versions, configuration generation, typed payload,
 and bounded static capability requirements.
 
-Capability update/probe/report messages are transport schemas only. P1-09 owns
-capability health, availability, capacity, qualification, hysteresis, and
-scheduler eligibility.
+Capability update/probe/report messages carry complete records, partial
+changes/removals, validity, a full-manifest digest, and correlated full or
+targeted reports. P1-09 interpretation, qualification, hysteresis, and
+capacity rules are documented in
+[`worker-capabilities.md`](worker-capabilities.md).
 
 ## Registration and authentication policy
 
@@ -175,8 +177,10 @@ acknowledgment/start port only after a matching `job_accepted`. A rejection is
 a scheduling/reconciliation event, not handler failure. Missed acknowledgment
 is left to P1-07 durable reconciliation.
 
-Heartbeat carries bounded active lease references and optional capability
-epoch/digest transport data. Matching active leases renew through P1-07, whose
+Heartbeat carries bounded active lease references and the current capability
+epoch/digest. A matching trusted manifest refreshes controller-time validity;
+a gap or mismatch blocks new qualification and requests a full report.
+Matching active leases renew through P1-07, whose
 lease extension is capped by the absolute deadline. Unknown or stale leases
 are returned for reconciliation and are never recreated. Heartbeat timeout
 closes the session without deciding work outcomes. No production heartbeat
@@ -273,7 +277,7 @@ WebSocket libraries, broadcast, Liquidsoap, TTS, NWWS, worker handlers, SQLite,
 or test simulation. Only `seasonalweather.swwp.adapter` may import the P1-07
 job-store boundary. API and `control.py` cannot own or invoke simulation.
 
-Dynamic capability qualification remains P1-09. Real WSS transport,
-file-backed bootstrap credentials, worker processes, health/metrics, and
-deployment remain Phase 2 work.
-
+Dynamic capability qualification is simulated through the P1-09 controller
+registry and scheduler boundary. Real WSS transport, file-backed bootstrap
+credentials, worker processes, health/metrics, and deployment remain Phase 2
+work.

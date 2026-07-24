@@ -20,7 +20,6 @@ from seasonalweather.swwp.auth import AuthenticatedPrincipal, StaticRegistration
 from seasonalweather.swwp.constants import ControllerState, ProtocolErrorCategory, WorkerState
 from seasonalweather.swwp.controller import ControllerSession
 from seasonalweather.swwp.messages import (
-    CapabilityManifest,
     JobAssignmentPayload,
     JobProgress,
     JobResult,
@@ -34,6 +33,7 @@ from seasonalweather.swwp.messages import (
     VersionSupport,
 )
 from seasonalweather.swwp.worker import WorkerSession
+from tests.support.capabilities import wire_manifest, wire_record
 from tests.support.swwp_simulation import DeterministicIds, SimulatedClock, SimulatedPeers
 
 NOW = dt.datetime(2026, 7, 24, 12, tzinfo=dt.UTC)
@@ -58,11 +58,15 @@ def registration(
         build_identity="build_eaaf24b",
         requested_queues=(QueueClass.ROUTINE, QueueClass.CONTROL),
         requested_slots=2,
-        capability_manifest=CapabilityManifest(
-            schema_version=1,
-            epoch=1,
-            digest="digest_00000001",
-            names=("tts.synthesis.v1", "untrusted.capability"),
+        capability_manifest=wire_manifest(
+            (
+                wire_record(
+                    "tts.synthesis.v1",
+                    now=NOW,
+                    parameters={"format": "wav"},
+                ),
+                wire_record("untrusted.capability", now=NOW),
+            )
         ),
         supported_versions=versions
         or VersionSupport(
@@ -118,6 +122,10 @@ class FakeDurable:
     def acknowledge(self, lease: LeaseRef):
         assert lease == LEASE
         self.acknowledged += 1
+        return object()
+
+    def reject_unacknowledged(self, lease: LeaseRef):
+        assert lease == LEASE
         return object()
 
     def renew(self, lease: LeaseRef):

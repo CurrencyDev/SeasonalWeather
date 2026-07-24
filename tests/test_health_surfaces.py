@@ -14,6 +14,7 @@ import yaml
 from seasonalweather.api.api import create_app
 from seasonalweather.api.commands import CommandStore
 from seasonalweather.auth import AuthenticationRepository, AuthenticationService
+from seasonalweather.capabilities.registry import CapabilityRegistry
 from seasonalweather.config import load_config
 from seasonalweather.database.core import SeasonalDatabase
 from seasonalweather.health_service import (
@@ -23,7 +24,10 @@ from seasonalweather.health_service import (
     HealthService,
     build_runtime_health_service,
 )
+from seasonalweather.jobs.policies import JobType
 from seasonalweather.lifecycle import Lifecycle
+from seasonalweather.swwp.capability_adapter import manifest_from_wire
+from tests.support.capabilities import wire_manifest, wire_record
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -428,6 +432,28 @@ def test_runtime_report_is_truthful_bounded_and_secret_free(
         ),
         _paths=lambda: paths,
     )
+    capability_registry = CapabilityRegistry(allowed_capabilities=frozenset({"tts.synthesis.v1"}))
+    capability_registry.register(
+        worker_id="worker_00000001",
+        worker_instance_id="instance_00000001",
+        session_id="session_00000001",
+        manifest=manifest_from_wire(
+            wire_manifest(
+                (
+                    wire_record(
+                        "tts.synthesis.v1",
+                        now=dt.datetime(2026, 7, 24, tzinfo=dt.UTC),
+                        parameters={"format": "wav"},
+                    ),
+                )
+            )
+        ),
+        authorized_capabilities=frozenset({"tts.synthesis.v1"}),
+        authorized_job_types=frozenset({JobType.TTS_SYNTHESIZE}),
+        payload_versions={JobType.TTS_SYNTHESIZE: 1},
+        result_versions={JobType.TTS_SYNTHESIZE: 1},
+        now=dt.datetime.now(dt.UTC),
+    )
     service = build_runtime_health_service(
         runtime,
         command_store=CommandStore(),
@@ -450,6 +476,8 @@ def test_runtime_report_is_truthful_bounded_and_secret_free(
                 },
             )
         ),
+        capability_registry=capability_registry,
+        required_capabilities=("tts.synthesis.v1",),
     )
 
     async def collect_with_conductor() -> dict[str, Any]:
@@ -478,7 +506,9 @@ def test_runtime_report_is_truthful_bounded_and_secret_free(
     assert components["segments"]["details"]["stale_count"] == 1
     assert components["job_repository"]["state"] == "healthy"
     assert components["job_repository"]["required"] is True
-    assert components["workers"]["state"] == "not_applicable"
+    assert components["workers"]["state"] == "healthy"
+    assert components["workers"]["required"] is True
+    assert components["workers"]["details"]["qualified_workers"] == 1
     assert components["postgresql"]["state"] == "not_applicable"
     assert components["redis"]["state"] == "not_applicable"
     assert components["source_nwws_oi"]["age_seconds"] == 31_536_000

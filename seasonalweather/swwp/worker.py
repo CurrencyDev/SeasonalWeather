@@ -6,12 +6,19 @@ import datetime as dt
 from collections.abc import Callable
 from typing import Any
 
+from ..capabilities.manifest import manifest_digest
 from ..jobs.contracts import AttemptOutcome
 from ..jobs.policies import FailureCategory
+from .capability_adapter import record_from_wire
 from .constants import ProtocolErrorCategory, WorkerState
 from .messages import (
     Cancel,
     CancelAcknowledged,
+    CapabilityProbe,
+    CapabilityRecordPayload,
+    CapabilityRejectionCategory,
+    CapabilityReport,
+    CapabilityUpdate,
     Drain,
     Drained,
     Envelope,
@@ -55,6 +62,7 @@ class WorkerSession(SessionMachine):
         self.assignments: dict[tuple[str, str, str, int], JobAssignmentPayload] = {}
         self.completions: dict[tuple[str, str, str, int], JobResult] = {}
         self.cancelled: set[tuple[str, str, str, int]] = set()
+        self.capability_manifest = registration.capability_manifest
 
     def _out(self, payload: object) -> Envelope:
         return self.envelope(
@@ -107,6 +115,7 @@ class WorkerSession(SessionMachine):
             ResultCommitted: self._result_committed,
             ReconcileResult: self._reconciled,
             ProtocolErrorPayload: self._protocol_error,
+            CapabilityProbe: self._capability_probe,
         }
         handler = handlers.get(type(payload))
         return handler(payload) if handler is not None else ()
@@ -122,6 +131,11 @@ class WorkerSession(SessionMachine):
         self.session_id = payload.session_id
         self.controller_epoch = payload.controller_epoch
         self.state = WorkerState.ACTIVE
+        if (
+            payload.capability_epoch != self.capability_manifest.epoch
+            or payload.capability_digest != self.capability_manifest.digest
+        ):
+            raise ValueError("registered capability baseline does not match")
         return ()
 
     def _assignment(self, payload: JobAssignmentPayload) -> tuple[Envelope, ...]:
@@ -136,8 +150,9 @@ class WorkerSession(SessionMachine):
                 self._out(
                     JobRejected(
                         lease=payload.lease,
-                        category="capacity_unavailable",
+                        category=CapabilityRejectionCategory.CAPACITY_UNAVAILABLE,
                         summary="simulated worker rejected assignment",
+                        capabilities=payload.capability_requirements,
                     )
                 ),
             )
@@ -177,6 +192,33 @@ class WorkerSession(SessionMachine):
             self.state = WorkerState.FAILED
         return ()
 
+    def _capability_probe(self, payload: CapabilityProbe) -> tuple[Envelope, ...]:
+        if self.state not in {WorkerState.ACTIVE, WorkerState.DRAINING}:
+            raise ValueError("capability probe requires a live worker")
+        records = self.capability_manifest.records
+        if not payload.full:
+            targets = set(payload.names)
+            records = tuple(record for record in records if record.name in targets)
+            if tuple(record.name for record in records) != payload.names:
+                raise ValueError("targeted capability is not implemented")
+        next_epoch = self.capability_manifest.epoch + 1
+        self.capability_manifest = self.capability_manifest.model_copy(update={"epoch": next_epoch})
+        return (
+            self._out(
+                CapabilityReport(
+                    probe_id=payload.probe_id,
+                    schema_version=self.capability_manifest.schema_version,
+                    epoch=next_epoch,
+                    records=records,
+                    full_digest=self.capability_manifest.digest,
+                    validity_seconds=min(
+                        (record.validity_seconds for record in records),
+                        default=1,
+                    ),
+                )
+            ),
+        )
+
     def _validate_session(self, incoming: Envelope) -> None:
         if (
             incoming.session_id != self.session_id
@@ -194,7 +236,50 @@ class WorkerSession(SessionMachine):
     def heartbeat(self) -> Envelope:
         if self.state not in {WorkerState.ACTIVE, WorkerState.DRAINING}:
             raise ValueError("worker is not active")
-        return self._out(Heartbeat(active_leases=tuple(item.lease for item in self.assignments.values())))
+        return self._out(
+            Heartbeat(
+                active_leases=tuple(item.lease for item in self.assignments.values()),
+                capability_epoch=self.capability_manifest.epoch,
+                capability_digest=self.capability_manifest.digest,
+            )
+        )
+
+    def capability_update(
+        self,
+        *,
+        changed: tuple[CapabilityRecordPayload, ...] = (),
+        removed: tuple[str, ...] = (),
+        validity_seconds: int,
+    ) -> Envelope:
+        if self.state not in {WorkerState.ACTIVE, WorkerState.DRAINING}:
+            raise ValueError("worker is not active")
+        records = {record.name: record for record in self.capability_manifest.records}
+        for name in removed:
+            records.pop(name, None)
+        for record in changed:
+            records[record.name] = record
+        normalized = tuple(sorted(records.values(), key=lambda item: item.name))
+        digest = manifest_digest(
+            schema_version=self.capability_manifest.schema_version,
+            records=tuple(record_from_wire(item) for item in normalized),
+        )
+        epoch = self.capability_manifest.epoch + 1
+        self.capability_manifest = self.capability_manifest.model_copy(
+            update={
+                "epoch": epoch,
+                "digest": digest,
+                "records": normalized,
+            }
+        )
+        return self._out(
+            CapabilityUpdate(
+                epoch=epoch,
+                changed=changed,
+                removed=tuple(sorted(set(removed))),
+                full_digest=digest,
+                validity_seconds=validity_seconds,
+            )
+        )
 
     def progress(
         self,
@@ -281,4 +366,5 @@ class WorkerSession(SessionMachine):
             self.state = WorkerState.DISCONNECTED
             self.session_id = None
             self.controller_epoch = None
+            self.registration = self.registration.model_copy(update={"capability_manifest": self.capability_manifest})
             self.reset_message_sequence()

@@ -225,11 +225,13 @@ class JobRepository:
         queues: Iterable[QueueClass] | None = None,
         executors: Iterable[ExecutorClass] | None = None,
         capabilities: Iterable[str] = (),
+        candidate_job_ids: Iterable[str] | None = None,
     ) -> JobAssignment | None:
         owner = self._bounded_identifier(owner, "lease owner")
         queue_values = {item.value for item in queues or QueueClass}
         executor_values = {item.value for item in executors or ExecutorClass}
         available = frozenset(capabilities)
+        candidates = frozenset(candidate_job_ids or ())
         now_iso = _iso(now)
         with self.database.transaction() as conn:
             rows = conn.execute(
@@ -249,6 +251,7 @@ class JobRepository:
                 queue_values=queue_values,
                 executor_values=executor_values,
                 available=available,
+                candidate_job_ids=candidates,
             )
             if row is None:
                 return None
@@ -389,6 +392,35 @@ class JobRepository:
                 _iso(at),
             )
         return started
+
+    def reject_unacknowledged(
+        self,
+        *,
+        job_id: str,
+        lease_id: str,
+        attempt_id: str,
+        owner: str,
+        at: dt.datetime,
+    ) -> JobRecord:
+        """Release a current pre-acceptance lease without a handler outcome."""
+
+        now_iso = _iso(at)
+        with self.database.transaction() as conn:
+            row = self._current_lease(
+                conn,
+                job_id,
+                lease_id,
+                attempt_id,
+                owner,
+            )
+            if row["status"] != JobStatus.LEASED.value:
+                raise StaleJobMutationError("only an unacknowledged lease may be rejected")
+            self._release_unacknowledged(conn, row, now_iso)
+            updated = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+        return self._job(updated)
 
     def renew(
         self,
@@ -1209,6 +1241,7 @@ class JobRepository:
         queue_values: set[str],
         executor_values: set[str],
         available: frozenset[str],
+        candidate_job_ids: frozenset[str],
     ) -> sqlite3.Row | None:
         return next(
             (
@@ -1216,6 +1249,7 @@ class JobRepository:
                 for row in rows
                 if row["queue"] in queue_values
                 and row["executor"] in executor_values
+                and (not candidate_job_ids or row["job_id"] in candidate_job_ids)
                 and self._capabilities_satisfied(row, available)
             ),
             None,

@@ -56,6 +56,30 @@ swwp_non_adapter_forbidden_imports = [
   "seasonalweather.job_store",
 ]
 
+capability_roots = ["seasonalweather/capabilities"]
+capability_adapter_roots = ["seasonalweather/capabilities/service.py"]
+capability_forbidden_imports = [
+  "fastapi",
+  "starlette",
+  "uvicorn",
+  "websocket",
+  "websockets",
+  "seasonalweather.api",
+  "seasonalweather.broadcast",
+  "seasonalweather.control",
+  "seasonalweather.liquidsoap_telnet",
+  "seasonalweather.nwws",
+  "seasonalweather.tts",
+  "seasonalweather.worker",
+  "seasonalweather.workers",
+  "tests",
+  "sqlite3",
+]
+capability_non_adapter_forbidden_imports = [
+  "seasonalweather.job_store",
+  "seasonalweather.swwp",
+]
+
 api_roots = ["seasonalweather/api"]
 api_forbidden_imports = [
   "seasonalweather.database",

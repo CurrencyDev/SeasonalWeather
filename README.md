@@ -83,6 +83,11 @@ Freeze products are supported natively. `FZ.W` maps to SAME `FZW` (**Freeze Warn
   machines, and simulated-only protocol validation are documented in
   [`docs/swwp.md`](docs/swwp.md); there is no production socket or worker
   process yet.
+- Dynamic worker capability records, epochs/digests, freshness, probes,
+  qualification, and capacity reservations are implemented for deterministic
+  simulated peers and documented in
+  [`docs/worker-capabilities.md`](docs/worker-capabilities.md). They do not add
+  a live worker or execution path.
 - Public handled-alerts feed API (`/v1/handled-alerts`) for external UI consumption, backed by SQLite.
   Persisted station-feed rows remain authoritative across restarts; startup does not synthesize degraded public records from AlertTracker state.
 

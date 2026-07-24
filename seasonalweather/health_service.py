@@ -260,6 +260,8 @@ def build_runtime_health_service(
     command_store: Any,
     auth_service: Any,
     job_service: Any = None,
+    capability_registry: Any = None,
+    required_capabilities: Iterable[str] = (),
     timeout_seconds: float = 1.0,
 ) -> HealthService:
     """Build probes from current controller-owned runtime capabilities."""
@@ -478,13 +480,65 @@ def build_runtime_health_service(
             )
         )
 
-    probes.extend(
-        (
-            _constant_probe(
+    required_capability_names = tuple(sorted(set(required_capabilities)))[:16]
+
+    async def workers_probe() -> HealthComponent:
+        if capability_registry is None:
+            return _component(
                 "workers",
                 ComponentState.NOT_APPLICABLE,
-                reason="not_implemented",
-            ),
+                bool(required_capability_names),
+                "simulated_only",
+            )
+        now = _utc_now()
+        summary = capability_registry.health(now)
+        snapshots = capability_registry.snapshots(now)
+        satisfied = {
+            record.name
+            for snapshot in snapshots
+            if snapshot.connected and snapshot.trusted and not snapshot.probe_required
+            for record in snapshot.records
+            if snapshot.effective_capacity.get(record.name, 0) > 0
+        }
+        missing = set(required_capability_names) - satisfied
+        if missing:
+            state = ComponentState.UNAVAILABLE
+            reason = "required_capability_unavailable"
+        elif summary.connected_workers == 0:
+            state = ComponentState.NOT_APPLICABLE
+            reason = "no_simulated_workers"
+        elif summary.unknown_workers or summary.stale_capabilities:
+            state = ComponentState.DEGRADED
+            reason = "capability_requalification_required"
+        else:
+            state = ComponentState.HEALTHY
+            reason = "capabilities_qualified"
+        return _component(
+            "workers",
+            state,
+            bool(required_capability_names),
+            reason,
+            details={
+                "active_assignments": summary.active_assignments,
+                "connected_workers": summary.connected_workers,
+                "effective_capacity": summary.effective_capacity,
+                "missing_required": len(missing),
+                "outstanding_probes": summary.outstanding_probes,
+                "qualified_workers": summary.qualified_workers,
+                "stale_capabilities": summary.stale_capabilities,
+                "unknown_workers": summary.unknown_workers,
+            },
+        )
+
+    probes.append(
+        ComponentProbe(
+            "workers",
+            bool(required_capability_names),
+            workers_probe,
+        )
+    )
+    probes.extend(
+        (
             _constant_probe(
                 "postgresql",
                 ComponentState.NOT_APPLICABLE,

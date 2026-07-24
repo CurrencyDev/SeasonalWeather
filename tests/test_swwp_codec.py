@@ -24,7 +24,6 @@ from seasonalweather.swwp.messages import (
     PAYLOAD_TYPES,
     Cancel,
     CancelAcknowledged,
-    CapabilityManifest,
     CapabilityProbe,
     CapabilityReport,
     CapabilityUpdate,
@@ -53,6 +52,7 @@ from seasonalweather.swwp.messages import (
     SelectedVersions,
     VersionSupport,
 )
+from tests.support.capabilities import wire_manifest, wire_record
 
 NOW = dt.datetime(2026, 7, 24, 12, tzinfo=dt.UTC)
 LEASE = LeaseRef(
@@ -61,11 +61,14 @@ LEASE = LeaseRef(
     attempt_id="attempt_00000001",
     attempt=1,
 )
-MANIFEST = CapabilityManifest(
-    schema_version=1,
-    epoch=1,
-    digest="digest_00000001",
-    names=("tts.synthesis.v1",),
+MANIFEST = wire_manifest(
+    (
+        wire_record(
+            "tts.synthesis.v1",
+            now=NOW,
+            parameters={"format": "wav"},
+        ),
+    )
 )
 VERSIONS = VersionSupport(
     swwp=(1,),
@@ -136,6 +139,9 @@ def _payloads():
             selected_versions=SELECTED,
             max_message_bytes=65536,
             max_active_assignments=2,
+            effective_capabilities=("tts.synthesis.v1",),
+            capability_epoch=MANIFEST.epoch,
+            capability_digest=MANIFEST.digest,
         ),
         RegistrationRejected(
             category=ProtocolErrorCategory.UNSUPPORTED_VERSION,
@@ -143,12 +149,34 @@ def _payloads():
             supported_subprotocols=(SUBPROTOCOL,),
             supported_swwp_versions=(1,),
         ),
-        Heartbeat(active_leases=(LEASE,), capability_epoch=1, capability_digest="digest_00000001"),
+        Heartbeat(
+            active_leases=(LEASE,),
+            capability_epoch=1,
+            capability_digest=MANIFEST.digest,
+        ),
         HeartbeatAck(renewed=(LEASE,)),
-        CapabilityUpdate(manifest=MANIFEST),
-        CapabilityUpdateAck(epoch=1, digest="digest_00000001"),
-        CapabilityProbe(probe_id="probe_00000001", names=("tts.synthesis.v1",)),
-        CapabilityReport(probe_id="probe_00000001", manifest=MANIFEST, evidence={"ready": True}),
+        CapabilityUpdate(
+            epoch=2,
+            changed=MANIFEST.records,
+            full_digest=MANIFEST.digest,
+            validity_seconds=60,
+        ),
+        CapabilityUpdateAck(epoch=2, digest=MANIFEST.digest),
+        CapabilityProbe(
+            probe_id="probe_00000001",
+            full=False,
+            names=("tts.synthesis.v1",),
+            reason="internal",
+            deadline_at=NOW + dt.timedelta(seconds=15),
+        ),
+        CapabilityReport(
+            probe_id="probe_00000001",
+            schema_version=1,
+            epoch=2,
+            records=MANIFEST.records,
+            full_digest=MANIFEST.digest,
+            validity_seconds=60,
+        ),
         assignment,
         JobAccepted(lease=LEASE),
         JobRejected(lease=LEASE, category="capacity_unavailable", summary="busy"),

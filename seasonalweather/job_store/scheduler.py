@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime as dt
 from collections.abc import Callable, Iterable
 
-from ..jobs.contracts import AttemptOutcome, JobError, JobRecord
+from ..jobs.contracts import AttemptOutcome, JobError, JobRecord, JobStatus
 from ..jobs.policies import ExecutorClass, QueueClass
 from ..lifecycle import Lifecycle, WorkClass
 from .models import JobAssignment, ResultCommitReceipt
@@ -39,6 +39,7 @@ class JobScheduler:
         queues: Iterable[QueueClass] | None = None,
         executors: Iterable[ExecutorClass] | None = None,
         capabilities: Iterable[str] = (),
+        candidate_job_ids: Iterable[str] | None = None,
     ) -> JobAssignment | None:
         self.lifecycle.require(WorkClass.JOB_LEASE)
         return self.repository.acquire_next(
@@ -49,10 +50,35 @@ class JobScheduler:
             queues=queues,
             executors=executors,
             capabilities=capabilities,
+            candidate_job_ids=candidate_job_ids,
+        )
+
+    def pending_candidates(self, *, limit: int = 128) -> tuple[JobRecord, ...]:
+        now = self.clock()
+        jobs = self.repository.list_jobs(statuses=(JobStatus.PENDING,), limit=limit)
+        return tuple(
+            sorted(
+                (job for job in jobs if not job.cancel_requested and job.not_before <= now < job.deadline_at),
+                key=lambda job: (
+                    int(job.priority),
+                    job.not_before,
+                    job.created_at,
+                    job.job_id,
+                ),
+            )
         )
 
     def acknowledge(self, assignment: JobAssignment) -> JobRecord:
         return self.repository.acknowledge(
+            job_id=assignment.job.job_id,
+            lease_id=assignment.lease_id,
+            attempt_id=assignment.attempt_id,
+            owner=assignment.lease_owner,
+            at=self.clock(),
+        )
+
+    def reject_unacknowledged(self, assignment: JobAssignment) -> JobRecord:
+        return self.repository.reject_unacknowledged(
             job_id=assignment.job.job_id,
             lease_id=assignment.lease_id,
             attempt_id=assignment.attempt_id,

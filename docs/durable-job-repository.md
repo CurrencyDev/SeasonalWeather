@@ -71,6 +71,12 @@ deadline, cancellation state, and declared static capability names, then
 atomically leases one job. It returns a typed `JobAssignment` to a future
 consumer port and invokes no handler.
 
+P1-09 adds a narrow qualified-assignment input. Its ephemeral capability
+service first evaluates and reserves a worker snapshot, then asks this
+repository to acquire only the selected job ID. The repository still rechecks
+static capability names and all durable eligibility predicates atomically.
+The reservation is never persisted here and cannot create a job or lease.
+
 Each assignment has an opaque lease ID, a distinct attempt ID, positive
 monotonic attempt number, bounded owner, assignment acknowledgment deadline,
 and lease expiry capped by the absolute job deadline. Acknowledgment starts
@@ -164,7 +170,7 @@ P1-07 deliberately does not own SWWP. P1-08 adds a separate
 `seasonalweather.swwp` package whose sole concrete adapter calls these public
 repository/scheduler ports; its schemas, session machines, and test-only
 simulated peers are documented in [`swwp.md`](swwp.md). There is still no live
-connection, worker handler/process, dynamic capability or capacity health,
-embedded production executor, artifact staging or promotion, active-file
-mutation, result fencing/publication, PostgreSQL, Redis, container, or
-deployment behavior.
+connection, worker handler/process, embedded production executor, artifact
+staging or promotion, active-file mutation, result fencing/publication,
+PostgreSQL, Redis, container, or deployment behavior. P1-09 dynamic capability
+state remains simulated-only and ephemeral.
