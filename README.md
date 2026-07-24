@@ -182,10 +182,30 @@ model for development, recovery, loopback-only administration, minimal
 deployments, and break-glass access. `hybrid` is migration-only compatibility,
 not a preferred steady state.
 
-Operational `exchange` and `hybrid` authentication are not available until the
-P1-03 token-exchange work is implemented. Selecting either mode currently stops
-configuration loading with a structured compatibility error; neither mode
-degrades to static or unauthenticated access.
+`exchange` uses controller-owned SQLite client and access-token records.
+Long-lived client credentials use the strict
+`swc_<public-id>.<secret>` format and are accepted only as
+`Authorization: SeasonalClient ...` on `/v1/auth/token` and
+`/v1/auth/revoke`. Short-lived access tokens use the disjoint
+`swa_<public-id>.<secret>` format and are accepted only as Bearer credentials on
+protected resources. Credentials are generated with secure randomness; only
+one-way SHA-256 verifiers are stored. Raw client credentials are shown only by
+client creation or rotation, and raw access tokens are shown only by successful
+issuance. There are no refresh tokens.
+
+Each client has explicit scopes, an explicit unrestricted-route selection or
+segment-aware route prefixes, and one or more IPv4/IPv6 CIDRs. Disabled,
+expired, revoked, or rotated clients cannot exchange or use tokens. Disablement
+and rotation revoke current access tokens; enabling a client does not resurrect
+them. Client revocation is terminal. Direct ASGI peer addresses are used for
+CIDR checks; arbitrary forwarded-address headers are not trusted.
+
+Access tokens default to 900 seconds. The configured minimum is 60 seconds, the
+read-only maximum is 3600 seconds, and the write-capable maximum is 900 seconds.
+Write capability comes from the central route/scope policy, including wildcard
+behavior. Tokens never outlive their client. The controller SQLite database
+configured under `database.path` stores auth state and bounded, secret-free
+audit events.
 
 Canonical static configuration uses `api.auth.mode: static`, a non-placeholder
 `SEASONAL_API_TOKEN`, and one space-separated `api.auth.scopes` string. The
@@ -197,6 +217,38 @@ may normalize to static only when exactly one valid legacy credential source is
 present; the effective configuration reports that normalization. Legacy
 comma-separated single-token scopes remain accepted only as an unmixed
 compatibility form.
+
+For remote API use, terminate TLS before credentials cross an untrusted
+network. Credentials are accepted only in the `Authorization` header, never in
+query strings, cookies, paths, or redirects. Keep a narrowly scoped static
+credential for documented break-glass use where appropriate. A normal
+migration is `static` → migration-only `hybrid` → `exchange`; verify exchange
+clients before removing the static compatibility path.
+
+### Authentication administration
+
+Local client administration uses the same repository and application service
+as the API:
+
+```bash
+seasonalweather auth --config /etc/seasonalweather/config.yaml client create \
+  --subject automation \
+  --scope read:status \
+  --route-prefix /v1/status \
+  --cidr 127.0.0.1/32
+seasonalweather auth --config /etc/seasonalweather/config.yaml client list
+seasonalweather auth --config /etc/seasonalweather/config.yaml client show CLIENT_ID
+seasonalweather auth --config /etc/seasonalweather/config.yaml client rotate CLIENT_ID
+seasonalweather auth --config /etc/seasonalweather/config.yaml client disable CLIENT_ID
+seasonalweather auth --config /etc/seasonalweather/config.yaml client enable CLIENT_ID
+seasonalweather auth --config /etc/seasonalweather/config.yaml client revoke CLIENT_ID
+```
+
+Use `--json` before `client` for deterministic machine-readable output.
+`create` and `rotate` are the only commands that print a raw client credential;
+capture that one-time value securely. Use `--unrestricted-routes` instead of
+`--route-prefix` only when unrestricted protected-route access is deliberate.
+`--expires-at` accepts an offset-aware ISO 8601 timestamp.
 
 ## HTTP API contract
 
@@ -212,6 +264,15 @@ require an `Idempotency-Key` header. Scheduled broadcast inserts live under
 `/v1/inserts/*` and require the `control:inserts` scope; they add bounded,
 non-SAME text or uploaded-audio segments into the normal cycle without flushing
 the Liquidsoap cycle queue.
+
+`POST /v1/auth/token` and `POST /v1/auth/revoke` are available only in
+`exchange` and `hybrid`. Both authenticate the client with
+`Authorization: SeasonalClient swc_<public-id>.<secret>`. Token requests accept
+only optional `scopes` and `ttl_seconds`; successful no-store responses return
+`access_token`, `token_type: Bearer`, `expires_in`, and effective `scopes`.
+Revocation accepts only `{"token": "swa_..."}`. Well-formed unknown, expired,
+already revoked, or not-owned tokens receive the same idempotent success
+response and are not enumerated.
 
 For the wrapper install/runtime contract, see `docs/runtime-wrappers.md`.
 

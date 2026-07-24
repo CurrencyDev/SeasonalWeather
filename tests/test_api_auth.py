@@ -227,12 +227,12 @@ def test_effective_configuration_reports_auth_without_credentials(
 
     summary = asyncio.run(control.get_config_summary())
 
-    assert summary["api"]["auth"] == {
-        "mode": "static",
-        "credential_count": 1,
-        "legacy_mode_normalized": False,
-        "legacy_scope_normalized": False,
-    }
+    assert summary["api"]["auth"]["mode"] == "static"
+    assert summary["api"]["auth"]["credential_count"] == 1
+    assert summary["api"]["auth"]["legacy_mode_normalized"] is False
+    assert summary["api"]["auth"]["legacy_scope_normalized"] is False
+    assert summary["api"]["auth"]["exchange_available"] is False
+    assert summary["api"]["auth"]["ttl_policy"]["default_seconds"] == 900
     assert sentinel not in repr(summary)
 
 

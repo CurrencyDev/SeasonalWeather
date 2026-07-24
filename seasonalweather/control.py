@@ -389,6 +389,19 @@ class OrchestratorControl:
                     "credential_count": len(cfg.api.auth.credentials),
                     "legacy_mode_normalized": cfg.api.auth.legacy_mode_normalized,
                     "legacy_scope_normalized": cfg.api.auth.legacy_scope_normalized,
+                    "exchange_available": bool(
+                        cfg.database.enabled and cfg.api.auth.mode.value in {"exchange", "hybrid"}
+                    ),
+                    "store": {
+                        "kind": "controller-sqlite",
+                        "path": cfg.database.path,
+                    },
+                    "ttl_policy": {
+                        "minimum_seconds": cfg.api.auth.exchange.minimum_ttl_seconds,
+                        "default_seconds": cfg.api.auth.exchange.default_ttl_seconds,
+                        "maximum_read_seconds": cfg.api.auth.exchange.maximum_read_ttl_seconds,
+                        "maximum_write_seconds": cfg.api.auth.exchange.maximum_write_ttl_seconds,
+                    },
                 },
                 "allow_remote": cfg.api.allow_remote,
             },

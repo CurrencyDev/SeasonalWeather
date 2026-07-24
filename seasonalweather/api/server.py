@@ -11,6 +11,8 @@ from .commands import CommandStore
 from ..config import load_config
 from ..control import OrchestratorControl
 from ..database.bootstrap import bootstrap_database_from_config
+from ..auth import AuthenticationRepository, AuthenticationService
+from ..config import AuthMode
 from ..main import Orchestrator, _setup_logging
 
 
@@ -23,7 +25,14 @@ async def run_api_server(*, config_path: str, host: str, port: int) -> None:
     orch = Orchestrator(cfg)
     control = OrchestratorControl(orch, config_path=config_path)
     db = bootstrap_database_from_config(cfg) if getattr(cfg.database, "enabled", True) else None
-    app = create_app(control, store=CommandStore(database=db))
+    if cfg.api.auth.mode in {AuthMode.EXCHANGE, AuthMode.HYBRID} and db is None:
+        raise RuntimeError("Exchange authentication requires the controller SQLite database.")
+    auth_service = (
+        AuthenticationService(AuthenticationRepository(db), cfg.api.auth.exchange)
+        if db is not None and cfg.api.auth.mode in {AuthMode.EXCHANGE, AuthMode.HYBRID}
+        else None
+    )
+    app = create_app(control, store=CommandStore(database=db), auth_service=auth_service)
 
     server = uvicorn.Server(
         uvicorn.Config(

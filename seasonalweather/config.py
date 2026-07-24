@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -28,6 +27,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
+from .auth.policy import KNOWN_API_SCOPES as _KNOWN_API_SCOPES
+from .auth.policy import SCOPE_RE as _AUTH_SCOPE_RE
 from .broadcast.tests import normalize_postpone_policy
 from .alerts.focus import (
     AlertFocusPolicy,
@@ -604,9 +605,18 @@ class StaticCredentialConfig:
 
 
 @dataclass(frozen=True)
+class ExchangeAuthConfig:
+    minimum_ttl_seconds: int = 60
+    default_ttl_seconds: int = 900
+    maximum_read_ttl_seconds: int = 3600
+    maximum_write_ttl_seconds: int = 900
+
+
+@dataclass(frozen=True)
 class ApiAuthConfig:
     mode: AuthMode
     credentials: tuple[StaticCredentialConfig, ...] = field(repr=False)
+    exchange: ExchangeAuthConfig
     legacy_mode_normalized: bool
     legacy_scope_normalized: bool
 
@@ -871,24 +881,7 @@ def _upper_list(value: Any) -> List[str]:
     return out
 
 
-_AUTH_SCOPE_RE = re.compile(r"^(?:\*|[a-z][a-z0-9_-]*:[a-z][a-z0-9_-]*)$")
-
-_DEFAULT_ADMIN_SCOPES = frozenset(
-    {
-        "read:health",
-        "read:status",
-        "read:alerts",
-        "read:config",
-        "control:cycle",
-        "control:mode",
-        "control:tests",
-        "control:originate",
-        "control:audio",
-        "control:inserts",
-        "control:config",
-    }
-)
-_KNOWN_API_SCOPES = _DEFAULT_ADMIN_SCOPES | {"*"}
+_DEFAULT_ADMIN_SCOPES = _KNOWN_API_SCOPES - {"*"}
 
 
 def _auth_error(
@@ -1122,6 +1115,43 @@ def _parse_static_credentials(
     )
 
 
+def _load_exchange_auth_config(auth_block: dict[str, Any] | None) -> ExchangeAuthConfig:
+    exchange_raw = auth_block.get("exchange", {}) if auth_block is not None else {}
+    if not isinstance(exchange_raw, dict):
+        raise _auth_error(
+            "invalid_type",
+            "api.auth.exchange",
+            "Exchange authentication configuration must be an object.",
+        )
+    try:
+        exchange = ExchangeAuthConfig(
+            minimum_ttl_seconds=int(exchange_raw.get("minimum_ttl_seconds", 60)),
+            default_ttl_seconds=int(exchange_raw.get("default_ttl_seconds", 900)),
+            maximum_read_ttl_seconds=int(exchange_raw.get("maximum_read_ttl_seconds", 3600)),
+            maximum_write_ttl_seconds=int(exchange_raw.get("maximum_write_ttl_seconds", 900)),
+        )
+    except (TypeError, ValueError) as exc:
+        raise _auth_error(
+            "invalid_ttl_policy",
+            "api.auth.exchange",
+            "Exchange token TTL policy must contain integers.",
+        ) from exc
+    ordered = (
+        0
+        < exchange.minimum_ttl_seconds
+        <= exchange.default_ttl_seconds
+        <= exchange.maximum_write_ttl_seconds
+        <= exchange.maximum_read_ttl_seconds
+    )
+    if not ordered:
+        raise _auth_error(
+            "invalid_ttl_policy",
+            "api.auth.exchange",
+            "Exchange token TTL policy is invalid.",
+        )
+    return exchange
+
+
 def _load_api_auth_config(api_raw: Any) -> ApiAuthConfig:
     if not isinstance(api_raw, dict):
         raise _auth_error(
@@ -1173,24 +1203,23 @@ def _load_api_auth_config(api_raw: Any) -> ApiAuthConfig:
         scope_path = "api.scopes"
         legacy_mode = True
 
-    if mode in {AuthMode.EXCHANGE, AuthMode.HYBRID}:
-        raise _auth_error(
-            "authenticator_unavailable",
-            "api.auth.mode",
-            "The configured authentication mode requires an exchange authenticator that is unavailable.",
-            details={"mode": mode.value, "available_modes": [AuthMode.STATIC.value]},
-        )
+    exchange = _load_exchange_auth_config(auth_block)
 
-    credentials, legacy_scope = _parse_static_credentials(
-        single_token=single_token,
-        tokens_json=tokens_json,
-        subject=subject,
-        scope_value=scope_value,
-        scope_path=scope_path,
-    )
+    if mode is AuthMode.EXCHANGE:
+        credentials: tuple[StaticCredentialConfig, ...] = ()
+        legacy_scope = False
+    else:
+        credentials, legacy_scope = _parse_static_credentials(
+            single_token=single_token,
+            tokens_json=tokens_json,
+            subject=subject,
+            scope_value=scope_value,
+            scope_path=scope_path,
+        )
     return ApiAuthConfig(
         mode=mode,
         credentials=credentials,
+        exchange=exchange,
         legacy_mode_normalized=legacy_mode,
         legacy_scope_normalized=legacy_scope,
     )

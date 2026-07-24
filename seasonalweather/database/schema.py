@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 MIGRATIONS: dict[int, tuple[str, ...]] = {
     1: (
@@ -107,7 +107,6 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         "CREATE INDEX IF NOT EXISTS idx_api_commands_status_finished_at ON api_commands (status, finished_at)",
         "CREATE INDEX IF NOT EXISTS idx_audio_assets_expires_at ON audio_assets (expires_at)",
     ),
-
     3: (
         """
         CREATE TABLE IF NOT EXISTS station_feed_alerts (
@@ -121,7 +120,6 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         "CREATE INDEX IF NOT EXISTS idx_station_feed_alerts_expires_at ON station_feed_alerts (expires_at)",
         "CREATE INDEX IF NOT EXISTS idx_station_feed_alerts_updated_at ON station_feed_alerts (updated_at)",
     ),
-
     4: (
         """
         CREATE TABLE IF NOT EXISTS cycle_inserts (
@@ -152,5 +150,60 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         "CREATE INDEX IF NOT EXISTS idx_cycle_inserts_status_expires ON cycle_inserts (status, expires_at)",
         "CREATE INDEX IF NOT EXISTS idx_cycle_inserts_due ON cycle_inserts (status, placement, start_after, expires_at)",
         "CREATE INDEX IF NOT EXISTS idx_cycle_inserts_audio_path ON cycle_inserts (audio_path)",
+    ),
+    5: (
+        """
+        CREATE TABLE IF NOT EXISTS auth_clients (
+            client_id TEXT PRIMARY KEY,
+            subject TEXT NOT NULL,
+            verifier_algorithm TEXT NOT NULL,
+            verifier_digest TEXT NOT NULL,
+            scopes_json TEXT NOT NULL,
+            route_prefixes_json TEXT NOT NULL,
+            unrestricted_routes INTEGER NOT NULL CHECK (unrestricted_routes IN (0, 1)),
+            cidrs_json TEXT NOT NULL,
+            enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            expires_at TEXT,
+            revoked_at TEXT,
+            last_used_at TEXT,
+            generation INTEGER NOT NULL CHECK (generation > 0)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS auth_access_tokens (
+            token_id TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL,
+            verifier_algorithm TEXT NOT NULL,
+            verifier_digest TEXT NOT NULL,
+            scopes_json TEXT NOT NULL,
+            issued_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            revoked_at TEXT,
+            last_used_at TEXT,
+            write_capable INTEGER NOT NULL CHECK (write_capable IN (0, 1)),
+            client_generation INTEGER NOT NULL CHECK (client_generation > 0),
+            FOREIGN KEY (client_id) REFERENCES auth_clients(client_id)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_auth_access_tokens_client ON auth_access_tokens (client_id)",
+        "CREATE INDEX IF NOT EXISTS idx_auth_access_tokens_expires ON auth_access_tokens (expires_at)",
+        """
+        CREATE TABLE IF NOT EXISTS auth_audit_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            client_id TEXT NOT NULL,
+            token_id TEXT,
+            actor TEXT NOT NULL,
+            source_ip TEXT,
+            request_id TEXT,
+            reason_code TEXT NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_auth_audit_occurred ON auth_audit_events (occurred_at)",
+        "CREATE INDEX IF NOT EXISTS idx_auth_audit_client ON auth_audit_events (client_id, occurred_at)",
     ),
 }

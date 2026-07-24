@@ -13,7 +13,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .auth import ApiPrincipal, require_route_policy
+from .auth import ApiPrincipal, get_client_authentication, require_route_policy
 from .commands import CommandNotFoundError, CommandStore, IdempotencyConflictError
 from .models import (
     AudioUploadAccepted,
@@ -31,6 +31,10 @@ from .models import (
     ProblemDetails,
     RebuildCycleRequest,
     SetHeightenedModeRequest,
+    TokenExchangeRequest,
+    TokenExchangeResponse,
+    TokenRevocationRequest,
+    TokenRevocationResponse,
 )
 from .openapi import (
     API_VERSION,
@@ -41,6 +45,7 @@ from .openapi import (
     json_response,
 )
 from ..control import ControlError, OrchestratorControl
+from ..auth.service import AuthenticationError, AuthenticationService
 
 
 _CODE_RE = re.compile(r"[^a-z0-9_-]+")
@@ -178,7 +183,12 @@ def _detail_code_message(detail: Any) -> tuple[str, str, dict[str, Any]]:
     return "http_error", str(detail or "HTTP error"), {}
 
 
-def create_app(control: OrchestratorControl, *, store: CommandStore | None = None) -> FastAPI:
+def create_app(
+    control: OrchestratorControl,
+    *,
+    store: CommandStore | None = None,
+    auth_service: AuthenticationService | None = None,
+) -> FastAPI:
     command_store = store or CommandStore()
     app = FastAPI(
         title="SeasonalWeather API",
@@ -190,11 +200,14 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
     )
     app.state.control = control
     app.state.command_store = command_store
+    app.state.auth_service = auth_service
     install_openapi(app)
 
     @app.exception_handler(RequestValidationError)
     async def _handle_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
         errors = jsonable_encoder(exc.errors())
+        for error in errors:
+            error.pop("input", None)
         return _problem_response(
             request,
             status_code=422,
@@ -238,6 +251,70 @@ def create_app(control: OrchestratorControl, *, store: CommandStore | None = Non
             code="internal_error",
             detail="Unhandled server error.",
         )
+
+    @app.post(
+        "/v1/auth/token",
+        response_model=TokenExchangeResponse,
+        tags=["authentication"],
+        summary="Exchange a client credential for a short-lived access token.",
+        responses=STANDARD_PROBLEM_RESPONSES,
+    )
+    async def v1_auth_token(
+        request: Request,
+        response: Response,
+        body: TokenExchangeRequest,
+        authentication: tuple[AuthenticationService, str, str] = Depends(get_client_authentication),
+    ) -> TokenExchangeResponse:
+        service, credential, client_host = authentication
+        try:
+            issued = service.issue_token(
+                client_credential=credential,
+                source_ip=client_host,
+                requested_scopes=body.scopes,
+                requested_ttl=body.ttl_seconds,
+                request_id=_request_id(request),
+            )
+        except AuthenticationError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code, "message": str(exc)},
+                headers={"WWW-Authenticate": "SeasonalClient"} if exc.status_code == 401 else None,
+            ) from exc
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        return TokenExchangeResponse(
+            access_token=issued.access_token,
+            expires_in=issued.expires_in,
+            scopes=list(issued.scopes),
+        )
+
+    @app.post(
+        "/v1/auth/revoke",
+        response_model=TokenRevocationResponse,
+        tags=["authentication"],
+        summary="Revoke an access token owned by the calling client.",
+        responses=STANDARD_PROBLEM_RESPONSES,
+    )
+    async def v1_auth_revoke(
+        request: Request,
+        body: TokenRevocationRequest,
+        authentication: tuple[AuthenticationService, str, str] = Depends(get_client_authentication),
+    ) -> TokenRevocationResponse:
+        service, credential, client_host = authentication
+        try:
+            service.revoke_token(
+                client_credential=credential,
+                target_token=body.token,
+                source_ip=client_host,
+                request_id=_request_id(request),
+            )
+        except AuthenticationError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code, "message": str(exc)},
+                headers={"WWW-Authenticate": "SeasonalClient"} if exc.status_code == 401 else None,
+            ) from exc
+        return TokenRevocationResponse()
 
     @app.get(
         "/healthz",

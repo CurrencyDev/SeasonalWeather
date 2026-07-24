@@ -17,6 +17,7 @@ import datetime as dt
 import hashlib
 import logging
 import time
+import sys
 
 import re
 from pathlib import Path
@@ -854,9 +855,14 @@ class Orchestrator:
 
 
 def main(argv: list[str] | None = None) -> int:
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
+    if effective_argv and effective_argv[0] == "auth":
+        from .cli.auth import main as auth_main
+
+        return auth_main(effective_argv[1:])
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="/etc/seasonalweather/config.yaml")
-    args = ap.parse_args(argv)
+    args = ap.parse_args(effective_argv)
 
     cfg = load_config(args.config)
     _setup_logging(cfg)

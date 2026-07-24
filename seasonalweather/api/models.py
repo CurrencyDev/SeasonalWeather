@@ -51,6 +51,26 @@ class ApiModel(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, use_enum_values=True)
 
 
+class TokenExchangeRequest(ApiModel):
+    scopes: list[str] | None = Field(default=None, min_length=1, max_length=32)
+    ttl_seconds: int | None = Field(default=None)
+
+
+class TokenExchangeResponse(ApiModel):
+    access_token: str
+    token_type: Literal["Bearer"] = "Bearer"
+    expires_in: int
+    scopes: list[str]
+
+
+class TokenRevocationRequest(ApiModel):
+    token: str
+
+
+class TokenRevocationResponse(ApiModel):
+    revoked: bool = True
+
+
 class RebuildCycleRequest(ApiModel):
     reason: str | None = Field(default=None, min_length=1, max_length=64)
 

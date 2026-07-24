@@ -160,22 +160,38 @@ def test_single_and_multi_token_sources_conflict(
     assert exc_info.value.kind == "conflicting_credentials"
 
 
-@pytest.mark.parametrize("mode", ["exchange", "hybrid"])
-def test_exchange_dependent_modes_are_explicitly_unavailable(
+@pytest.mark.parametrize(("mode", "credential_count"), [("exchange", 0), ("hybrid", 1)])
+def test_exchange_dependent_modes_build_typed_configuration(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     mode: str,
+    credential_count: int,
 ) -> None:
     def mutate(raw: dict[str, Any]) -> None:
         raw["api"]["auth"]["mode"] = mode
 
+    cfg = _load(monkeypatch, tmp_path, mutate)
+
+    assert cfg.api.auth.mode is AuthMode(mode)
+    assert len(cfg.api.auth.credentials) == credential_count
+    assert cfg.api.auth.exchange.minimum_ttl_seconds == 60
+    assert cfg.api.auth.exchange.default_ttl_seconds == 900
+    assert cfg.api.auth.exchange.maximum_read_ttl_seconds == 3600
+    assert cfg.api.auth.exchange.maximum_write_ttl_seconds == 900
+
+
+def test_exchange_ttl_policy_ordering_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def mutate(raw: dict[str, Any]) -> None:
+        raw["api"]["auth"]["exchange"]["minimum_ttl_seconds"] = 901
+
     with pytest.raises(AuthConfigurationError) as exc_info:
         _load(monkeypatch, tmp_path, mutate)
 
-    error = exc_info.value
-    assert error.kind == "authenticator_unavailable"
-    assert error.path == "api.auth.mode"
-    assert error.details == {"mode": mode, "available_modes": ["static"]}
+    assert exc_info.value.kind == "invalid_ttl_policy"
+    assert exc_info.value.path == "api.auth.exchange"
 
 
 def test_legacy_comma_scopes_normalize_once(

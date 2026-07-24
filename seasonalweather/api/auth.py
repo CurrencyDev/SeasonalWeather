@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hmac
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, NoReturn
 
 from fastapi import Depends, Header, HTTPException, Request, status
 
+from ..auth.policy import ROUTE_AUTH_POLICIES, RouteAuthPolicy
+from ..auth.service import AuthenticationError, AuthenticationService
 from ..config import AuthMode, StaticCredentialConfig
 
 
@@ -14,6 +16,9 @@ class ApiPrincipal:
     subject: str
     scopes: frozenset[str]
     client_host: str | None
+    kind: str = "static"
+    client_id: str | None = None
+    token_id: str | None = None
 
     def has_scope(self, required: str) -> bool:
         return "*" in self.scopes or required in self.scopes
@@ -31,54 +36,6 @@ class ApiPrincipal:
             )
 
 
-@dataclass(frozen=True)
-class RouteAuthPolicy:
-    scopes: frozenset[str] = frozenset()
-
-    @property
-    def public(self) -> bool:
-        return not self.scopes
-
-
-def _protected(*scopes: str) -> RouteAuthPolicy:
-    return RouteAuthPolicy(frozenset(scopes))
-
-
-PUBLIC_ROUTE = RouteAuthPolicy()
-
-ROUTE_AUTH_POLICIES: dict[tuple[str, str], RouteAuthPolicy] = {
-    ("GET", "/openapi.json"): PUBLIC_ROUTE,
-    ("HEAD", "/openapi.json"): PUBLIC_ROUTE,
-    ("GET", "/docs"): PUBLIC_ROUTE,
-    ("HEAD", "/docs"): PUBLIC_ROUTE,
-    ("GET", "/docs/oauth2-redirect"): PUBLIC_ROUTE,
-    ("HEAD", "/docs/oauth2-redirect"): PUBLIC_ROUTE,
-    ("GET", "/redoc"): PUBLIC_ROUTE,
-    ("HEAD", "/redoc"): PUBLIC_ROUTE,
-    ("GET", "/healthz"): _protected("read:health"),
-    ("GET", "/v1/health"): _protected("read:health"),
-    ("GET", "/v1/status"): _protected("read:status"),
-    ("GET", "/v1/handled-alerts"): PUBLIC_ROUTE,
-    ("GET", "/v1/station-feed"): _protected("read:alerts"),
-    ("GET", "/v1/config/summary"): _protected("read:config"),
-    ("GET", "/v1/commands/{command_id}"): _protected("read:status"),
-    ("POST", "/v1/cycle/rebuild"): _protected("control:cycle"),
-    ("POST", "/v1/mode/heightened"): _protected("control:mode"),
-    ("DELETE", "/v1/mode/heightened"): _protected("control:mode"),
-    ("POST", "/v1/tests/originate"): _protected("control:tests"),
-    ("POST", "/v1/uploads/audio"): _protected("control:audio"),
-    ("POST", "/v1/inserts/text"): _protected("control:inserts"),
-    ("POST", "/v1/inserts/audio"): _protected("control:inserts"),
-    ("GET", "/v1/inserts"): _protected("control:inserts"),
-    ("GET", "/v1/inserts/{insert_id}"): _protected("control:inserts"),
-    ("DELETE", "/v1/inserts/{insert_id}"): _protected("control:inserts"),
-    ("POST", "/v1/originate/text"): _protected("control:originate"),
-    ("POST", "/v1/originate/audio"): _protected("control:originate"),
-    ("POST", "/v1/config/reload"): _protected("control:config"),
-    ("GET", "/v1/events"): _protected("read:status"),
-}
-
-
 def _is_loopback(host: str | None) -> bool:
     if host is None:
         return False
@@ -91,7 +48,7 @@ def _load_static_credentials() -> tuple[StaticCredentialConfig, ...]:
     if _APP_CFG is None:
         return ()
     auth = _APP_CFG.api.auth
-    if auth.mode is not AuthMode.STATIC:
+    if auth.mode not in {AuthMode.STATIC, AuthMode.HYBRID}:
         return ()
     return auth.credentials
 
@@ -103,51 +60,105 @@ def _authenticate_token(token: str) -> StaticCredentialConfig | None:
     return None
 
 
+def _checked_client_host(request: Request, *, allow_remote: bool) -> str | None:
+    client_host = request.client.host if request.client else None
+    if allow_remote or _is_loopback(client_host):
+        return client_host
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={
+            "code": "remote_client_forbidden",
+            "message": "This API only accepts loopback clients unless remote access is enabled.",
+            "details": {"client_host": client_host},
+        },
+    )
+
+
+def _authorization_value(authorization: str | None, scheme_name: str) -> str:
+    scheme, separator, value = (authorization or "").partition(" ")
+    if separator and scheme.lower() == scheme_name.lower() and value.strip():
+        return value.strip()
+    code = "missing_authorization" if not authorization else "invalid_authorization"
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail={"code": code, "message": f"Authorization must use the {scheme_name} scheme."},
+        headers={"WWW-Authenticate": scheme_name},
+    )
+
+
+def _auth_service(request: Request) -> AuthenticationService:
+    service: AuthenticationService | None = getattr(request.app.state, "auth_service", None)
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "authenticator_unavailable", "message": "Exchange authentication is unavailable."},
+        )
+    return service
+
+
+def _raise_service_error(exc: AuthenticationError, scheme: str) -> NoReturn:
+    raise HTTPException(
+        status_code=exc.status_code,
+        detail={"code": exc.code, "message": str(exc)},
+        headers={"WWW-Authenticate": scheme} if exc.status_code == 401 else None,
+    ) from exc
+
+
 async def get_api_principal(
     request: Request,
     authorization: str | None = Header(default=None),
 ) -> ApiPrincipal:
     from ..main import _APP_CFG  # late import to avoid circular dependency
-    allow_remote = (_APP_CFG.api.allow_remote if _APP_CFG else False)
-    client_host = request.client.host if request.client else None
-    if not allow_remote and not _is_loopback(client_host):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "code": "remote_client_forbidden",
-                "message": "This API only accepts loopback clients unless SEASONAL_API_ALLOW_REMOTE is enabled.",
-                "details": {"client_host": client_host},
-            },
+
+    client_host = _checked_client_host(request, allow_remote=_APP_CFG.api.allow_remote if _APP_CFG else False)
+    raw_token = _authorization_value(authorization, "Bearer")
+    mode = _APP_CFG.api.auth.mode if _APP_CFG else AuthMode.STATIC
+    exchange_family = raw_token.startswith(("swa_", "swc_"))
+    credential = None if mode is AuthMode.HYBRID and exchange_family else _authenticate_token(raw_token)
+    if credential is not None and mode in {AuthMode.STATIC, AuthMode.HYBRID}:
+        return ApiPrincipal(
+            subject=credential.subject,
+            scopes=credential.scopes,
+            client_host=client_host,
         )
 
-    if not authorization:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"code": "missing_authorization", "message": "Missing Authorization header."},
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer" or not token.strip():
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"code": "invalid_authorization", "message": "Authorization must be a Bearer token."},
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    credential = _authenticate_token(token.strip())
-    if credential is None:
+    if mode is AuthMode.STATIC:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"code": "invalid_token", "message": "Bearer token was not recognized."},
             headers={"WWW-Authenticate": "Bearer"},
         )
-
+    service = _auth_service(request)
+    try:
+        principal = service.authorize_access(raw_token, source_ip=client_host or "", path=request.url.path)
+    except AuthenticationError as exc:
+        _raise_service_error(exc, "Bearer")
     return ApiPrincipal(
-        subject=credential.subject,
-        scopes=credential.scopes,
+        subject=principal.subject,
+        scopes=principal.scopes,
         client_host=client_host,
+        kind="access_token",
+        client_id=principal.client_id,
+        token_id=principal.token_id,
     )
+
+
+async def get_client_authentication(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> tuple[AuthenticationService, str, str]:
+    from ..main import _APP_CFG
+
+    mode = _APP_CFG.api.auth.mode if _APP_CFG else AuthMode.STATIC
+    if mode is AuthMode.STATIC:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "exchange_not_permitted", "message": "Authentication mode does not permit token exchange."},
+        )
+    service = _auth_service(request)
+    credential = _authorization_value(authorization, "SeasonalClient")
+    client_host = _checked_client_host(request, allow_remote=_APP_CFG.api.allow_remote if _APP_CFG else False)
+    return service, credential, client_host or ""
 
 
 def require_scopes(*scopes: str) -> Callable[..., Any]:
@@ -168,8 +179,11 @@ def route_auth_policy(method: str, path: str) -> RouteAuthPolicy:
 
 def require_route_policy(method: str, path: str) -> Callable[..., Any]:
     policy = route_auth_policy(method, path)
-    if policy.public:
+    if policy.public or policy.client_credential:
         raise RuntimeError(f"Public route {method.strip().upper()} {path} must not install an auth dependency.")
     dependency = require_scopes(*sorted(policy.scopes))
     dependency.__dict__["__seasonalweather_auth_policy__"] = policy
     return dependency
+
+
+get_client_authentication.__dict__["__seasonalweather_auth_policy__"] = ROUTE_AUTH_POLICIES[("POST", "/v1/auth/token")]

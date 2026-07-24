@@ -192,7 +192,7 @@ def problem_response(description: str) -> dict[str, Any]:
     }
 
 
-STANDARD_PROBLEM_RESPONSES: dict[int, dict[str, Any]] = {
+STANDARD_PROBLEM_RESPONSES: dict[int | str, dict[str, Any]] = {
     400: problem_response("Bad request."),
     401: problem_response("Authentication is required."),
     403: problem_response("The authenticated principal lacks access to this resource."),
@@ -203,7 +203,7 @@ STANDARD_PROBLEM_RESPONSES: dict[int, dict[str, Any]] = {
     503: problem_response("A required backend dependency is unavailable."),
 }
 
-PUBLIC_PROBLEM_RESPONSES: dict[int, dict[str, Any]] = {
+PUBLIC_PROBLEM_RESPONSES: dict[int | str, dict[str, Any]] = {
     422: STANDARD_PROBLEM_RESPONSES[422],
     500: STANDARD_PROBLEM_RESPONSES[500],
 }
@@ -233,6 +233,7 @@ def install_openapi(app: FastAPI) -> None:
                 {"name": "origination", "description": "Authenticated test and manual alert origination."},
                 {"name": "inserts", "description": "Authenticated bounded inserts into the normal broadcast cycle."},
                 {"name": "configuration", "description": "Authenticated configuration inspection and reload."},
+                {"name": "authentication", "description": "Client credential exchange and access-token revocation."},
             ],
         )
         schema["jsonSchemaDialect"] = "https://json-schema.org/draft/2020-12/schema"
@@ -241,6 +242,12 @@ def install_openapi(app: FastAPI) -> None:
         components.setdefault("securitySchemes", {})["BearerAuth"] = {
             "type": "http",
             "scheme": "bearer",
+        }
+        components.setdefault("securitySchemes", {})["SeasonalClientAuth"] = {
+            "type": "apiKey",
+            "in": "header",
+            "name": "Authorization",
+            "description": "SeasonalClient swc_<public-id>.<secret>",
         }
         schemas.update(
             {
@@ -259,7 +266,12 @@ def install_openapi(app: FastAPI) -> None:
                 policy = ROUTE_AUTH_POLICIES.get((method.upper(), path))
                 if policy is None:
                     continue
-                operation["security"] = [] if policy.public else [{"BearerAuth": []}]
+                if policy.public:
+                    operation["security"] = []
+                elif policy.client_credential:
+                    operation["security"] = [{"SeasonalClientAuth": []}]
+                else:
+                    operation["security"] = [{"BearerAuth": []}]
         app.openapi_schema = schema
         return app.openapi_schema
 

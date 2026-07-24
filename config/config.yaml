@@ -477,9 +477,14 @@ station_feed:
 # HTTP API server settings
 api:
   auth:
-    mode: "static"               # static | exchange | hybrid (exchange/hybrid require P1-03 and currently fail closed)
+    mode: "static"               # static | exchange | hybrid (hybrid is migration-only)
     subject: "local-admin"       # subject name for SEASONAL_API_TOKEN
     scopes: "read:health read:status read:alerts read:config control:cycle control:mode control:tests control:originate control:audio control:inserts control:config"
+    exchange:
+      minimum_ttl_seconds: 60
+      default_ttl_seconds: 900
+      maximum_read_ttl_seconds: 3600
+      maximum_write_ttl_seconds: 900
   allow_remote: false           # bind to 0.0.0.0 if true; localhost-only if false
   audio_max_bytes: 20971520     # 20 MiB — max upload size for audio inject endpoint
   audio_max_seconds: 180        # max audio clip duration accepted
@@ -552,7 +557,7 @@ paths:
 
 database:
   enabled: true
-  path: "/var/lib/seasonalweather/seasonalweather.sqlite3"
+  path: "/var/lib/seasonalweather/seasonalweather.sqlite3"  # also stores exchange clients, tokens, and auth audit
   busy_timeout_ms: 5000
   journal_mode: "WAL"
   housekeeping:
