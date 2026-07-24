@@ -19,9 +19,7 @@ jobs:
           python3 -m venv .venv-ci
           . .venv-ci/bin/activate
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
-          if find . -maxdepth 3 -type d -name tests | grep -q .; then pip install pytest; fi
+          python -m pip install -r requirements.txt -r requirements-dev.txt
       - name: Compile Python sources
         run: |
           python3 - <<'PY'
