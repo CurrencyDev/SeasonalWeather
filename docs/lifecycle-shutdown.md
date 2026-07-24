@@ -155,8 +155,12 @@ sum multiplied by the number of components.
 
 ## Current limits and future integration
 
-SeasonalWeather has a typed durable job repository and lease state, but no
-remote workers or SWWP sessions to drain. Later worker, diagnostics,
-TTS-adapter, artifact-fencing, and normalized NWWS-source packets must
-integrate through these lifecycle and supervision boundaries without moving
-lifecycle authority into those subsystems.
+SeasonalWeather has a typed durable job repository and lease state plus
+simulated-only SWWP/1 session machines. There is still no production SWWP
+network task or remote worker to drain. The controller state machine exposes a
+narrow deterministic drain port for tests: it closes new session assignment,
+sends bounded drain intent, and treats the worker response as observation
+rather than durable completion. Later real worker, diagnostics, TTS-adapter,
+artifact-fencing, and normalized NWWS-source packets must integrate through
+these lifecycle and supervision boundaries without moving lifecycle authority
+into those subsystems.

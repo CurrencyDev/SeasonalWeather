@@ -167,9 +167,12 @@ lifecycle transitions.
 
 ## Deferred implementation
 
-The following are deliberately not implemented here:
+The following are deliberately not implemented by the command/job contract
+layer:
 
-- P1-08: SWWP messages, connections, sessions, and peers;
+- P1-08 now supplies separate SWWP/1 schemas, session machines, and
+  simulated-only peers under [`swwp.md`](swwp.md); it does not change these
+  contracts or add a live connection;
 - P1-09: dynamic worker capability, health, capacity, epoch, and qualification;
 - P1-10: artifact staging, validation, promotion, and stale-result acceptance.
 

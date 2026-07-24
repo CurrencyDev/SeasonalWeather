@@ -160,8 +160,11 @@ change `/etc/seasonalweather/config.yaml`.
 
 ## Deferred boundaries
 
-P1-07 deliberately does not implement SWWP envelopes or connections, worker
-registration/sessions/heartbeats, dynamic capability or capacity health,
-worker handlers/processes, an embedded production executor, artifact staging
-or promotion, active-file mutation, result fencing/publication, PostgreSQL,
-Redis, containers, or deployment.
+P1-07 deliberately does not own SWWP. P1-08 adds a separate
+`seasonalweather.swwp` package whose sole concrete adapter calls these public
+repository/scheduler ports; its schemas, session machines, and test-only
+simulated peers are documented in [`swwp.md`](swwp.md). There is still no live
+connection, worker handler/process, dynamic capability or capacity health,
+embedded production executor, artifact staging or promotion, active-file
+mutation, result fencing/publication, PostgreSQL, Redis, container, or
+deployment behavior.

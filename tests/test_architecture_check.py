@@ -18,6 +18,8 @@ def test_invalid_architecture_fixture_proves_rules_fail_closed():
         "SWARCH006",
         "SWARCH009",
         "SWARCH010",
+        "SWARCH011",
+        "SWARCH012",
     }
     assert any("filesystem mutation" in finding.message for finding in findings)
 
@@ -29,3 +31,13 @@ def test_control_module_has_no_duplicate_job_repository_or_scheduler_authority()
     assert "JobRepository(" not in source
     assert "JobScheduler(" not in source
     assert "sqlite3" not in source
+
+
+def test_control_and_api_have_no_swwp_or_simulation_authority():
+    control = (ROOT / "seasonalweather/control.py").read_text(encoding="utf-8")
+    api = "\n".join(path.read_text(encoding="utf-8") for path in (ROOT / "seasonalweather/api").glob("*.py"))
+
+    for source in (control, api):
+        assert "seasonalweather.swwp" not in source
+        assert "swwp_simulation" not in source
+        assert "SimulatedPeers" not in source

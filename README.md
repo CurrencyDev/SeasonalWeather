@@ -79,7 +79,10 @@ Freeze products are supported natively. `FZ.W` maps to SAME `FZW` (**Freeze Warn
   controller-owned WAL job database and non-executing durable scheduler are
   documented in
   [`docs/durable-job-repository.md`](docs/durable-job-repository.md); external
-  workers are not yet implemented.
+  workers are not yet implemented. SWWP/1 schemas, controller/worker state
+  machines, and simulated-only protocol validation are documented in
+  [`docs/swwp.md`](docs/swwp.md); there is no production socket or worker
+  process yet.
 - Public handled-alerts feed API (`/v1/handled-alerts`) for external UI consumption, backed by SQLite.
   Persisted station-feed rows remain authoritative across restarts; startup does not synthesize degraded public records from AlertTracker state.
 
