@@ -2,14 +2,6 @@ version = 1
 
 [[exceptions]]
 rule = "SWARCH003"
-rationale = "The existing API command store is backed directly by the controller-owned command database pending an application-service boundary."
-owner = "SeasonalWeather maintainers"
-scope = "seasonalweather/api/commands.py"
-review_date = "2026-10-23"
-removal_condition = "Remove when command persistence is accessed only through the typed application command service."
-
-[[exceptions]]
-rule = "SWARCH003"
 rationale = "The existing API server performs database bootstrap during startup pending centralized controller lifecycle ownership."
 owner = "SeasonalWeather maintainers"
 scope = "seasonalweather/api/server.py"

@@ -7,7 +7,7 @@ from fastapi.openapi.utils import get_openapi
 
 from .auth import ROUTE_AUTH_POLICIES
 
-API_VERSION = "1.3.0"
+API_VERSION = "1.4.0"
 PROBLEM_JSON = "application/problem+json"
 
 PROBLEM_DETAILS_SCHEMA: dict[str, Any] = {

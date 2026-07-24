@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 MIGRATIONS: dict[int, tuple[str, ...]] = {
     1: (
@@ -205,5 +205,14 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         """,
         "CREATE INDEX IF NOT EXISTS idx_auth_audit_occurred ON auth_audit_events (occurred_at)",
         "CREATE INDEX IF NOT EXISTS idx_auth_audit_client ON auth_audit_events (client_id, occurred_at)",
+    ),
+    6: (
+        "ALTER TABLE api_commands ADD COLUMN created_at TEXT",
+        "ALTER TABLE api_commands ADD COLUMN reason TEXT",
+        "ALTER TABLE api_commands ADD COLUMN correlation_id TEXT",
+        "ALTER TABLE api_commands ADD COLUMN cancel_requested_at TEXT",
+        "ALTER TABLE api_commands ADD COLUMN audit_context_json TEXT NOT NULL DEFAULT '{}'",
+        "UPDATE api_commands SET created_at = accepted_at WHERE created_at IS NULL",
+        "UPDATE api_commands SET status = 'accepted' WHERE status = 'pending'",
     ),
 }

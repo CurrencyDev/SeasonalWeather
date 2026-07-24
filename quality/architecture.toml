@@ -37,6 +37,24 @@ domain_forbidden_imports = [
   "pymysql",
 ]
 
+contract_roots = [
+  "seasonalweather/commands/contracts.py",
+  "seasonalweather/jobs",
+]
+contract_forbidden_imports = [
+  "fastapi",
+  "starlette",
+  "uvicorn",
+  "seasonalweather.api",
+  "seasonalweather.database",
+  "seasonalweather.tts",
+  "seasonalweather.broadcast",
+  "seasonalweather.liquidsoap_telnet",
+  "seasonalweather.nwws",
+  "slixmpp",
+  "sqlite3",
+]
+
 script_roots = ["scripts"]
 script_forbidden_imports = [
   "seasonalweather.alerts",

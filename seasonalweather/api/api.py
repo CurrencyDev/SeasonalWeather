@@ -4,8 +4,9 @@ import asyncio
 import json
 import re
 import uuid
+from collections.abc import Awaitable, Callable
 from http import HTTPStatus
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.encoders import jsonable_encoder
@@ -123,6 +124,7 @@ def _command_accepted(record: Any, *, replayed: bool) -> CommandAccepted:
         accepted_at=record.accepted_at,
         idempotent_replay=replayed,
         request_id=record.request_id,
+        status_url=f"/v1/commands/{record.command_id}",
     )
 
 
@@ -133,9 +135,14 @@ def _command_snapshot(record: Any) -> CommandSnapshot:
 async def _require_idempotency_key(idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> str:
     key = (idempotency_key or "").strip()
     if not key:
-        raise HTTPException(status_code=400, detail={"code": "missing_idempotency_key", "message": "Idempotency-Key header is required."})
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "missing_idempotency_key", "message": "Idempotency-Key header is required."},
+        )
     if len(key) > 200:
-        raise HTTPException(status_code=400, detail={"code": "invalid_idempotency_key", "message": "Idempotency-Key is too long."})
+        raise HTTPException(
+            status_code=400, detail={"code": "invalid_idempotency_key", "message": "Idempotency-Key is too long."}
+        )
     return key
 
 
@@ -155,6 +162,7 @@ async def _execute_command(
             idempotency_key=idempotency_key,
             actor=principal.subject,
             payload=payload,
+            reason=str(payload.get("reason")) if payload.get("reason") else None,
         )
     except IdempotencyConflictError as exc:
         raise HTTPException(status_code=409, detail={"code": "idempotency_conflict", "message": str(exc)}) from exc
@@ -162,7 +170,7 @@ async def _execute_command(
     if replayed:
         return _command_accepted(record, replayed=True)
 
-    await store.mark_running(record.command_id)
+    record = await store.mark_running(record.command_id)
     try:
         result = await action()
     except ControlError as exc:
@@ -173,9 +181,44 @@ async def _execute_command(
         await store.mark_failed(record.command_id, err)
         raise HTTPException(status_code=500, detail=err) from exc
 
-    await store.mark_succeeded(record.command_id, result)
+    record = await store.mark_succeeded(record.command_id, result)
     if success_event:
-        await store.broker.publish(success_event, {"command_id": record.command_id, "command_type": record.command_type, "result": result})
+        await store.broker.publish(
+            success_event, {"command_id": record.command_id, "command_type": record.command_type, "result": result}
+        )
+    return _command_accepted(record, replayed=False)
+
+
+async def _admit_async_command(
+    *,
+    store: CommandStore,
+    principal: ApiPrincipal,
+    idempotency_key: str,
+    command_type: str,
+    payload: dict[str, Any],
+    admission: Callable[[], Awaitable[dict[str, Any]]],
+) -> CommandAccepted:
+    try:
+        record, replayed = await store.create_or_replay(
+            command_type=command_type,
+            idempotency_key=idempotency_key,
+            actor=principal.subject,
+            payload=payload,
+            reason=str(payload.get("reason")) if payload.get("reason") else None,
+        )
+    except IdempotencyConflictError as exc:
+        raise HTTPException(status_code=409, detail={"code": "idempotency_conflict", "message": str(exc)}) from exc
+    if replayed:
+        return _command_accepted(record, replayed=True)
+    try:
+        await admission()
+    except ControlError as exc:
+        await store.mark_failed(record.command_id, exc.to_dict())
+        raise HTTPException(status_code=exc.status_code, detail=exc.to_dict()) from exc
+    except Exception as exc:
+        error = {"code": "admission_failed", "message": "Asynchronous work could not be admitted."}
+        await store.mark_failed(record.command_id, error)
+        raise HTTPException(status_code=500, detail=error) from exc
     return _command_accepted(record, replayed=False)
 
 
@@ -199,6 +242,7 @@ def create_app(
 ) -> FastAPI:
     command_store = store or CommandStore()
     if health_service is None:
+
         async def runtime_unavailable() -> HealthComponent:
             return HealthComponent(
                 "runtime",
@@ -207,9 +251,7 @@ def create_app(
                 "health_service_unavailable",
             )
 
-        health_service = HealthService(
-            [ComponentProbe("runtime", True, runtime_unavailable)]
-        )
+        health_service = HealthService([ComponentProbe("runtime", True, runtime_unavailable)])
     app = FastAPI(
         title="SeasonalWeather API",
         version=API_VERSION,
@@ -468,9 +510,7 @@ def create_app(
         },
     )
     async def v1_config_summary(
-        principal: ApiPrincipal = Depends(
-            require_route_policy("GET", "/v1/config/summary")
-        ),
+        principal: ApiPrincipal = Depends(require_route_policy("GET", "/v1/config/summary")),
     ) -> dict[str, Any]:
         return await control.get_config_summary()
 
@@ -483,39 +523,37 @@ def create_app(
     )
     async def v1_command(
         command_id: str,
-        principal: ApiPrincipal = Depends(
-            require_route_policy("GET", "/v1/commands/{command_id}")
-        ),
+        principal: ApiPrincipal = Depends(require_route_policy("GET", "/v1/commands/{command_id}")),
     ) -> CommandSnapshot:
         try:
             record = await command_store.get(command_id)
         except CommandNotFoundError as exc:
-            raise HTTPException(status_code=404, detail={"code": "command_not_found", "message": "Command was not found."}) from exc
+            raise HTTPException(
+                status_code=404, detail={"code": "command_not_found", "message": "Command was not found."}
+            ) from exc
         return _command_snapshot(record)
 
     @app.post(
         "/v1/cycle/rebuild",
         response_model=CommandAccepted,
+        status_code=202,
         tags=["control"],
         summary="Rebuild the normal station cycle.",
         responses=STANDARD_PROBLEM_RESPONSES,
     )
     async def v1_cycle_rebuild(
         req: RebuildCycleRequest,
-        principal: ApiPrincipal = Depends(
-            require_route_policy("POST", "/v1/cycle/rebuild")
-        ),
+        principal: ApiPrincipal = Depends(require_route_policy("POST", "/v1/cycle/rebuild")),
         idempotency_key: str = Depends(_require_idempotency_key),
     ) -> CommandAccepted:
         payload = req.model_dump(mode="json")
-        return await _execute_command(
+        return await _admit_async_command(
             store=command_store,
             principal=principal,
             idempotency_key=idempotency_key,
             command_type="cycle.rebuild",
             payload=payload,
-            action=lambda: control.rebuild_cycle(reason=req.reason, actor=principal.subject),
-            success_event="cycle.rebuild.completed",
+            admission=lambda: control.rebuild_cycle(reason=req.reason, actor=principal.subject),
         )
 
     @app.post(
@@ -527,9 +565,7 @@ def create_app(
     )
     async def v1_mode_heightened(
         req: SetHeightenedModeRequest,
-        principal: ApiPrincipal = Depends(
-            require_route_policy("POST", "/v1/mode/heightened")
-        ),
+        principal: ApiPrincipal = Depends(require_route_policy("POST", "/v1/mode/heightened")),
         idempotency_key: str = Depends(_require_idempotency_key),
     ) -> CommandAccepted:
         payload = req.model_dump(mode="json")
@@ -552,9 +588,7 @@ def create_app(
     )
     async def v1_mode_heightened_clear(
         req: ClearHeightenedModeRequest,
-        principal: ApiPrincipal = Depends(
-            require_route_policy("DELETE", "/v1/mode/heightened")
-        ),
+        principal: ApiPrincipal = Depends(require_route_policy("DELETE", "/v1/mode/heightened")),
         idempotency_key: str = Depends(_require_idempotency_key),
     ) -> CommandAccepted:
         payload = req.model_dump(mode="json")
@@ -577,9 +611,7 @@ def create_app(
     )
     async def v1_tests_originate(
         req: OriginateTestRequest,
-        principal: ApiPrincipal = Depends(
-            require_route_policy("POST", "/v1/tests/originate")
-        ),
+        principal: ApiPrincipal = Depends(require_route_policy("POST", "/v1/tests/originate")),
         idempotency_key: str = Depends(_require_idempotency_key),
     ) -> CommandAccepted:
         payload = req.model_dump(mode="json")
@@ -602,9 +634,7 @@ def create_app(
     )
     async def v1_upload_audio(
         file: UploadFile = File(...),
-        principal: ApiPrincipal = Depends(
-            require_route_policy("POST", "/v1/uploads/audio")
-        ),
+        principal: ApiPrincipal = Depends(require_route_policy("POST", "/v1/uploads/audio")),
     ) -> AudioUploadAccepted:
         data = await file.read()
         try:
@@ -627,9 +657,7 @@ def create_app(
     )
     async def v1_inserts_text(
         req: CreateTextInsertRequest,
-        principal: ApiPrincipal = Depends(
-            require_route_policy("POST", "/v1/inserts/text")
-        ),
+        principal: ApiPrincipal = Depends(require_route_policy("POST", "/v1/inserts/text")),
         idempotency_key: str = Depends(_require_idempotency_key),
     ) -> CommandAccepted:
         payload = req.model_dump(mode="json")
@@ -652,9 +680,7 @@ def create_app(
     )
     async def v1_inserts_audio(
         req: CreateAudioInsertRequest,
-        principal: ApiPrincipal = Depends(
-            require_route_policy("POST", "/v1/inserts/audio")
-        ),
+        principal: ApiPrincipal = Depends(require_route_policy("POST", "/v1/inserts/audio")),
         idempotency_key: str = Depends(_require_idempotency_key),
     ) -> CommandAccepted:
         payload = req.model_dump(mode="json")
@@ -678,11 +704,14 @@ def create_app(
     async def v1_inserts_list(
         include_inactive: bool = Query(default=False),
         limit: int = Query(default=100, ge=1, le=500),
-        principal: ApiPrincipal = Depends(
-            require_route_policy("GET", "/v1/inserts")
-        ),
+        principal: ApiPrincipal = Depends(require_route_policy("GET", "/v1/inserts")),
     ) -> CycleInsertList:
-        return CycleInsertList(inserts=[CycleInsertSnapshot.model_validate(item) for item in await control.list_inserts(include_inactive=include_inactive, limit=limit)])
+        return CycleInsertList(
+            inserts=[
+                CycleInsertSnapshot.model_validate(item)
+                for item in await control.list_inserts(include_inactive=include_inactive, limit=limit)
+            ]
+        )
 
     @app.get(
         "/v1/inserts/{insert_id}",
@@ -693,9 +722,7 @@ def create_app(
     )
     async def v1_inserts_get(
         insert_id: str,
-        principal: ApiPrincipal = Depends(
-            require_route_policy("GET", "/v1/inserts/{insert_id}")
-        ),
+        principal: ApiPrincipal = Depends(require_route_policy("GET", "/v1/inserts/{insert_id}")),
     ) -> CycleInsertSnapshot:
         return CycleInsertSnapshot.model_validate(await control.get_insert(insert_id))
 
@@ -708,9 +735,7 @@ def create_app(
     )
     async def v1_inserts_cancel(
         insert_id: str,
-        principal: ApiPrincipal = Depends(
-            require_route_policy("DELETE", "/v1/inserts/{insert_id}")
-        ),
+        principal: ApiPrincipal = Depends(require_route_policy("DELETE", "/v1/inserts/{insert_id}")),
         idempotency_key: str = Depends(_require_idempotency_key),
     ) -> CommandAccepted:
         payload = {"insert_id": insert_id}
@@ -733,9 +758,7 @@ def create_app(
     )
     async def v1_originate_text(
         req: OriginateTextRequest,
-        principal: ApiPrincipal = Depends(
-            require_route_policy("POST", "/v1/originate/text")
-        ),
+        principal: ApiPrincipal = Depends(require_route_policy("POST", "/v1/originate/text")),
         idempotency_key: str = Depends(_require_idempotency_key),
     ) -> CommandAccepted:
         payload = req.model_dump(mode="json")
@@ -758,9 +781,7 @@ def create_app(
     )
     async def v1_originate_audio(
         req: OriginateAudioRequest,
-        principal: ApiPrincipal = Depends(
-            require_route_policy("POST", "/v1/originate/audio")
-        ),
+        principal: ApiPrincipal = Depends(require_route_policy("POST", "/v1/originate/audio")),
         idempotency_key: str = Depends(_require_idempotency_key),
     ) -> CommandAccepted:
         payload = req.model_dump(mode="json")
@@ -783,9 +804,7 @@ def create_app(
     )
     async def v1_config_reload(
         req: ConfigReloadRequest,
-        principal: ApiPrincipal = Depends(
-            require_route_policy("POST", "/v1/config/reload")
-        ),
+        principal: ApiPrincipal = Depends(require_route_policy("POST", "/v1/config/reload")),
         idempotency_key: str = Depends(_require_idempotency_key),
     ) -> CommandAccepted:
         payload = req.model_dump(mode="json")
@@ -821,7 +840,7 @@ def create_app(
                 while True:
                     try:
                         item = await asyncio.wait_for(queue.get(), timeout=15.0)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         yield ": heartbeat\n\n"
                         continue
                     payload = json.dumps(item["data"], separators=(",", ":"), ensure_ascii=False)

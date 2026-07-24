@@ -27,8 +27,10 @@ class CommandRepository:
                 INSERT INTO api_commands (
                     command_id, command_type, status, accepted_at, idempotency_key,
                     actor, payload_hash, payload_json, request_id, started_at,
-                    finished_at, idempotent_replay_count, result_json, error_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    finished_at, idempotent_replay_count, result_json, error_json,
+                    created_at, reason, correlation_id, cancel_requested_at,
+                    audit_context_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record["command_id"],
@@ -38,15 +40,27 @@ class CommandRepository:
                     record["idempotency_key"],
                     record["actor"],
                     record["payload_hash"],
-                    json.dumps(record.get("payload") or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+                    "{}",
                     record["request_id"],
                     record.get("started_at"),
                     record.get("finished_at"),
                     int(record.get("idempotent_replay_count", 0) or 0),
                     json.dumps(record.get("result") or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-                    if record.get("result") is not None else None,
+                    if record.get("result") is not None
+                    else None,
                     json.dumps(record.get("error") or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-                    if record.get("error") is not None else None,
+                    if record.get("error") is not None
+                    else None,
+                    record["created_at"],
+                    record.get("reason"),
+                    record.get("correlation_id"),
+                    record.get("cancel_requested_at"),
+                    json.dumps(
+                        record.get("audit_context") or {},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ),
                 ),
             )
 
@@ -60,7 +74,11 @@ class CommandRepository:
                        finished_at = ?,
                        idempotent_replay_count = ?,
                        result_json = ?,
-                       error_json = ?
+                       error_json = ?,
+                       reason = ?,
+                       correlation_id = ?,
+                       cancel_requested_at = ?,
+                       audit_context_json = ?
                  WHERE command_id = ?
                 """,
                 (
@@ -69,20 +87,30 @@ class CommandRepository:
                     record.get("finished_at"),
                     int(record.get("idempotent_replay_count", 0) or 0),
                     json.dumps(record.get("result") or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-                    if record.get("result") is not None else None,
+                    if record.get("result") is not None
+                    else None,
                     json.dumps(record.get("error") or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-                    if record.get("error") is not None else None,
+                    if record.get("error") is not None
+                    else None,
+                    record.get("reason"),
+                    record.get("correlation_id"),
+                    record.get("cancel_requested_at"),
+                    json.dumps(
+                        record.get("audit_context") or {},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ),
                     record["command_id"],
                 ),
             )
-
 
     def prune_terminal_before(self, cutoff_iso: str) -> int:
         with self.db.transaction() as conn:
             cur = conn.execute(
                 """
                 DELETE FROM api_commands
-                 WHERE status IN ('succeeded', 'failed')
+                 WHERE status IN ('succeeded', 'failed', 'cancelled', 'expired', 'superseded')
                    AND COALESCE(finished_at, accepted_at) < ?
                 """,
                 (cutoff_iso,),
@@ -96,11 +124,15 @@ class CommandRepository:
             "command_type": str(row["command_type"]),
             "status": str(row["status"]),
             "accepted_at": str(row["accepted_at"]),
+            "created_at": str(row["created_at"] or row["accepted_at"]),
             "idempotency_key": str(row["idempotency_key"]),
             "actor": str(row["actor"]),
             "payload_hash": str(row["payload_hash"]),
-            "payload": json.loads(row["payload_json"] or "{}"),
             "request_id": str(row["request_id"]),
+            "reason": row["reason"],
+            "correlation_id": row["correlation_id"],
+            "cancel_requested_at": row["cancel_requested_at"],
+            "audit_context": json.loads(row["audit_context_json"] or "{}"),
             "started_at": row["started_at"],
             "finished_at": row["finished_at"],
             "idempotent_replay_count": int(row["idempotent_replay_count"] or 0),

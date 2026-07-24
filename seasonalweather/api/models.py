@@ -5,8 +5,8 @@ import re
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
-
+from ..commands.contracts import CommandStatus, CommandType
+from ..validation.modeling import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 ALLOWED_MANUAL_EVENT_CODES = {"ADR", "DMO", "RWT", "RMT", "SPS"}
 _SAME_RE = re.compile(r"^\d{6}$")
@@ -38,13 +38,6 @@ class InsertPlacement(str, Enum):
 class InsertRepeatMode(str, Enum):
     ONCE = "once"
     EVERY_N_ROTATIONS = "every_n_rotations"
-
-
-class CommandStatus(str, Enum):
-    PENDING = "pending"
-    RUNNING = "running"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
 
 
 class ApiModel(BaseModel):
@@ -174,7 +167,7 @@ class OriginateBaseRequest(ApiModel):
         return sender
 
     @model_validator(mode="after")
-    def _validate_voice_mode_targeting(self) -> "OriginateBaseRequest":
+    def _validate_voice_mode_targeting(self) -> OriginateBaseRequest:
         if self.voice_mode == VoiceMode.FULL_EAS and not self.same_codes:
             raise ValueError("same_codes must be provided for full_eas origination")
         if self.voice_mode == VoiceMode.VOICE_ONLY and self.same_codes:
@@ -220,22 +213,28 @@ class ConfigReloadRequest(ApiModel):
 
 class CommandAccepted(ApiModel):
     command_id: str
-    command_type: str
+    command_type: CommandType
     status: CommandStatus
-    accepted_at: str
+    accepted_at: dt.datetime
     idempotent_replay: bool = False
     request_id: str
+    status_url: str
 
 
 class CommandSnapshot(ApiModel):
     command_id: str
-    command_type: str
+    command_type: CommandType
     status: CommandStatus
-    accepted_at: str
-    started_at: str | None = None
-    finished_at: str | None = None
+    created_at: dt.datetime
+    accepted_at: dt.datetime
+    started_at: dt.datetime | None = None
+    finished_at: dt.datetime | None = None
+    cancel_requested_at: dt.datetime | None = None
     idempotency_key: str
     actor: str
+    reason: str | None = None
+    request_id: str
+    correlation_id: str | None = None
     idempotent_replay_count: int = 0
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
@@ -263,7 +262,7 @@ class InsertRepeatRequest(ApiModel):
     max_airings: int = Field(default=1, ge=1, le=100)
 
     @model_validator(mode="after")
-    def _validate_repeat(self) -> "InsertRepeatRequest":
+    def _validate_repeat(self) -> InsertRepeatRequest:
         if self.mode == InsertRepeatMode.ONCE:
             self.every_n_rotations = 1
             self.max_airings = 1
@@ -295,7 +294,7 @@ class CreateInsertBaseRequest(ApiModel):
         return value
 
     @model_validator(mode="after")
-    def _validate_window(self) -> "CreateInsertBaseRequest":
+    def _validate_window(self) -> CreateInsertBaseRequest:
         if self.start_after is not None and self.expires_at <= self.start_after:
             raise ValueError("expires_at must be after start_after")
         return self

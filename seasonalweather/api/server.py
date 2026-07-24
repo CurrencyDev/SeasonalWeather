@@ -10,6 +10,7 @@ from typing import Any
 import uvicorn
 
 from ..auth import AuthenticationRepository, AuthenticationService
+from ..commands import CommandStore
 from ..config import AuthMode, load_config
 from ..control import OrchestratorControl
 from ..database.bootstrap import bootstrap_database_from_config
@@ -17,7 +18,6 @@ from ..health_service import build_runtime_health_service
 from ..lifecycle import Lifecycle, LifecycleState, TaskSupervisor
 from ..main import Orchestrator, _setup_logging
 from .api import create_app
-from .commands import CommandStore
 
 log = logging.getLogger("seasonalweather.api")
 

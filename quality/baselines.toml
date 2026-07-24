@@ -5,15 +5,15 @@ version = 1
 # downward; increases require a separately governed exception.
 
 [checks.format]
-maximum = 88
+maximum = 85
 owner = "SeasonalWeather maintainers"
-rationale = "Initial v0.17.0 Ruff formatter debt across 89 legacy files."
+rationale = "Remaining v0.17.0 Ruff formatter debt after touched-file cleanup."
 scope = "seasonalweather/, tests/, and tools/"
 review_date = "2026-10-23"
 removal_condition = "Reduce whenever legacy files are materially changed; reach zero."
 
 [checks.lint]
-maximum = 990
+maximum = 980
 owner = "SeasonalWeather maintainers"
 rationale = "Initial v0.17.0 Ruff debt."
 scope = "seasonalweather/, tests/, and tools/"

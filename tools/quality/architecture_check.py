@@ -202,6 +202,18 @@ def scan(root: Path, config: dict[str, Any], exceptions: list[dict[str, Any]] | 
                         Finding(relative, line, "SWARCH004", f"domain/validation imports deployment concern {imported}")
                     )
 
+        if _under(relative, config.get("contract_roots", [])):
+            for imported, line in imports:
+                if _matches_prefix(imported, config.get("contract_forbidden_imports", [])):
+                    findings.append(
+                        Finding(
+                            relative,
+                            line,
+                            "SWARCH008",
+                            f"command/job contract imports runtime authority {imported}",
+                        )
+                    )
+
         if _under(relative, config["script_roots"]):
             for imported, line in imports:
                 if _matches_prefix(imported, config["script_forbidden_imports"]):
